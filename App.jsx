@@ -6,7 +6,7 @@ import { createClient } from "@supabase/supabase-js";
 //  Get it at: https://console.anthropic.com → API Keys
 //  Example:   "sk-ant-api03-XXXXXXXXXXXX..."
 // ════════════════════════════════════════════════════════════
-const ANTHROPIC_API_KEY = "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";
+const ANTHROPIC_API_KEY = "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";
 
 // ════════════════════════════════════════════════════════════
 //  ☁️  SHARED CLOUD DATABASE (SUPABASE)  ☁️
