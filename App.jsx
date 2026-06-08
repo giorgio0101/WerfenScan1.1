@@ -20,8 +20,8 @@ const SUPABASE_URL      = "https://upztxixdnnvhqnirxpye.supabase.co";
 const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVwenR4aXhkbm52aHFuaXJ4cHllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzk5NzkxNzEsImV4cCI6MjA5NTU1NTE3MX0._p2toNqZrr2Rlk4FgOOQRSnSQjxuvv94iELwamTokfk";
 
 const cloudReady =
-  SUPABASE_URL !== "https://xxxx.supabase.co" &&
-  SUPABASE_ANON_KEY !== "eyJhbGc...";
+  SUPABASE_URL !== "https://upztxixdnnvhqnirxpye.supabase.co" &&
+  SUPABASE_ANON_KEY !== "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVwenR4aXhkbm52aHFuaXJ4cHllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzk5NzkxNzEsImV4cCI6MjA5NTU1NTE3MX0._p2toNqZrr2Rlk4FgOOQRSnSQjxuvv94iELwamTokfk";
 
 const supabase = cloudReady ? createClient(SUPABASE_URL, SUPABASE_ANON_KEY) : null;
 
