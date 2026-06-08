@@ -6,7 +6,7 @@ import { createClient } from "@supabase/supabase-js";
 //  Get it at: https://console.anthropic.com → API Keys
 //  Example:   "sk-ant-api03-XXXXXXXXXXXX..."
 // ════════════════════════════════════════════════════════════
-const ANTHROPIC_API_KEY = "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";
+const ANTHROPIC_API_KEY = "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";
 
 // ════════════════════════════════════════════════════════════
 //  ☁️  SHARED CLOUD DATABASE (SUPABASE)  ☁️
@@ -184,15 +184,16 @@ function djbHash(s) {
   return (h >>> 0).toString(36);
 }
 
-function compressImage(file, maxSize = 600, quality = 0.82) {
+function compressImage(file, maxSize = 1000, quality = 0.8) {
   return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onerror = () => reject(new Error("File read error"));
-    reader.onload = (e) => {
-      const img = new Image();
-      img.onerror = () => reject(new Error("Image load error"));
-      img.onload = () => {
-        let w = img.width, h = img.height;
+    // Safety timeout: never let the UI hang forever on a stuck decode
+    const timer = setTimeout(() => reject(new Error("Image processing timed out")), 20000);
+    const done = (val) => { clearTimeout(timer); resolve(val); };
+    const fail = (err) => { clearTimeout(timer); reject(err); };
+
+    function drawAndExport(bitmapOrImg, natW, natH) {
+      try {
+        let w = natW, h = natH;
         if (w > maxSize || h > maxSize) {
           if (w > h) { h = Math.round((h / w) * maxSize); w = maxSize; }
           else       { w = Math.round((w / h) * maxSize); h = maxSize; }
@@ -202,12 +203,31 @@ function compressImage(file, maxSize = 600, quality = 0.82) {
         const ctx = canvas.getContext("2d");
         ctx.fillStyle = "#FFFFFF";
         ctx.fillRect(0, 0, w, h);
-        ctx.drawImage(img, 0, 0, w, h);
-        resolve(canvas.toDataURL("image/jpeg", quality));
-      };
-      img.src = e.target.result;
-    };
-    reader.readAsDataURL(file);
+        ctx.drawImage(bitmapOrImg, 0, 0, w, h);
+        if (bitmapOrImg.close) bitmapOrImg.close(); // free ImageBitmap memory
+        done(canvas.toDataURL("image/jpeg", quality));
+      } catch (e) { fail(e); }
+    }
+
+    // Preferred path: createImageBitmap handles huge Android camera files natively
+    if (typeof createImageBitmap === "function") {
+      createImageBitmap(file)
+        .then(bmp => drawAndExport(bmp, bmp.width, bmp.height))
+        .catch(() => fallbackPath());
+    } else {
+      fallbackPath();
+    }
+
+    // Fallback: classic objectURL + <img>
+    function fallbackPath() {
+      try {
+        const url = URL.createObjectURL(file);
+        const img = new Image();
+        img.onload = () => { URL.revokeObjectURL(url); drawAndExport(img, img.width, img.height); };
+        img.onerror = () => { URL.revokeObjectURL(url); fail(new Error("Image load error")); };
+        img.src = url;
+      } catch (e) { fail(e); }
+    }
   });
 }
 
@@ -505,20 +525,22 @@ function ScanScreen({ parts, onAddHistory }) {
   const [analyzing, setAnalyzing] = useState(false);
   const [result, setResult]       = useState(null);
   const [error, setError]         = useState("");
-  const fileRef = useRef();
+  const [imgLoading, setImgLoading] = useState(false);
 
   async function handleFile(e) {
     const file = e.target.files?.[0];
     if (!file) return;
-    e.target.value = "";
+    setImgLoading(true);
+    setError("");
     try {
-      const compressed = await compressImage(file, 800, 0.85);
+      const compressed = await compressImage(file, 1000, 0.8);
       setImage(compressed);
       setResult(null);
-      setError("");
-    } catch {
+      try { e.target.value = ""; } catch (_) {}
+    } catch (err) {
       setError("Could not load the image. Please try again.");
     }
+    setImgLoading(false);
   }
 
   async function analyze() {
@@ -621,20 +643,21 @@ Reply ONLY with valid JSON (no extra text, no markdown, no backticks):
 
   return (
     <div style={{ padding: 16 }}>
-      {/* Camera zone */}
-      <div
-        onClick={() => !analyzing && fileRef.current.click()}
-        className="tap-sc"
-        style={{
-          borderRadius: 20, overflow: "hidden", marginBottom: 16,
-          minHeight: 240, display: "flex", alignItems: "center", justifyContent: "center",
-          background: image ? "black" : T.card,
-          border: `2px dashed ${image ? T.blue : T.border}`,
-          cursor: "pointer", position: "relative",
-          boxShadow: image ? T.shadowLg : T.shadow
-        }}
-      >
-        {image ? (
+      {/* Camera zone — uses <label> (reliable on Android, no programmatic click) */}
+      <label htmlFor="scan-photo-input" style={{
+        display: "flex", borderRadius: 20, overflow: "hidden", marginBottom: 16,
+        minHeight: 240, alignItems: "center", justifyContent: "center",
+        background: image ? "black" : T.card,
+        border: `2px dashed ${image ? T.blue : T.border}`,
+        cursor: (analyzing || imgLoading) ? "default" : "pointer", position: "relative",
+        boxShadow: image ? T.shadowLg : T.shadow
+      }}>
+        {imgLoading ? (
+          <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 12, minHeight: 240 }}>
+            <Spinner size={36} />
+            <p style={{ color: T.textMid, fontWeight: 600, fontSize: 14 }}>Processing photo...</p>
+          </div>
+        ) : image ? (
           <>
             <img src={image} alt="part" style={{ width: "100%", maxHeight: 320, objectFit: "cover", display: "block" }} />
             {analyzing && (
@@ -661,8 +684,15 @@ Reply ONLY with valid JSON (no extra text, no markdown, no backticks):
             </p>
           </div>
         )}
-        <input ref={fileRef} type="file" accept="image/*" capture="environment" onChange={handleFile} />
-      </div>
+        <input
+          id="scan-photo-input"
+          type="file"
+          accept="image/*"
+          disabled={analyzing || imgLoading}
+          onChange={handleFile}
+          style={{ display: "none" }}
+        />
+      </label>
 
       {!image && (
         <div style={{
@@ -1145,21 +1175,16 @@ function AddEditPartScreen({ parts, editingPart, onAddPart, onUpdatePart, onDone
   const [saving, setSaving] = useState(false);
   const [errors, setErrors] = useState({});
   const [imgLoading, setImgLoading] = useState(false);
-  // Prevents Android double-trigger on touch
-  const pickingRef = useRef(false);
 
   function field(key, val) { setForm(f => ({ ...f, [key]: val })); }
 
   async function handleImage(e) {
     const file = e.target.files?.[0];
-    pickingRef.current = false;
     if (!file) return;
-    // DO NOT reset e.target.value here on Android — do it after processing
     setImgLoading(true);
     try {
-      const compressed = await compressImage(file, 500, 0.78);
+      const compressed = await compressImage(file, 800, 0.78);
       field("imageBase64", compressed);
-      // Safe to reset now
       try { e.target.value = ""; } catch (_) {}
     } catch {
       setErrors(e2 => ({ ...e2, image: "Could not load the image. Try again." }));
