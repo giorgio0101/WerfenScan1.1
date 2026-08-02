@@ -16,7 +16,7 @@ import { createClient } from "@supabase/supabase-js";
 //  Lasciare "" è la configurazione sicura di default.
 // ════════════════════════════════════════════════════════════
 const ANTHROPIC_API_KEY = "";
-
+const ADMIN_EMAIL = "giorgiocanada6@gmail.com";   // ← sostituisci con la TUA email admin
 // Modello usato per il riconoscimento visivo.
 //  - "claude-opus-5"      → massima accuratezza sul riconoscimento immagini
 //  - "claude-sonnet-4-6"  → più economico/veloce (era il valore precedente)
