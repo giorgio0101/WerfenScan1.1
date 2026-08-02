@@ -1,29 +1,54 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect } from "react";
 import { createClient } from "@supabase/supabase-js";
 
 // ════════════════════════════════════════════════════════════
-//  ⚙️  PASTE YOUR ANTHROPIC API KEY HERE  ⚙️
-//  Get it at: https://console.anthropic.com → API Keys
-//  Example:   "sk-ant-api03-XXXXXXXXXXXX..."
+//  ⚙️  ANTHROPIC API KEY  ⚙️
+//  ⛔ NON incollare qui la chiave in un'app pubblicata:
+//     il bundle JS è scaricabile da chiunque apra il sito e
+//     la chiave verrebbe letta in chiaro (= credito rubato).
+//
+//  Usa una delle due opzioni:
+//   A) Amministratore → Settings → incolla la chiave
+//      (resta solo in localStorage, su QUESTO dispositivo)
+//   B) [consigliato in produzione] crea un piccolo proxy
+//      server-side che tiene la chiave e inoltra la richiesta.
+//
+//  Lasciare "" è la configurazione sicura di default.
 // ════════════════════════════════════════════════════════════
-const ANTHROPIC_API_KEY = "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";
+const ANTHROPIC_API_KEY = "";
+
+// Modello usato per il riconoscimento visivo.
+//  - "claude-opus-5"      → massima accuratezza sul riconoscimento immagini
+//  - "claude-sonnet-4-6"  → più economico/veloce (era il valore precedente)
+const AI_MODEL = "claude-opus-5";
 
 // ════════════════════════════════════════════════════════════
 //  ☁️  SHARED CLOUD DATABASE (SUPABASE)  ☁️
-//  All parts & scans are shared across every device.
-//  Setup once — see GUIDA-SUPABASE.md:
-//   1. supabase.com → create free project
-//   2. SQL Editor → run the SQL from the guide
-//   3. Project Settings → API → copy the two values below
+//  Ricambi e cronologia scansioni condivisi tra tutti i device.
+//   1. supabase.com → crea progetto gratuito
+//   2. SQL Editor → esegui l'SQL della guida
+//   3. Project Settings → API → copia i due valori qui sotto
 // ════════════════════════════════════════════════════════════
 const SUPABASE_URL      = "https://upztxixdnnvhqnirxpye.supabase.co";
 const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVwenR4aXhkbm52aHFuaXJ4cHllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzk5NzkxNzEsImV4cCI6MjA5NTU1NTE3MX0._p2toNqZrr2Rlk4FgOOQRSnSQjxuvv94iELwamTokfk";
 
-const cloudReady =
-  SUPABASE_URL !== "https://upztxixdnnvhqnirxpye.supabase.co" &&
-  SUPABASE_ANON_KEY !== "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVwenR4aXhkbm52aHFuaXJ4cHllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzk5NzkxNzEsImV4cCI6MjA5NTU1NTE3MX0._p2toNqZrr2Rlk4FgOOQRSnSQjxuvv94iELwamTokfk";
+// ⚠️ BUG CORRETTO — la versione precedente era:
+//      SUPABASE_URL !== "https://upztxixdnnvhqnirxpye.supabase.co" && ...
+//    cioè confrontava i valori configurati CON SÉ STESSI → sempre false
+//    → supabase = null → l'app restava bloccata su SetupScreen e non
+//    arrivava mai al login. Ora si controllano dei veri segnaposto.
+const isPlaceholder = (v) =>
+  !v || /YOUR[-_]|<.*>|INCOLLA|PASTE|EXAMPLE|xxxx/i.test(v);
 
-const supabase = cloudReady ? createClient(SUPABASE_URL, SUPABASE_ANON_KEY) : null;
+const cloudReady =
+  !isPlaceholder(SUPABASE_URL) &&
+  !isPlaceholder(SUPABASE_ANON_KEY) &&
+  /^https:\/\/.+\.supabase\.co\/?$/.test(SUPABASE_URL.trim()) &&
+  SUPABASE_ANON_KEY.trim().length > 40;
+
+const supabase = cloudReady
+  ? createClient(SUPABASE_URL.trim(), SUPABASE_ANON_KEY.trim())
+  : null;
 
 // ===================== THEME =====================
 const T = {
@@ -63,7 +88,7 @@ const GLOBAL_STYLES = `
   body { overscroll-behavior-y: contain; line-height: 1.4; }
   #root { width: 100%; overflow-x: hidden; }
 
-  /* Inputs at 16px+ so iOS Safari/Chrome never auto-zooms on focus */
+  /* Input a 16px+ così iOS Safari/Chrome non fa auto-zoom sul focus */
   input, textarea, select, button {
     font-family: ${FONT};
     outline: none;
@@ -73,14 +98,10 @@ const GLOBAL_STYLES = `
   textarea { resize: vertical; }
   input[type="file"] { display: none; }
 
-  /* All images responsive by default — never overflow the screen */
   img { max-width: 100%; height: auto; }
 
-  /* Tables scroll horizontally on small screens instead of breaking layout */
   table { width: 100%; border-collapse: collapse; }
   .table-scroll { width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
-
-  /* Long codes / words wrap instead of overflowing */
   .wrap-anywhere { overflow-wrap: anywhere; word-break: break-word; }
 
   @keyframes spin    { to { transform: rotate(360deg); } }
@@ -93,7 +114,17 @@ const GLOBAL_STYLES = `
   .tap-sc:active { transform: scale(0.96); }
 `;
 
-// ===================== LOCAL STORAGE (per-device settings only) =====================
+// ⚠️ BUG CORRETTO — prima <style>{GLOBAL_STYLES}</style> veniva montato SOLO
+//    dentro LoginScreen / SetupScreen / schermata di caricamento. Dopo il login
+//    quei componenti si smontavano e con loro sparivano reset CSS, font,
+//    sfondo e tutte le @keyframes: gli spinner non giravano più e le
+//    animazioni della schermata principale non partivano.
+//    Ora è montato UNA volta sola alla radice dell'app.
+function GlobalStyles() {
+  return <style>{GLOBAL_STYLES}</style>;
+}
+
+// ===================== LOCAL STORAGE (impostazioni per-dispositivo) =====================
 const db = {
   get: async (key) => {
     try { const r = localStorage.getItem(key); return r ? JSON.parse(r) : null; }
@@ -106,7 +137,6 @@ const db = {
 };
 
 // ===================== SHARED CLOUD DATA LAYER (Supabase) =====================
-// Parts & scan history live here so every device sees the same data.
 const cloud = {
   async loadParts() {
     const { data, error } = await supabase
@@ -114,8 +144,8 @@ const cloud = {
     if (error) { console.error("loadParts:", error); throw error; }
     return (data || []).map(p => ({
       id: p.id,
-      code: p.code,
-      name: p.name,
+      code: p.code || "",
+      name: p.name || "",
       description: p.description || "",
       category: p.category || "",
       compatibility: p.compatibility || [],
@@ -184,14 +214,18 @@ function djbHash(s) {
   return (h >>> 0).toString(36);
 }
 
+// ===================== IMAGE HELPERS =====================
 function compressImage(file, maxSize = 1000, quality = 0.8) {
   return new Promise((resolve, reject) => {
-    // Safety timeout: never let the UI hang forever on a stuck decode
+    // Timeout di sicurezza: non bloccare mai la UI su un decode incastrato
     const timer = setTimeout(() => reject(new Error("Image processing timed out")), 20000);
     const done = (val) => { clearTimeout(timer); resolve(val); };
     const fail = (err) => { clearTimeout(timer); reject(err); };
+    let settled = false;
 
     function drawAndExport(bitmapOrImg, natW, natH) {
+      if (settled) return;
+      settled = true;
       try {
         let w = natW, h = natH;
         if (w > maxSize || h > maxSize) {
@@ -204,21 +238,23 @@ function compressImage(file, maxSize = 1000, quality = 0.8) {
         ctx.fillStyle = "#FFFFFF";
         ctx.fillRect(0, 0, w, h);
         ctx.drawImage(bitmapOrImg, 0, 0, w, h);
-        if (bitmapOrImg.close) bitmapOrImg.close(); // free ImageBitmap memory
+        if (bitmapOrImg.close) bitmapOrImg.close(); // libera l'ImageBitmap
         done(canvas.toDataURL("image/jpeg", quality));
       } catch (e) { fail(e); }
     }
 
-    // Preferred path: createImageBitmap handles huge Android camera files natively
+    // Percorso preferito: createImageBitmap gestisce nativamente i file
+    // enormi delle fotocamere Android. imageOrientation:"from-image" applica
+    // la rotazione EXIF → niente più foto ruotate di 90° prese col telefono.
     if (typeof createImageBitmap === "function") {
-      createImageBitmap(file)
+      createImageBitmap(file, { imageOrientation: "from-image" })
         .then(bmp => drawAndExport(bmp, bmp.width, bmp.height))
-        .catch(() => fallbackPath());
+        .catch(() => { if (!settled) fallbackPath(); });
     } else {
       fallbackPath();
     }
 
-    // Fallback: classic objectURL + <img>
+    // Fallback classico: objectURL + <img>
     function fallbackPath() {
       try {
         const url = URL.createObjectURL(file);
@@ -229,6 +265,62 @@ function compressImage(file, maxSize = 1000, quality = 0.8) {
       } catch (e) { fail(e); }
     }
   });
+}
+
+// Miniatura per la cronologia: la versione precedente salvava su Supabase
+// l'immagine piena (~150-250 KB in base64) per ogni scansione. Caricando 60
+// righe la schermata History scaricava diversi MB ad ogni apertura.
+function makeThumb(dataUrl, maxSize = 200, quality = 0.65) {
+  return new Promise((resolve) => {
+    try {
+      const img = new Image();
+      img.onload = () => {
+        let w = img.width, h = img.height;
+        if (w > maxSize || h > maxSize) {
+          if (w > h) { h = Math.round((h / w) * maxSize); w = maxSize; }
+          else       { w = Math.round((w / h) * maxSize); h = maxSize; }
+        }
+        const c = document.createElement("canvas");
+        c.width = w; c.height = h;
+        const ctx = c.getContext("2d");
+        ctx.fillStyle = "#FFFFFF";
+        ctx.fillRect(0, 0, w, h);
+        ctx.drawImage(img, 0, 0, w, h);
+        resolve(c.toDataURL("image/jpeg", quality));
+      };
+      img.onerror = () => resolve("");
+      img.src = dataUrl;
+    } catch { resolve(""); }
+  });
+}
+
+// Estrae il primo oggetto JSON bilanciato da un testo, anche se il modello
+// aggiunge prosa o code-fence attorno. Evita che JSON.parse fallisca e
+// trasformi una scansione riuscita in "AI analysis failed".
+function extractJson(raw) {
+  const cleaned = String(raw).replace(/```json/gi, "").replace(/```/g, "").trim();
+  try { return JSON.parse(cleaned); } catch { /* continua */ }
+
+  const start = cleaned.indexOf("{");
+  if (start === -1) throw new Error("No JSON object in AI response");
+
+  let depth = 0, inStr = false, esc = false;
+  for (let i = start; i < cleaned.length; i++) {
+    const ch = cleaned[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === "\\") esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') inStr = true;
+    else if (ch === "{") depth++;
+    else if (ch === "}") {
+      depth--;
+      if (depth === 0) return JSON.parse(cleaned.slice(start, i + 1));
+    }
+  }
+  throw new Error("Malformed JSON in AI response");
 }
 
 // ===================== SPINNER =====================
@@ -246,11 +338,15 @@ function Spinner({ size = 28, color = T.blue }) {
 }
 
 // ===================== TAGLINE =====================
-function Tagline({ light = false }) {
+// `raised` alza la scritta sopra la TabBar: prima si sovrapponeva alle
+// etichette dei tab nelle schermate User/Admin.
+function Tagline({ light = false, raised = false }) {
   return (
     <div style={{
       position: "fixed",
-      bottom: "max(12px, env(safe-area-inset-bottom))",
+      bottom: raised
+        ? "calc(max(12px, env(safe-area-inset-bottom)) + 64px)"
+        : "max(12px, env(safe-area-inset-bottom))",
       right: 18,
       fontSize: 11, fontWeight: 600, letterSpacing: 0.5,
       fontStyle: "italic",
@@ -293,6 +389,30 @@ function ConfirmDialog({ message, onConfirm, onCancel }) {
   );
 }
 
+// ===================== PHOTO PICKER =====================
+// ⚠️ BUG CORRETTO (il "loop" della fotocamera) —
+//    prima l'<input type="file"> era ANNIDATO dentro il <label> che aveva
+//    anche htmlFor sullo stesso id. Con questa combinazione il browser
+//    inoltra il click all'input DUE volte (attivazione implicita per
+//    discendenza + attivazione esplicita per `for`): su Android il selettore
+//    fotocamera si riapre subito dopo lo scatto, dando l'effetto loop.
+//    Qui l'input è fuori dal label: una sola attivazione per tap.
+function PhotoPicker({ id, disabled, onFile, children, style }) {
+  return (
+    <>
+      <label htmlFor={id} style={style}>{children}</label>
+      <input
+        id={id}
+        type="file"
+        accept="image/*"
+        disabled={disabled}
+        onChange={onFile}
+        style={{ display: "none" }}
+      />
+    </>
+  );
+}
+
 // ===================== LOGIN SCREEN =====================
 function LoginScreen({ onLogin }) {
   const [mode, setMode] = useState(null);
@@ -324,7 +444,6 @@ function LoginScreen({ onLogin }) {
       alignItems: "center", justifyContent: "center",
       padding: 24, position: "relative", overflow: "hidden"
     }}>
-      <style>{GLOBAL_STYLES}</style>
       <div style={{ position: "absolute", top: -80, right: -80, width: 280, height: 280, borderRadius: "50%", background: "rgba(255,104,32,0.13)", pointerEvents: "none" }} />
       <div style={{ position: "absolute", bottom: -60, left: -60, width: 200, height: 200, borderRadius: "50%", background: "rgba(63,60,184,0.22)", pointerEvents: "none" }} />
 
@@ -408,9 +527,6 @@ function LoginScreen({ onLogin }) {
             width: "100%", padding: 10, borderRadius: 12,
             background: "transparent", color: "rgba(255,255,255,0.6)", fontSize: 14
           }}>← Back</button>
-          <p style={{ color: "rgba(255,255,255,0.35)", fontSize: 12, textAlign: "center", marginTop: 12 }}>
-            Default password: admin123
-          </p>
         </div>
       )}
 
@@ -493,8 +609,10 @@ function UserApp({ parts, reloadParts, loadError, onLogout }) {
   }, []);
 
   async function addToHistory(item) {
+    // Nella lista locale teniamo l'immagine piena; su cloud solo la miniatura.
     setHistory(prev => [item, ...prev].slice(0, 60));
-    await cloud.addHistory(item);
+    const thumb = item.image ? await makeThumb(item.image) : "";
+    await cloud.addHistory({ ...item, image: thumb });
   }
 
   return (
@@ -502,7 +620,7 @@ function UserApp({ parts, reloadParts, loadError, onLogout }) {
       <Header title="WERFEN SCAN" subtitle="User — Spare Parts Recognition" onLogout={onLogout} />
       <div style={{ paddingBottom: 90 }}>
         {tab === "scan"    && <ScanScreen parts={parts} onAddHistory={addToHistory} reloadParts={reloadParts} loadError={loadError} />}
-        {tab === "catalog" && <CatalogScreen parts={parts} reloadParts={reloadParts} />}
+        {tab === "catalog" && <CatalogScreen parts={parts} />}
         {tab === "history" && <HistoryScreen history={history} />}
       </div>
       <TabBar
@@ -514,13 +632,13 @@ function UserApp({ parts, reloadParts, loadError, onLogout }) {
         active={tab}
         onChange={setTab}
       />
-      <Tagline />
+      <Tagline raised />
     </div>
   );
 }
 
 // ===================== SCAN SCREEN =====================
-function ScanScreen({ parts, onAddHistory }) {
+function ScanScreen({ parts, onAddHistory, reloadParts, loadError }) {
   const [image, setImage]         = useState(null);
   const [analyzing, setAnalyzing] = useState(false);
   const [result, setResult]       = useState(null);
@@ -528,7 +646,8 @@ function ScanScreen({ parts, onAddHistory }) {
   const [imgLoading, setImgLoading] = useState(false);
 
   async function handleFile(e) {
-    const file = e.target.files?.[0];
+    const input = e.target;                 // riferimento stabile
+    const file = input.files?.[0];
     if (!file) return;
     setImgLoading(true);
     setError("");
@@ -536,11 +655,17 @@ function ScanScreen({ parts, onAddHistory }) {
       const compressed = await compressImage(file, 1000, 0.8);
       setImage(compressed);
       setResult(null);
-      try { e.target.value = ""; } catch (_) {}
     } catch (err) {
+      console.error("compressImage:", err);
       setError("Could not load the image. Please try again.");
+    } finally {
+      // ⚠️ BUG CORRETTO — prima il reset del value avveniva solo nel ramo
+      //    di successo: dopo un errore l'input restava "sporco" e riselezionare
+      //    la STESSA foto non faceva più scattare onChange (app apparentemente
+      //    bloccata). Ora si azzera sempre.
+      try { input.value = ""; } catch { /* ignore */ }
+      setImgLoading(false);
     }
-    setImgLoading(false);
   }
 
   async function analyze() {
@@ -550,13 +675,11 @@ function ScanScreen({ parts, onAddHistory }) {
       return;
     }
 
-    // ── Key check: uses top-level constant OR the one saved in Settings ──
     const apiKey = ANTHROPIC_API_KEY.trim() || (await db.get("anthropic_key")) || "";
     if (!apiKey) {
-      setError("API Key not configured. Paste your Anthropic key in the ANTHROPIC_API_KEY constant at the top of App.jsx, or enter it in Administrator → Settings.");
+      setError("API Key not configured. Open Administrator → Settings and paste your Anthropic key.");
       return;
     }
-    // ─────────────────────────────────────────────────────────────────────
 
     setAnalyzing(true);
     setError("");
@@ -576,15 +699,16 @@ function ScanScreen({ parts, onAddHistory }) {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          // ── THE THREE CRITICAL HEADERS ──────────────────────────
           "x-api-key": apiKey,
           "anthropic-version": "2023-06-01",
           "anthropic-dangerous-direct-browser-access": "true",
-          // ────────────────────────────────────────────────────────
         },
         body: JSON.stringify({
-          model: "claude-sonnet-4-6",
-          max_tokens: 1000,
+          model: AI_MODEL,
+          // Su Claude Opus 5 il "thinking" è attivo di default e max_tokens
+          // limita ragionamento + risposta insieme: 3000 lascia margine.
+          max_tokens: 3000,
+          output_config: { effort: "low" },
           messages: [{
             role: "user",
             content: [
@@ -602,8 +726,8 @@ ${JSON.stringify(partsCtx, null, 2)}
 
 Identify the matching part by analyzing: shape, color, size, component type, visible markings, physical characteristics.
 
-Reply ONLY with valid JSON (no extra text, no markdown, no backticks):
-- If match found: {"matched":true,"id":"<exact id>","confidence":<0-100>,"reasoning":"<concise technical explanation of what you recognized and why it matches>"}
+Reply ONLY with valid JSON (no extra text, no markdown, no backticks). Keep "reasoning" under 40 words:
+- If match found: {"matched":true,"id":"<exact id>","confidence":<0-100>,"reasoning":"<concise technical explanation>"}
 - If no match: {"matched":false,"confidence":0,"reasoning":"<describe what you see and why no part matches>"}`
               }
             ]
@@ -617,13 +741,23 @@ Reply ONLY with valid JSON (no extra text, no markdown, no backticks):
       }
 
       const data = await res.json();
-      const raw   = (data.content || []).map(c => c.text || "").join("");
-      const clean = raw.replace(/```json|```/g, "").trim();
-      const parsed = JSON.parse(clean);
+
+      if (data.stop_reason === "refusal") {
+        throw new Error("The AI declined to analyze this image. Try a different photo.");
+      }
+
+      const raw = (data.content || [])
+        .filter(c => c.type === "text")
+        .map(c => c.text || "")
+        .join("");
+
+      const parsed = extractJson(raw);
       const matchedPart = parsed.matched ? parts.find(p => p.id === parsed.id) : null;
 
       const finalResult = {
         ...parsed,
+        confidence: Number(parsed.confidence) || 0,
+        matched: !!parsed.matched && !!matchedPart,
         part: matchedPart || null,
         timestamp: new Date().toISOString(),
         image,
@@ -633,8 +767,9 @@ Reply ONLY with valid JSON (no extra text, no markdown, no backticks):
     } catch (e) {
       console.error("AI error:", e);
       setError(`AI analysis failed: ${e.message || "check your connection and API Key."}`);
+    } finally {
+      setAnalyzing(false);
     }
-    setAnalyzing(false);
   }
 
   function reset() { setImage(null); setResult(null); setError(""); }
@@ -643,15 +778,33 @@ Reply ONLY with valid JSON (no extra text, no markdown, no backticks):
 
   return (
     <div style={{ padding: 16 }}>
-      {/* Camera zone — uses <label> (reliable on Android, no programmatic click) */}
-      <label htmlFor="scan-photo-input" style={{
-        display: "flex", borderRadius: 20, overflow: "hidden", marginBottom: 16,
-        minHeight: 240, alignItems: "center", justifyContent: "center",
-        background: image ? "black" : T.card,
-        border: `2px dashed ${image ? T.blue : T.border}`,
-        cursor: (analyzing || imgLoading) ? "default" : "pointer", position: "relative",
-        boxShadow: image ? T.shadowLg : T.shadow
-      }}>
+      {loadError && (
+        <div style={{
+          background: "#FEF2F2", border: "1px solid #FECACA", borderRadius: 14,
+          padding: "12px 14px", marginBottom: 12, color: T.error, fontSize: 13, lineHeight: 1.5
+        }}>
+          ⚠️ {loadError}
+          <button onClick={reloadParts} style={{
+            marginTop: 8, width: "100%", padding: 9, borderRadius: 10,
+            background: T.card, color: T.error, fontSize: 13, fontWeight: 700,
+            border: "1px solid #FECACA"
+          }}>↻ Retry</button>
+        </div>
+      )}
+
+      <PhotoPicker
+        id="scan-photo-input"
+        disabled={analyzing || imgLoading}
+        onFile={handleFile}
+        style={{
+          display: "flex", borderRadius: 20, overflow: "hidden", marginBottom: 16,
+          minHeight: 240, alignItems: "center", justifyContent: "center",
+          background: image ? "black" : T.card,
+          border: `2px dashed ${image ? T.blue : T.border}`,
+          cursor: (analyzing || imgLoading) ? "default" : "pointer", position: "relative",
+          boxShadow: image ? T.shadowLg : T.shadow
+        }}
+      >
         {imgLoading ? (
           <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 12, minHeight: 240 }}>
             <Spinner size={36} />
@@ -684,15 +837,7 @@ Reply ONLY with valid JSON (no extra text, no markdown, no backticks):
             </p>
           </div>
         )}
-        <input
-          id="scan-photo-input"
-          type="file"
-          accept="image/*"
-          disabled={analyzing || imgLoading}
-          onChange={handleFile}
-          style={{ display: "none" }}
-        />
-      </label>
+      </PhotoPicker>
 
       {!image && (
         <div style={{
@@ -761,11 +906,12 @@ function CatalogScreen({ parts }) {
   const [search, setSearch] = useState("");
   const [selected, setSelected] = useState(null);
 
+  const q = search.toLowerCase();
   const filtered = parts.filter(p =>
-    p.name?.toLowerCase().includes(search.toLowerCase()) ||
-    p.code?.toLowerCase().includes(search.toLowerCase()) ||
-    p.category?.toLowerCase().includes(search.toLowerCase()) ||
-    p.description?.toLowerCase().includes(search.toLowerCase())
+    p.name?.toLowerCase().includes(q) ||
+    p.code?.toLowerCase().includes(q) ||
+    p.category?.toLowerCase().includes(q) ||
+    p.description?.toLowerCase().includes(q)
   );
 
   if (selected) return <PartDetail part={selected} onBack={() => setSelected(null)} />;
@@ -847,7 +993,7 @@ function PartDetail({ part, onBack }) {
           <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 12 }}>
             <div style={{ display: "inline-flex", alignItems: "center", gap: 8, background: T.bluePale, borderRadius: 12, padding: "8px 14px" }}>
               <span>🏷️</span>
-              <span style={{ fontFamily: "monospace", color: T.blue, fontWeight: 700, fontSize: 16 }}>{part.code}</span>
+              <span className="wrap-anywhere" style={{ fontFamily: "monospace", color: T.blue, fontWeight: 700, fontSize: 16 }}>{part.code}</span>
             </div>
             {part.category && (
               <div style={{ display: "inline-flex", alignItems: "center", background: T.orangePale, borderRadius: 10, padding: "8px 12px" }}>
@@ -876,6 +1022,7 @@ function PartDetail({ part, onBack }) {
 // ===================== RESULT CARD =====================
 function ResultCard({ result, onReset }) {
   const { matched, part, confidence, reasoning } = result;
+  const pct = Math.max(0, Math.min(100, Number(confidence) || 0));
   return (
     <div className="fade-up" style={{ padding: 16 }}>
       <div style={{ background: T.card, borderRadius: 20, overflow: "hidden", boxShadow: T.shadowLg, border: `1px solid ${T.border}` }}>
@@ -888,16 +1035,16 @@ function ResultCard({ result, onReset }) {
               {matched ? "✅ Part Identified" : "❌ No Match Found"}
             </div>
             <div style={{ color: "rgba(255,255,255,0.7)", fontSize: 13, marginTop: 3 }}>
-              AI confidence: {confidence}%
+              AI confidence: {pct}%
             </div>
           </div>
           <div style={{
             background: matched ? `linear-gradient(135deg, ${T.orange}, ${T.orangeLight})` : "rgba(255,255,255,0.15)",
             borderRadius: 14, padding: "8px 14px", color: "white", fontSize: 18, fontWeight: 800
-          }}>{confidence}%</div>
+          }}>{pct}%</div>
         </div>
         <div style={{ height: 4, background: T.border }}>
-          <div style={{ height: "100%", width: `${confidence}%`, background: `linear-gradient(90deg, ${T.orange}, ${T.orangeLight})`, transition: "width 0.8s ease" }} />
+          <div style={{ height: "100%", width: `${pct}%`, background: `linear-gradient(90deg, ${T.orange}, ${T.orangeLight})`, transition: "width 0.8s ease" }} />
         </div>
         <div style={{ padding: 20 }}>
           {matched && part ? (
@@ -906,7 +1053,7 @@ function ResultCard({ result, onReset }) {
               <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 12 }}>
                 <div style={{ display: "inline-flex", alignItems: "center", gap: 8, background: T.bluePale, borderRadius: 12, padding: "8px 14px" }}>
                   <span>🏷️</span>
-                  <span style={{ fontFamily: "monospace", color: T.blue, fontWeight: 700, fontSize: 16 }}>{part.code}</span>
+                  <span className="wrap-anywhere" style={{ fontFamily: "monospace", color: T.blue, fontWeight: 700, fontSize: 16 }}>{part.code}</span>
                 </div>
                 {part.category && (
                   <div style={{ display: "inline-flex", alignItems: "center", background: T.orangePale, borderRadius: 10, padding: "8px 12px" }}>
@@ -915,7 +1062,7 @@ function ResultCard({ result, onReset }) {
                 )}
               </div>
               <h3 style={{ fontSize: 20, fontWeight: 800, color: T.text, marginBottom: 8, lineHeight: 1.2 }}>{part.name}</h3>
-              <p style={{ fontSize: 14, color: T.textMid, lineHeight: 1.6, marginBottom: 16 }}>{part.description}</p>
+              {part.description && <p style={{ fontSize: 14, color: T.textMid, lineHeight: 1.6, marginBottom: 16 }}>{part.description}</p>}
               {part.compatibility?.length > 0 && (
                 <div style={{ marginBottom: 16 }}>
                   <p style={{ fontSize: 11, color: T.textLight, fontWeight: 700, marginBottom: 8, textTransform: "uppercase", letterSpacing: 1 }}>Compatibility</p>
@@ -934,11 +1081,13 @@ function ResultCard({ result, onReset }) {
               </p>
             </div>
           )}
-          <div style={{ background: T.orangePale, border: `1px solid ${T.orange}33`, borderRadius: 12, padding: "12px 14px", marginBottom: 20 }}>
-            <p style={{ color: "#92400E", fontSize: 13, lineHeight: 1.5 }}>
-              <strong>💡 AI Analysis: </strong>{reasoning}
-            </p>
-          </div>
+          {reasoning && (
+            <div style={{ background: T.orangePale, border: `1px solid ${T.orange}33`, borderRadius: 12, padding: "12px 14px", marginBottom: 20 }}>
+              <p style={{ color: "#92400E", fontSize: 13, lineHeight: 1.5 }}>
+                <strong>💡 AI Analysis: </strong>{reasoning}
+              </p>
+            </div>
+          )}
           <button onClick={onReset} className="tap-sc" style={{
             width: "100%", padding: 15, borderRadius: 14,
             background: `linear-gradient(135deg, ${T.orange}, ${T.orangeLight})`,
@@ -967,7 +1116,7 @@ function HistoryScreen({ history }) {
         <span style={{ marginLeft: 8, background: T.bluePale, color: T.blue, fontSize: 13, borderRadius: 8, padding: "2px 8px", fontWeight: 700, verticalAlign: "middle" }}>{history.length}</span>
       </h2>
       {history.map((item, i) => (
-        <div key={i} className="fade-in" style={{
+        <div key={`${item.timestamp}-${i}`} className="fade-in" style={{
           background: T.card, borderRadius: 16, marginBottom: 10,
           border: `1px solid ${T.border}`, display: "flex",
           alignItems: "center", gap: 12, padding: 12,
@@ -982,7 +1131,7 @@ function HistoryScreen({ history }) {
             {item.matched && item.part ? (
               <>
                 <div style={{ fontWeight: 700, color: T.text, fontSize: 15 }}>{item.part.name}</div>
-                <div style={{ fontFamily: "monospace", color: T.blue, fontSize: 12, marginTop: 2 }}>{item.part.code}</div>
+                <div className="wrap-anywhere" style={{ fontFamily: "monospace", color: T.blue, fontSize: 12, marginTop: 2 }}>{item.part.code}</div>
               </>
             ) : (
               <div style={{ fontWeight: 600, color: T.textMid, fontSize: 14 }}>No match found</div>
@@ -1016,7 +1165,20 @@ function AdminApp({ parts, onAddPart, onUpdatePart, onDeletePart, reloadParts, l
       <Header title="WERFEN SCAN Admin" subtitle="Administrator Area" onLogout={onLogout} />
       <div style={{ paddingBottom: 90 }}>
         {tab === "parts" && <PartsListScreen parts={parts} onEdit={handleEdit} onAdd={handleAddNew} onDeletePart={onDeletePart} reloadParts={reloadParts} loadError={loadError} />}
-        {tab === "add"   && <AddEditPartScreen parts={parts} editingPart={editingPart} onAddPart={onAddPart} onUpdatePart={onUpdatePart} onDone={handleDone} />}
+        {/* ⚠️ BUG CORRETTO — la `key` forza il remount quando si passa da
+            "Edit" a "Add" restando sullo stesso tab. Prima il form manteneva
+            i dati del ricambio in modifica e il salvataggio falliva con
+            "This code already exists". */}
+        {tab === "add"   && (
+          <AddEditPartScreen
+            key={editingPart?.id || "new"}
+            parts={parts}
+            editingPart={editingPart}
+            onAddPart={onAddPart}
+            onUpdatePart={onUpdatePart}
+            onDone={handleDone}
+          />
+        )}
         {tab === "settings" && <SettingsScreen partsCount={parts.length} />}
       </div>
       <TabBar
@@ -1031,7 +1193,7 @@ function AdminApp({ parts, onAddPart, onUpdatePart, onDeletePart, reloadParts, l
           else { setEditingPart(null); setTab(t); }
         }}
       />
-      <Tagline />
+      <Tagline raised />
     </div>
   );
 }
@@ -1041,16 +1203,22 @@ function PartsListScreen({ parts, onEdit, onAdd, onDeletePart, reloadParts, load
   const [search, setSearch] = useState("");
   const [confirmDelete, setConfirmDelete] = useState(null);
   const [refreshing, setRefreshing] = useState(false);
+  const [deleteError, setDeleteError] = useState("");
 
+  const q = search.toLowerCase();
   const filtered = parts.filter(p =>
-    p.name?.toLowerCase().includes(search.toLowerCase()) ||
-    p.code?.toLowerCase().includes(search.toLowerCase()) ||
-    p.category?.toLowerCase().includes(search.toLowerCase())
+    p.name?.toLowerCase().includes(q) ||
+    p.code?.toLowerCase().includes(q) ||
+    p.category?.toLowerCase().includes(q)
   );
 
   async function deletePart(id) {
+    setDeleteError("");
     try { await onDeletePart(id); }
-    catch (e) { console.error(e); alert("Could not delete the part. Check your connection."); }
+    catch (e) {
+      console.error(e);
+      setDeleteError("Could not delete the part. Check your connection.");
+    }
     setConfirmDelete(null);
   }
 
@@ -1070,11 +1238,11 @@ function PartsListScreen({ parts, onEdit, onAdd, onDeletePart, reloadParts, load
         />
       )}
 
-      {loadError && (
+      {(loadError || deleteError) && (
         <div style={{
           background: "#FEF2F2", border: "1px solid #FECACA", borderRadius: 14,
           padding: "12px 14px", marginBottom: 12, color: T.error, fontSize: 13, lineHeight: 1.5
-        }}>⚠️ {loadError}</div>
+        }}>⚠️ {loadError || deleteError}</div>
       )}
 
       <div style={{
@@ -1140,7 +1308,7 @@ function PartsListScreen({ parts, onEdit, onAdd, onDeletePart, reloadParts, load
                 <div style={{ width: 68, height: 68, borderRadius: 12, flexShrink: 0, background: T.bluePale, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 28 }}>🔩</div>
               )}
               <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={{ fontFamily: "monospace", color: T.blue, fontSize: 12, fontWeight: 600 }}>{part.code}</div>
+                <div className="wrap-anywhere" style={{ fontFamily: "monospace", color: T.blue, fontSize: 12, fontWeight: 600 }}>{part.code}</div>
                 <div style={{ fontWeight: 700, color: T.text, fontSize: 15, marginTop: 2 }}>{part.name}</div>
                 {part.category && (
                   <span style={{ display: "inline-block", marginTop: 4, background: T.orangePale, color: T.orange, borderRadius: 6, padding: "2px 8px", fontSize: 11, fontWeight: 600 }}>{part.category}</span>
@@ -1179,17 +1347,21 @@ function AddEditPartScreen({ parts, editingPart, onAddPart, onUpdatePart, onDone
   function field(key, val) { setForm(f => ({ ...f, [key]: val })); }
 
   async function handleImage(e) {
-    const file = e.target.files?.[0];
+    const input = e.target;
+    const file = input.files?.[0];
     if (!file) return;
     setImgLoading(true);
+    setErrors(prev => ({ ...prev, image: "" }));
     try {
       const compressed = await compressImage(file, 800, 0.78);
       field("imageBase64", compressed);
-      try { e.target.value = ""; } catch (_) {}
-    } catch {
-      setErrors(e2 => ({ ...e2, image: "Could not load the image. Try again." }));
+    } catch (err) {
+      console.error("compressImage:", err);
+      setErrors(prev => ({ ...prev, image: "Could not load the image. Try again." }));
+    } finally {
+      try { input.value = ""; } catch { /* ignore */ }
+      setImgLoading(false);
     }
-    setImgLoading(false);
   }
 
   function addCompat() {
@@ -1203,7 +1375,10 @@ function AddEditPartScreen({ parts, editingPart, onAddPart, onUpdatePart, onDone
     const e = {};
     if (!form.code.trim()) e.code = "Part code is required";
     if (!form.name.trim()) e.name = "Part name is required";
-    const dup = parts.find(p => p.code.toLowerCase() === form.code.trim().toLowerCase() && p.id !== editingPart?.id);
+    // optional chaining: un ricambio con `code` nullo non deve far crashare
+    const dup = parts.find(p =>
+      p.code?.toLowerCase() === form.code.trim().toLowerCase() && p.id !== editingPart?.id
+    );
     if (dup) e.code = "This code already exists in the database";
     return e;
   }
@@ -1214,23 +1389,20 @@ function AddEditPartScreen({ parts, editingPart, onAddPart, onUpdatePart, onDone
     setSaving(true);
     const cleaned = { ...form, code: form.code.trim(), name: form.name.trim() };
     try {
-      if (isEdit) {
-        await onUpdatePart(editingPart.id, cleaned);
-      } else {
-        await onAddPart(cleaned);
-      }
-      setSaving(false);
+      if (isEdit) await onUpdatePart(editingPart.id, cleaned);
+      else        await onAddPart(cleaned);
       onDone();
     } catch (e) {
       console.error("save error:", e);
       setErrors({ general: `Could not save to the cloud: ${e.message || "check your connection."}` });
+    } finally {
       setSaving(false);
     }
   }
 
   const inp = (key) => ({
     width: "100%", padding: "13px 16px", borderRadius: 14,
-    border: `1.5px solid ${errors[key] ? T.error : T.border}`,
+    border: `1.5px solid ${key && errors[key] ? T.error : T.border}`,
     background: T.card, fontSize: 15, color: T.text,
   });
 
@@ -1240,14 +1412,19 @@ function AddEditPartScreen({ parts, editingPart, onAddPart, onUpdatePart, onDone
         {isEdit ? "✏️ Edit Part" : "➕ New Part"}
       </h2>
 
-      {/* Photo — uses <label> for reliable Android file picker (no JS .click()) */}
-      <label htmlFor="admin-photo-input" style={{
-        display: "block", borderRadius: 18, overflow: "hidden", marginBottom: 12,
-        border: `2px dashed ${form.imageBase64 ? T.blue : T.border}`,
-        minHeight: 150,
-        background: form.imageBase64 ? "black" : T.card,
-        cursor: imgLoading ? "default" : "pointer", position: "relative"
-      }}>
+      {/* Nessun capture="environment": Android mostra la scelta fotocamera/galleria */}
+      <PhotoPicker
+        id="admin-photo-input"
+        disabled={imgLoading}
+        onFile={handleImage}
+        style={{
+          display: "block", borderRadius: 18, overflow: "hidden", marginBottom: 12,
+          border: `2px dashed ${form.imageBase64 ? T.blue : T.border}`,
+          minHeight: 150,
+          background: form.imageBase64 ? "black" : T.card,
+          cursor: imgLoading ? "default" : "pointer", position: "relative"
+        }}
+      >
         {imgLoading ? (
           <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 10, padding: 24, minHeight: 150 }}>
             <Spinner size={32} />
@@ -1262,16 +1439,12 @@ function AddEditPartScreen({ parts, editingPart, onAddPart, onUpdatePart, onDone
             <p style={{ color: T.textLight, fontSize: 12, marginTop: 4 }}>Tap to take a photo or choose from gallery</p>
           </div>
         )}
-        {/* NO capture="environment" here — lets Android show camera + gallery choice */}
-        <input
-          id="admin-photo-input"
-          type="file"
-          accept="image/*"
-          disabled={imgLoading}
-          onChange={handleImage}
-          style={{ display: "none" }}
-        />
-      </label>
+      </PhotoPicker>
+
+      {errors.image && (
+        <p style={{ color: T.error, fontSize: 12, marginBottom: 10 }}>⚠️ {errors.image}</p>
+      )}
+
       {form.imageBase64 && (
         <button onClick={() => field("imageBase64", "")} style={{
           width: "100%", padding: 9, borderRadius: 10, marginBottom: 14,
@@ -1283,7 +1456,7 @@ function AddEditPartScreen({ parts, editingPart, onAddPart, onUpdatePart, onDone
       <div style={{ marginBottom: 14 }}>
         <label style={{ display: "block", fontSize: 13, fontWeight: 600, color: T.textMid, marginBottom: 6 }}>Part Code *</label>
         <input value={form.code}
-          onChange={e => { field("code", e.target.value); setErrors(e2 => ({ ...e2, code: "" })); }}
+          onChange={e => { field("code", e.target.value); setErrors(prev => ({ ...prev, code: "" })); }}
           placeholder="e.g. PART-001, CBN-2240-A"
           style={{ ...inp("code"), fontFamily: "monospace", letterSpacing: 0.5 }}
         />
@@ -1293,7 +1466,7 @@ function AddEditPartScreen({ parts, editingPart, onAddPart, onUpdatePart, onDone
       <div style={{ marginBottom: 14 }}>
         <label style={{ display: "block", fontSize: 13, fontWeight: 600, color: T.textMid, marginBottom: 6 }}>Part Name *</label>
         <input value={form.name}
-          onChange={e => { field("name", e.target.value); setErrors(e2 => ({ ...e2, name: "" })); }}
+          onChange={e => { field("name", e.target.value); setErrors(prev => ({ ...prev, name: "" })); }}
           placeholder="e.g. Ball bearing, Hydraulic valve"
           style={inp("name")}
         />
@@ -1324,7 +1497,7 @@ function AddEditPartScreen({ parts, editingPart, onAddPart, onUpdatePart, onDone
             onChange={e => setCompatInput(e.target.value)}
             onKeyDown={e => { if (e.key === "Enter") { e.preventDefault(); addCompat(); } }}
             placeholder="e.g. CNC Lathe Mazak, Hydraulic press"
-            style={{ ...inp(), flex: 1, fontSize: 14 }}
+            style={{ ...inp(null), flex: 1, fontSize: 14 }}
           />
           <button onClick={addCompat} style={{
             padding: "13px 18px", borderRadius: 14,
@@ -1393,12 +1566,17 @@ function SettingsScreen({ partsCount }) {
     db.get("anthropic_key").then(k => { if (k) setApiKey(k); });
   }, []);
 
+  useEffect(() => {
+    if (!apiSaved) return;
+    const t = setTimeout(() => setApiSaved(false), 3000);
+    return () => clearTimeout(t);   // niente timer orfani se si cambia tab
+  }, [apiSaved]);
+
   async function saveApiKey() {
     const trimmed = apiKey.trim();
     if (!trimmed) return;
     await db.set("anthropic_key", trimmed);
     setApiSaved(true);
-    setTimeout(() => setApiSaved(false), 3000);
   }
 
   async function changePassword() {
@@ -1416,6 +1594,8 @@ function SettingsScreen({ partsCount }) {
     setOldPwd(""); setNewPwd(""); setConfirmPwd("");
     setSavingPwd(false);
   }
+
+  const keyInCode = ANTHROPIC_API_KEY.trim().length > 0;
 
   return (
     <div style={{ padding: 16 }}>
@@ -1446,28 +1626,22 @@ function SettingsScreen({ partsCount }) {
           <a href="https://console.anthropic.com" target="_blank" rel="noreferrer" style={{ color: T.blue, fontWeight: 600 }}>console.anthropic.com</a>
         </p>
 
-        {/* ✅ Option 1 — Recommended for StackBlitz */}
-        <div style={{ background: T.bluePale, borderRadius: 14, padding: "12px 14px", marginBottom: 14 }}>
-          <p style={{ color: T.blue, fontSize: 13, fontWeight: 700, marginBottom: 4 }}>✅ Option 1 — Recommended (StackBlitz)</p>
+        <div style={{ background: "#FEF2F2", border: "1px solid #FECACA", borderRadius: 14, padding: "12px 14px", marginBottom: 14 }}>
+          <p style={{ color: T.error, fontSize: 13, fontWeight: 700, marginBottom: 4 }}>⚠️ Security notice</p>
           <p style={{ color: T.textMid, fontSize: 12, lineHeight: 1.6 }}>
-            Open <strong>App.jsx</strong> → find the first line at the top:<br />
-            <code style={{ background: "#fff", borderRadius: 6, padding: "2px 6px", fontSize: 11, display: "inline-block", marginTop: 4 }}>
-              const ANTHROPIC_API_KEY = "";
-            </code><br />
-            Paste your key between the quotes and save.
+            The key is stored <strong>only in this browser</strong> and is sent directly to Anthropic.
+            Anyone using this device can extract it. For a shared/production deployment,
+            route the request through your own server instead of calling the API from the browser.
           </p>
         </div>
 
-        {/* Option 2 — localStorage fallback */}
-        <p style={{ color: T.textMid, fontSize: 13, fontWeight: 600, marginBottom: 8 }}>
-          Option 2 — Save here (stored in this browser only)
-        </p>
         <div style={{ position: "relative", marginBottom: 10 }}>
           <input
             type={apiKeyVisible ? "text" : "password"}
             value={apiKey}
             onChange={e => setApiKey(e.target.value)}
             placeholder="sk-ant-api03-..."
+            autoComplete="off"
             style={{
               width: "100%", padding: "13px 48px 13px 16px", borderRadius: 14,
               border: `1.5px solid ${T.border}`, background: T.bg, fontSize: 14,
@@ -1487,22 +1661,20 @@ function SettingsScreen({ partsCount }) {
         }}>
           {apiSaved ? "✅ Saved!" : "💾 Save API Key"}
         </button>
-        <p style={{ color: ANTHROPIC_API_KEY.trim() || apiKey ? T.success : T.error, fontSize: 12, marginTop: 8, textAlign: "center" }}>
-          {ANTHROPIC_API_KEY.trim()
+        <p style={{ color: keyInCode || apiKey ? T.success : T.error, fontSize: 12, marginTop: 8, textAlign: "center" }}>
+          {keyInCode
             ? "✅ Key set in code — AI scanning active"
             : apiKey
               ? "✅ Key set via Settings — AI scanning active"
-              : "⚠️ No API Key — AI scanning disabled"
-          }
+              : "⚠️ No API Key — AI scanning disabled"}
         </p>
       </div>
-      {/* ─────────────────────────────────────────────────────────── */}
 
       {/* Password */}
       <div style={{ background: T.card, borderRadius: 20, padding: 20, border: `1px solid ${T.border}`, boxShadow: T.shadow, marginBottom: 16 }}>
         <h3 style={{ fontWeight: 800, color: T.text, marginBottom: 18, fontSize: 17 }}>🔐 Change Administrator Password</h3>
         {[
-          { val: oldPwd, set: setOldPwd, label: "Current password",    ph: "Enter current password" },
+          { val: oldPwd, set: setOldPwd, label: "Current password",     ph: "Enter current password" },
           { val: newPwd, set: setNewPwd, label: "New password",         ph: "At least 4 characters" },
           { val: confirmPwd, set: setConfirmPwd, label: "Confirm new password", ph: "Repeat new password" },
         ].map(({ val, set, label, ph }, idx) => (
@@ -1532,11 +1704,15 @@ function SettingsScreen({ partsCount }) {
         }}>
           {savingPwd ? <><Spinner size={18} color="white" /> Updating...</> : "🔐 Update Password"}
         </button>
+        <p style={{ color: T.textLight, fontSize: 11, marginTop: 10, lineHeight: 1.5 }}>
+          Note: this is a local device gate only (the password is stored in this browser).
+          It does not protect the shared cloud database.
+        </p>
       </div>
 
       <div style={{ background: T.card, borderRadius: 16, padding: 16, border: `1px solid ${T.border}`, textAlign: "center" }}>
         <div style={{ fontSize: 28, marginBottom: 8 }}>🔧</div>
-        <div style={{ color: T.text, fontWeight: 700, fontSize: 15 }}>WERFEN SCAN v2.0</div>
+        <div style={{ color: T.text, fontWeight: 700, fontSize: 15 }}>WERFEN SCAN v2.1</div>
         <div style={{ color: T.textLight, fontSize: 13, marginTop: 4 }}>
           Industrial Spare Parts Recognition<br />
           Powered by Claude AI (Anthropic)
@@ -1546,7 +1722,7 @@ function SettingsScreen({ partsCount }) {
   );
 }
 
-// ===================== SETUP SCREEN (cloud not configured) =====================
+// ===================== SETUP SCREEN (cloud non configurato) =====================
 function SetupScreen() {
   return (
     <div style={{
@@ -1555,7 +1731,6 @@ function SetupScreen() {
       display: "flex", flexDirection: "column",
       alignItems: "center", justifyContent: "center", padding: 24
     }}>
-      <style>{GLOBAL_STYLES}</style>
       <div style={{
         background: "rgba(255,255,255,0.10)", border: "1px solid rgba(255,255,255,0.2)",
         borderRadius: 24, padding: 28, maxWidth: 380, width: "100%"
@@ -1592,6 +1767,28 @@ function SetupScreen() {
   );
 }
 
+// ===================== LOADING SCREEN =====================
+function LoadingScreen() {
+  return (
+    <div style={{
+      minHeight: "100vh",
+      background: `linear-gradient(160deg, ${T.blueDark}, ${T.blue})`,
+      display: "flex", flexDirection: "column",
+      alignItems: "center", justifyContent: "center", gap: 20
+    }}>
+      <div style={{
+        width: 72, height: 72, borderRadius: 20,
+        background: `linear-gradient(135deg, ${T.orange}, ${T.orangeLight})`,
+        display: "flex", alignItems: "center", justifyContent: "center",
+        fontSize: 34, boxShadow: "0 8px 32px rgba(255,104,32,0.4)",
+        animation: "pulse 1.2s ease infinite"
+      }}>🔧</div>
+      <p style={{ color: "rgba(255,255,255,0.7)", fontSize: 16, fontWeight: 600 }}>Loading WERFEN SCAN...</p>
+      <Tagline light />
+    </div>
+  );
+}
+
 // ===================== ROOT =====================
 export default function App() {
   const [user, setUser] = useState(null);
@@ -1606,6 +1803,7 @@ export default function App() {
       setParts(p);
       setLoadError("");
     } catch (e) {
+      console.error("reloadParts:", e);
       setLoadError("Could not reach the cloud database. Check your connection and the Supabase keys.");
     }
   }
@@ -1613,6 +1811,7 @@ export default function App() {
   useEffect(() => {
     if (!cloudReady) { setLoading(false); return; }
     reloadParts().finally(() => setLoading(false));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   async function handleAddPart(partData) {
@@ -1628,31 +1827,12 @@ export default function App() {
     setParts(prev => prev.filter(p => p.id !== id));
   }
 
-  if (!cloudReady) return <SetupScreen />;
-
-  if (loading) return (
-    <div style={{
-      minHeight: "100vh",
-      background: `linear-gradient(160deg, ${T.blueDark}, ${T.blue})`,
-      display: "flex", flexDirection: "column",
-      alignItems: "center", justifyContent: "center", gap: 20
-    }}>
-      <style>{GLOBAL_STYLES}</style>
-      <div style={{
-        width: 72, height: 72, borderRadius: 20,
-        background: `linear-gradient(135deg, ${T.orange}, ${T.orangeLight})`,
-        display: "flex", alignItems: "center", justifyContent: "center",
-        fontSize: 34, boxShadow: "0 8px 32px rgba(255,104,32,0.4)",
-        animation: "pulse 1.2s ease infinite"
-      }}>🔧</div>
-      <p style={{ color: "rgba(255,255,255,0.7)", fontSize: 16, fontWeight: 600 }}>Loading WERFEN SCAN...</p>
-      <Tagline light />
-    </div>
-  );
-
-  if (!user) return <LoginScreen onLogin={setUser} />;
-
-  if (user.role === "admin") return (
+  // GlobalStyles è ora fuori da ogni ramo: resta montato in TUTTE le schermate.
+  let screen;
+  if (!cloudReady)            screen = <SetupScreen />;
+  else if (loading)           screen = <LoadingScreen />;
+  else if (!user)             screen = <LoginScreen onLogin={setUser} />;
+  else if (user.role === "admin") screen = (
     <AdminApp
       parts={parts}
       onAddPart={handleAddPart}
@@ -1663,6 +1843,19 @@ export default function App() {
       onLogout={() => setUser(null)}
     />
   );
+  else screen = (
+    <UserApp
+      parts={parts}
+      reloadParts={reloadParts}
+      loadError={loadError}
+      onLogout={() => setUser(null)}
+    />
+  );
 
-  return <UserApp parts={parts} reloadParts={reloadParts} loadError={loadError} onLogout={() => setUser(null)} />;
+  return (
+    <>
+      <GlobalStyles />
+      {screen}
+    </>
+  );
 }
