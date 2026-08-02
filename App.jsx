@@ -29,7 +29,7 @@ const AI_MODEL = "claude-opus-5";
 //   2. SQL Editor → esegui l'SQL della guida
 //   3. Project Settings → API → copia i due valori qui sotto
 // ════════════════════════════════════════════════════════════
-const SUPABASE_URL      = "https://upztxixdnnvhqnirxpye.supabase.co";
+const SUPABASE_URL      = "https://upztxixdnnvhqnirxpye.supabase.co/rest/v1/";
 const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVwenR4aXhkbm52aHFuaXJ4cHllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzk5NzkxNzEsImV4cCI6MjA5NTU1NTE3MX0._p2toNqZrr2Rlk4FgOOQRSnSQjxuvv94iELwamTokfk";
 
 // ⚠️ BUG CORRETTO — la versione precedente era:
