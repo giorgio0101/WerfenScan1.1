@@ -2,53 +2,43 @@ import { useState, useEffect } from "react";
 import { createClient } from "@supabase/supabase-js";
 
 // ════════════════════════════════════════════════════════════
-//  ⚙️  ANTHROPIC API KEY  ⚙️
-//  ⛔ NON incollare qui la chiave in un'app pubblicata:
-//     il bundle JS è scaricabile da chiunque apra il sito e
-//     la chiave verrebbe letta in chiaro (= credito rubato).
-//
-//  Usa una delle due opzioni:
-//   A) Amministratore → Settings → incolla la chiave
-//      (resta solo in localStorage, su QUESTO dispositivo)
-//   B) [consigliato in produzione] crea un piccolo proxy
-//      server-side che tiene la chiave e inoltra la richiesta.
-//
-//  Lasciare "" è la configurazione sicura di default.
-// ════════════════════════════════════════════════════════════
-const ANTHROPIC_API_KEY = "";
-const ADMIN_EMAIL = "giorgiocanada6@gmail.com";   // ← sostituisci con la TUA email admin
-// Modello usato per il riconoscimento visivo.
-//  - "claude-opus-5"      → massima accuratezza sul riconoscimento immagini
-//  - "claude-sonnet-4-6"  → più economico/veloce (era il valore precedente)
-const AI_MODEL = "claude-opus-5";
-
-// ════════════════════════════════════════════════════════════
-//  ☁️  SHARED CLOUD DATABASE (SUPABASE)  ☁️
-//  Ricambi e cronologia scansioni condivisi tra tutti i device.
-//   1. supabase.com → crea progetto gratuito
-//   2. SQL Editor → esegui l'SQL della guida
-//   3. Project Settings → API → copia i due valori qui sotto
+//  ☁️  SUPABASE  ☁️
+//  Settings → API → "Project URL" (NON l'endpoint REST: niente /rest/v1)
 // ════════════════════════════════════════════════════════════
 const SUPABASE_URL      = "https://upztxixdnnvhqnirxpye.supabase.co";
 const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVwenR4aXhkbm52aHFuaXJ4cHllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzk5NzkxNzEsImV4cCI6MjA5NTU1NTE3MX0._p2toNqZrr2Rlk4FgOOQRSnSQjxuvv94iELwamTokfk";
 
-// ⚠️ BUG CORRETTO — la versione precedente era:
-//      SUPABASE_URL !== "https://upztxixdnnvhqnirxpye.supabase.co" && ...
-//    cioè confrontava i valori configurati CON SÉ STESSI → sempre false
-//    → supabase = null → l'app restava bloccata su SetupScreen e non
-//    arrivava mai al login. Ora si controllano dei veri segnaposto.
-const isPlaceholder = (v) =>
-  !v || /YOUR[-_]|<.*>|INCOLLA|PASTE|EXAMPLE|xxxx/i.test(v);
+// ⚠️ L'email dell'account amministratore creato su Supabase.
+//    Deve combaciare ESATTAMENTE con quella usata nelle policy RLS.
+//    Precompilata con la tua: cambiala qui E in SETUP.md se ne usi un'altra.
+const ADMIN_EMAIL = "giorgiocanada6@gmail.com";
 
-const cloudReady =
-  !isPlaceholder(SUPABASE_URL) &&
-  !isPlaceholder(SUPABASE_ANON_KEY) &&
-  /^https:\/\/.+\.supabase\.co\/?$/.test(SUPABASE_URL.trim()) &&
-  SUPABASE_ANON_KEY.trim().length > 40;
+// 🔑 La chiave Anthropic NON sta più qui: vive nelle Environment
+//    Variables di Vercel e viene usata solo da /api/analyze.
 
-const supabase = cloudReady
-  ? createClient(SUPABASE_URL.trim(), SUPABASE_ANON_KEY.trim())
-  : null;
+// Tollera slash finale ed endpoint REST copiato per errore dalla dashboard
+const normalizeSupabaseUrl = (v) =>
+  String(v || "").trim().replace(/\/+$/, "").replace(/\/rest\/v1$/i, "").replace(/\/+$/, "");
+
+const SUPABASE_URL_CLEAN = normalizeSupabaseUrl(SUPABASE_URL);
+const SUPABASE_KEY_CLEAN = String(SUPABASE_ANON_KEY || "").trim();
+const isPlaceholder = (v) => !v || /YOUR[-_]|<.*>|INCOLLA|PASTE|EXAMPLE|xxxx/i.test(v);
+
+let cloudConfigProblem = "";
+if (isPlaceholder(SUPABASE_URL) || !SUPABASE_URL_CLEAN)
+  cloudConfigProblem = "SUPABASE_URL non configurato.";
+else if (!/^https:\/\/[^\s/]+\.[^\s/]+$/.test(SUPABASE_URL_CLEAN))
+  cloudConfigProblem = `SUPABASE_URL non valido: "${SUPABASE_URL}" — serve https://xxxx.supabase.co, senza percorsi tipo /rest/v1.`;
+else if (isPlaceholder(SUPABASE_ANON_KEY) || !SUPABASE_KEY_CLEAN)
+  cloudConfigProblem = "SUPABASE_ANON_KEY non configurata.";
+else if (!/^ey[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(SUPABASE_KEY_CLEAN))
+  cloudConfigProblem = "SUPABASE_ANON_KEY non ha formato JWT (deve iniziare con 'ey').";
+
+const cloudReady = !cloudConfigProblem;
+const supabase = cloudReady ? createClient(SUPABASE_URL_CLEAN, SUPABASE_KEY_CLEAN) : null;
+
+const isAdminEmail = (email) =>
+  !!email && email.trim().toLowerCase() === ADMIN_EMAIL.trim().toLowerCase();
 
 // ===================== THEME =====================
 const T = {
@@ -88,7 +78,6 @@ const GLOBAL_STYLES = `
   body { overscroll-behavior-y: contain; line-height: 1.4; }
   #root { width: 100%; overflow-x: hidden; }
 
-  /* Input a 16px+ così iOS Safari/Chrome non fa auto-zoom sul focus */
   input, textarea, select, button {
     font-family: ${FONT};
     outline: none;
@@ -97,11 +86,8 @@ const GLOBAL_STYLES = `
   button { cursor: pointer; border: none; -webkit-appearance: none; appearance: none; }
   textarea { resize: vertical; }
   input[type="file"] { display: none; }
-
   img { max-width: 100%; height: auto; }
-
   table { width: 100%; border-collapse: collapse; }
-  .table-scroll { width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
   .wrap-anywhere { overflow-wrap: anywhere; word-break: break-word; }
 
   @keyframes spin    { to { transform: rotate(360deg); } }
@@ -114,34 +100,16 @@ const GLOBAL_STYLES = `
   .tap-sc:active { transform: scale(0.96); }
 `;
 
-// ⚠️ BUG CORRETTO — prima <style>{GLOBAL_STYLES}</style> veniva montato SOLO
-//    dentro LoginScreen / SetupScreen / schermata di caricamento. Dopo il login
-//    quei componenti si smontavano e con loro sparivano reset CSS, font,
-//    sfondo e tutte le @keyframes: gli spinner non giravano più e le
-//    animazioni della schermata principale non partivano.
-//    Ora è montato UNA volta sola alla radice dell'app.
 function GlobalStyles() {
   return <style>{GLOBAL_STYLES}</style>;
 }
 
-// ===================== LOCAL STORAGE (impostazioni per-dispositivo) =====================
-const db = {
-  get: async (key) => {
-    try { const r = localStorage.getItem(key); return r ? JSON.parse(r) : null; }
-    catch (e) { console.error("db.get error:", e); return null; }
-  },
-  set: async (key, val) => {
-    try { localStorage.setItem(key, JSON.stringify(val)); }
-    catch (e) { console.error("db.set error:", e); }
-  },
-};
-
-// ===================== SHARED CLOUD DATA LAYER (Supabase) =====================
+// ===================== CLOUD DATA LAYER =====================
 const cloud = {
   async loadParts() {
     const { data, error } = await supabase
       .from("parts").select("*").order("created_at", { ascending: false });
-    if (error) { console.error("loadParts:", error); throw error; }
+    if (error) { console.error("loadParts:", error.message, error.code); throw error; }
     return (data || []).map(p => ({
       id: p.id,
       code: p.code || "",
@@ -184,7 +152,7 @@ const cloud = {
   async loadHistory() {
     const { data, error } = await supabase
       .from("scan_history").select("*").order("timestamp", { ascending: false }).limit(60);
-    if (error) { console.error("loadHistory:", error); return []; }
+    if (error) { console.error("loadHistory:", error.message, error.code); return []; }
     return (data || []).map(h => ({
       matched: h.matched,
       confidence: h.confidence,
@@ -204,20 +172,13 @@ const cloud = {
       part_code: item.part?.code || null,
       timestamp: item.timestamp || new Date().toISOString(),
     }]);
-    if (error) console.error("addHistory:", error);
+    if (error) console.error("addHistory:", error.message, error.code);
   },
 };
-
-function djbHash(s) {
-  let h = 5381;
-  for (let i = 0; i < s.length; i++) h = ((h << 5) + h) ^ s.charCodeAt(i);
-  return (h >>> 0).toString(36);
-}
 
 // ===================== IMAGE HELPERS =====================
 function compressImage(file, maxSize = 1000, quality = 0.8) {
   return new Promise((resolve, reject) => {
-    // Timeout di sicurezza: non bloccare mai la UI su un decode incastrato
     const timer = setTimeout(() => reject(new Error("Image processing timed out")), 20000);
     const done = (val) => { clearTimeout(timer); resolve(val); };
     const fail = (err) => { clearTimeout(timer); reject(err); };
@@ -238,14 +199,11 @@ function compressImage(file, maxSize = 1000, quality = 0.8) {
         ctx.fillStyle = "#FFFFFF";
         ctx.fillRect(0, 0, w, h);
         ctx.drawImage(bitmapOrImg, 0, 0, w, h);
-        if (bitmapOrImg.close) bitmapOrImg.close(); // libera l'ImageBitmap
+        if (bitmapOrImg.close) bitmapOrImg.close();
         done(canvas.toDataURL("image/jpeg", quality));
       } catch (e) { fail(e); }
     }
 
-    // Percorso preferito: createImageBitmap gestisce nativamente i file
-    // enormi delle fotocamere Android. imageOrientation:"from-image" applica
-    // la rotazione EXIF → niente più foto ruotate di 90° prese col telefono.
     if (typeof createImageBitmap === "function") {
       createImageBitmap(file, { imageOrientation: "from-image" })
         .then(bmp => drawAndExport(bmp, bmp.width, bmp.height))
@@ -254,7 +212,6 @@ function compressImage(file, maxSize = 1000, quality = 0.8) {
       fallbackPath();
     }
 
-    // Fallback classico: objectURL + <img>
     function fallbackPath() {
       try {
         const url = URL.createObjectURL(file);
@@ -267,9 +224,6 @@ function compressImage(file, maxSize = 1000, quality = 0.8) {
   });
 }
 
-// Miniatura per la cronologia: la versione precedente salvava su Supabase
-// l'immagine piena (~150-250 KB in base64) per ogni scansione. Caricando 60
-// righe la schermata History scaricava diversi MB ad ogni apertura.
 function makeThumb(dataUrl, maxSize = 200, quality = 0.65) {
   return new Promise((resolve) => {
     try {
@@ -294,36 +248,7 @@ function makeThumb(dataUrl, maxSize = 200, quality = 0.65) {
   });
 }
 
-// Estrae il primo oggetto JSON bilanciato da un testo, anche se il modello
-// aggiunge prosa o code-fence attorno. Evita che JSON.parse fallisca e
-// trasformi una scansione riuscita in "AI analysis failed".
-function extractJson(raw) {
-  const cleaned = String(raw).replace(/```json/gi, "").replace(/```/g, "").trim();
-  try { return JSON.parse(cleaned); } catch { /* continua */ }
-
-  const start = cleaned.indexOf("{");
-  if (start === -1) throw new Error("No JSON object in AI response");
-
-  let depth = 0, inStr = false, esc = false;
-  for (let i = start; i < cleaned.length; i++) {
-    const ch = cleaned[i];
-    if (inStr) {
-      if (esc) esc = false;
-      else if (ch === "\\") esc = true;
-      else if (ch === '"') inStr = false;
-      continue;
-    }
-    if (ch === '"') inStr = true;
-    else if (ch === "{") depth++;
-    else if (ch === "}") {
-      depth--;
-      if (depth === 0) return JSON.parse(cleaned.slice(start, i + 1));
-    }
-  }
-  throw new Error("Malformed JSON in AI response");
-}
-
-// ===================== SPINNER =====================
+// ===================== SPINNER / TAGLINE / DIALOG =====================
 function Spinner({ size = 28, color = T.blue }) {
   return (
     <div style={{
@@ -337,9 +262,6 @@ function Spinner({ size = 28, color = T.blue }) {
   );
 }
 
-// ===================== TAGLINE =====================
-// `raised` alza la scritta sopra la TabBar: prima si sovrapponeva alle
-// etichette dei tab nelle schermate User/Admin.
 function Tagline({ light = false, raised = false }) {
   return (
     <div style={{
@@ -357,7 +279,6 @@ function Tagline({ light = false, raised = false }) {
   );
 }
 
-// ===================== CONFIRM DIALOG =====================
 function ConfirmDialog({ message, onConfirm, onCancel }) {
   return (
     <div style={{
@@ -390,13 +311,9 @@ function ConfirmDialog({ message, onConfirm, onCancel }) {
 }
 
 // ===================== PHOTO PICKER =====================
-// ⚠️ BUG CORRETTO (il "loop" della fotocamera) —
-//    prima l'<input type="file"> era ANNIDATO dentro il <label> che aveva
-//    anche htmlFor sullo stesso id. Con questa combinazione il browser
-//    inoltra il click all'input DUE volte (attivazione implicita per
-//    discendenza + attivazione esplicita per `for`): su Android il selettore
-//    fotocamera si riapre subito dopo lo scatto, dando l'effetto loop.
-//    Qui l'input è fuori dal label: una sola attivazione per tap.
+// L'<input> è FUORI dal <label>: se fosse annidato e allo stesso tempo
+// referenziato da htmlFor, il browser inoltrerebbe il click due volte
+// e su Android la fotocamera si riaprirebbe dopo lo scatto.
 function PhotoPicker({ id, disabled, onFile, children, style }) {
   return (
     <>
@@ -413,28 +330,38 @@ function PhotoPicker({ id, disabled, onFile, children, style }) {
   );
 }
 
-// ===================== LOGIN SCREEN =====================
-function LoginScreen({ onLogin }) {
-  const [mode, setMode] = useState(null);
+// ===================== LOGIN SCREEN (Supabase Auth) =====================
+function LoginScreen() {
+  const [email, setEmail]       = useState("");
   const [password, setPassword] = useState("");
-  const [error, setError] = useState("");
-  const [loading, setLoading] = useState(false);
+  const [error, setError]       = useState("");
+  const [loading, setLoading]   = useState(false);
 
-  async function handleAdminLogin() {
-    if (!password.trim()) { setError("Please enter the password"); return; }
+  async function handleLogin() {
+    if (!email.trim() || !password) { setError("Inserisci email e password"); return; }
     setLoading(true);
-    const stored = await db.get("admin_password");
-    const defaultHash = djbHash("admin123");
-    const inputHash = djbHash(password);
-    const ok = stored ? inputHash === stored : inputHash === defaultHash;
-    if (ok) {
-      if (!stored) await db.set("admin_password", defaultHash);
-      onLogin({ role: "admin" });
-    } else {
-      setError("Incorrect password");
+    setError("");
+    const { error } = await supabase.auth.signInWithPassword({
+      email: email.trim(),
+      password,
+    });
+    if (error) {
+      setError(
+        error.message === "Invalid login credentials"
+          ? "Email o password non corretti"
+          : error.message
+      );
       setLoading(false);
     }
+    // In caso di successo onAuthStateChange in App fa il resto.
   }
+
+  const inputStyle = {
+    width: "100%", padding: "15px 18px", borderRadius: 14, marginBottom: 10,
+    background: "rgba(255,255,255,0.15)",
+    border: `1px solid ${error ? T.orange : "rgba(255,255,255,0.25)"}`,
+    color: "white", fontSize: 16,
+  };
 
   return (
     <div style={{
@@ -447,7 +374,7 @@ function LoginScreen({ onLogin }) {
       <div style={{ position: "absolute", top: -80, right: -80, width: 280, height: 280, borderRadius: "50%", background: "rgba(255,104,32,0.13)", pointerEvents: "none" }} />
       <div style={{ position: "absolute", bottom: -60, left: -60, width: 200, height: 200, borderRadius: "50%", background: "rgba(63,60,184,0.22)", pointerEvents: "none" }} />
 
-      <div className="fade-up" style={{ textAlign: "center", marginBottom: 48, position: "relative", zIndex: 1 }}>
+      <div className="fade-up" style={{ textAlign: "center", marginBottom: 40, position: "relative", zIndex: 1 }}>
         <div style={{
           width: 88, height: 88, borderRadius: 24, margin: "0 auto 16px",
           background: `linear-gradient(135deg, ${T.orange}, ${T.orangeLight})`,
@@ -460,82 +387,55 @@ function LoginScreen({ onLogin }) {
         </div>
       </div>
 
-      {!mode && (
-        <div className="fade-up" style={{
-          width: "100%", maxWidth: 360,
-          background: "rgba(255,255,255,0.10)", backdropFilter: "blur(16px)",
-          WebkitBackdropFilter: "blur(16px)",
-          border: "1px solid rgba(255,255,255,0.18)", borderRadius: 24, padding: 28,
-          animationDelay: "0.1s", position: "relative", zIndex: 1
-        }}>
-          <p style={{ color: "rgba(255,255,255,0.85)", textAlign: "center", marginBottom: 20, fontSize: 16, fontWeight: 500 }}>
-            Select account type
-          </p>
-          <button onClick={() => onLogin({ role: "user" })} className="tap-sc" style={{
-            width: "100%", padding: 18, borderRadius: 16, marginBottom: 12,
-            background: `linear-gradient(135deg, ${T.orange}, ${T.orangeLight})`,
-            color: "white", fontSize: 16, fontWeight: 700,
-            boxShadow: "0 6px 24px rgba(255,104,32,0.45)",
-            display: "flex", alignItems: "center", justifyContent: "center", gap: 10
-          }}>
-            <span style={{ fontSize: 22 }}>📷</span> User Account
-          </button>
-          <button onClick={() => setMode("admin")} className="tap-sc" style={{
-            width: "100%", padding: 18, borderRadius: 16,
-            background: "rgba(255,255,255,0.12)", border: "1px solid rgba(255,255,255,0.25)",
-            color: "white", fontSize: 16, fontWeight: 600,
-            display: "flex", alignItems: "center", justifyContent: "center", gap: 10
-          }}>
-            <span style={{ fontSize: 22 }}>⚙️</span> Administrator Account
-          </button>
-        </div>
-      )}
+      <div className="fade-up" style={{
+        width: "100%", maxWidth: 360,
+        background: "rgba(255,255,255,0.10)", backdropFilter: "blur(16px)",
+        WebkitBackdropFilter: "blur(16px)",
+        border: "1px solid rgba(255,255,255,0.18)", borderRadius: 24, padding: 28,
+        position: "relative", zIndex: 1
+      }}>
+        <h3 style={{ color: "white", marginBottom: 18, textAlign: "center", fontSize: 18, fontWeight: 700 }}>
+          Accedi
+        </h3>
 
-      {mode === "admin" && (
-        <div className="fade-up" style={{
-          width: "100%", maxWidth: 360,
-          background: "rgba(255,255,255,0.10)", backdropFilter: "blur(16px)",
-          WebkitBackdropFilter: "blur(16px)",
-          border: "1px solid rgba(255,255,255,0.18)", borderRadius: 24, padding: 28,
-          position: "relative", zIndex: 1
+        <input
+          type="email" placeholder="Email" autoComplete="username"
+          inputMode="email" autoCapitalize="none" autoCorrect="off"
+          value={email}
+          onChange={e => { setEmail(e.target.value); setError(""); }}
+          style={inputStyle}
+        />
+        <input
+          type="password" placeholder="Password" autoComplete="current-password"
+          value={password}
+          onChange={e => { setPassword(e.target.value); setError(""); }}
+          onKeyDown={e => e.key === "Enter" && handleLogin()}
+          style={inputStyle}
+        />
+
+        {error && <p style={{ color: T.orangeLight, fontSize: 13, marginBottom: 10 }}>⚠️ {error}</p>}
+
+        <button onClick={handleLogin} disabled={loading} className="tap-sc" style={{
+          width: "100%", padding: 15, borderRadius: 14,
+          background: loading ? "rgba(255,255,255,0.2)" : `linear-gradient(135deg, ${T.orange}, ${T.orangeLight})`,
+          color: "white", fontSize: 16, fontWeight: 700,
+          display: "flex", alignItems: "center", justifyContent: "center", gap: 8
         }}>
-          <h3 style={{ color: "white", marginBottom: 20, textAlign: "center", fontSize: 18, fontWeight: 700 }}>
-            Administrator Login
-          </h3>
-          <input
-            type="password" placeholder="Password" autoComplete="current-password"
-            value={password}
-            onChange={e => { setPassword(e.target.value); setError(""); }}
-            onKeyDown={e => e.key === "Enter" && handleAdminLogin()}
-            style={{
-              width: "100%", padding: "15px 18px", borderRadius: 14, marginBottom: 8,
-              background: "rgba(255,255,255,0.15)",
-              border: `1px solid ${error ? T.orange : "rgba(255,255,255,0.25)"}`,
-              color: "white", fontSize: 16,
-            }}
-          />
-          {error && <p style={{ color: T.orangeLight, fontSize: 13, marginBottom: 10 }}>⚠️ {error}</p>}
-          <button onClick={handleAdminLogin} disabled={loading} className="tap-sc" style={{
-            width: "100%", padding: 15, borderRadius: 14, marginBottom: 10,
-            background: loading ? "rgba(255,255,255,0.2)" : `linear-gradient(135deg, ${T.orange}, ${T.orangeLight})`,
-            color: "white", fontSize: 16, fontWeight: 700,
-            display: "flex", alignItems: "center", justifyContent: "center", gap: 8
-          }}>
-            {loading ? <><Spinner size={18} color="white" /> Logging in...</> : "Log In →"}
-          </button>
-          <button onClick={() => { setMode(null); setError(""); setPassword(""); }} style={{
-            width: "100%", padding: 10, borderRadius: 12,
-            background: "transparent", color: "rgba(255,255,255,0.6)", fontSize: 14
-          }}>← Back</button>
-        </div>
-      )}
+          {loading ? <><Spinner size={18} color="white" /> Accesso in corso...</> : "Accedi →"}
+        </button>
+
+        <p style={{ color: "rgba(255,255,255,0.45)", fontSize: 11, textAlign: "center", marginTop: 14, lineHeight: 1.5 }}>
+          L'accesso resta memorizzato su questo dispositivo.<br />
+          Le credenziali le fornisce l'amministratore.
+        </p>
+      </div>
 
       <Tagline light />
     </div>
   );
 }
 
-// ===================== HEADER =====================
+// ===================== HEADER / TABBAR =====================
 function Header({ title, subtitle, onLogout }) {
   return (
     <div style={{
@@ -566,7 +466,6 @@ function Header({ title, subtitle, onLogout }) {
   );
 }
 
-// ===================== TAB BAR =====================
 function TabBar({ tabs, active, onChange }) {
   return (
     <div style={{
@@ -609,7 +508,6 @@ function UserApp({ parts, reloadParts, loadError, onLogout }) {
   }, []);
 
   async function addToHistory(item) {
-    // Nella lista locale teniamo l'immagine piena; su cloud solo la miniatura.
     setHistory(prev => [item, ...prev].slice(0, 60));
     const thumb = item.image ? await makeThumb(item.image) : "";
     await cloud.addHistory({ ...item, image: thumb });
@@ -617,7 +515,7 @@ function UserApp({ parts, reloadParts, loadError, onLogout }) {
 
   return (
     <div style={{ minHeight: "100vh", background: T.bg, maxWidth: 520, margin: "0 auto" }}>
-      <Header title="WERFEN SCAN" subtitle="User — Spare Parts Recognition" onLogout={onLogout} />
+      <Header title="WERFEN SCAN" subtitle="Spare Parts Recognition" onLogout={onLogout} />
       <div style={{ paddingBottom: 90 }}>
         {tab === "scan"    && <ScanScreen parts={parts} onAddHistory={addToHistory} reloadParts={reloadParts} loadError={loadError} />}
         {tab === "catalog" && <CatalogScreen parts={parts} />}
@@ -646,7 +544,7 @@ function ScanScreen({ parts, onAddHistory, reloadParts, loadError }) {
   const [imgLoading, setImgLoading] = useState(false);
 
   async function handleFile(e) {
-    const input = e.target;                 // riferimento stabile
+    const input = e.target;
     const file = input.files?.[0];
     if (!file) return;
     setImgLoading(true);
@@ -657,12 +555,10 @@ function ScanScreen({ parts, onAddHistory, reloadParts, loadError }) {
       setResult(null);
     } catch (err) {
       console.error("compressImage:", err);
-      setError("Could not load the image. Please try again.");
+      setError("Impossibile caricare l'immagine. Riprova.");
     } finally {
-      // ⚠️ BUG CORRETTO — prima il reset del value avveniva solo nel ramo
-      //    di successo: dopo un errore l'input restava "sporco" e riselezionare
-      //    la STESSA foto non faceva più scattare onChange (app apparentemente
-      //    bloccata). Ora si azzera sempre.
+      // Sempre, anche dopo un errore: altrimenti riselezionare la STESSA
+      // foto non farebbe più scattare onChange e l'app sembrerebbe bloccata.
       try { input.value = ""; } catch { /* ignore */ }
       setImgLoading(false);
     }
@@ -671,13 +567,7 @@ function ScanScreen({ parts, onAddHistory, reloadParts, loadError }) {
   async function analyze() {
     if (!image) return;
     if (parts.length === 0) {
-      setError("The database is empty. Ask the administrator to add spare parts first.");
-      return;
-    }
-
-    const apiKey = ANTHROPIC_API_KEY.trim() || (await db.get("anthropic_key")) || "";
-    if (!apiKey) {
-      setError("API Key not configured. Open Administrator → Settings and paste your Anthropic key.");
+      setError("Il database è vuoto. Chiedi all'amministratore di caricare i ricambi.");
       return;
     }
 
@@ -685,6 +575,14 @@ function ScanScreen({ parts, onAddHistory, reloadParts, loadError }) {
     setError("");
 
     try {
+      // La sessione Supabase autorizza la chiamata al proxy.
+      const { data: { session } } = await supabase.auth.getSession();
+      const token = session?.access_token;
+      if (!token) throw new Error("Sessione scaduta. Esegui di nuovo il login.");
+
+      const [meta, base64] = image.split(",");
+      const mediaType = meta.split(";")[0].split(":")[1];
+
       const partsCtx = parts.map(p => ({
         id: p.id, code: p.code, name: p.name,
         description: p.description,
@@ -692,72 +590,28 @@ function ScanScreen({ parts, onAddHistory, reloadParts, loadError }) {
         compatibility: p.compatibility || []
       }));
 
-      const [meta, base64] = image.split(",");
-      const mediaType = meta.split(";")[0].split(":")[1];
-
-      const res = await fetch("https://api.anthropic.com/v1/messages", {
+      // 🔑 Nessuna chiave qui: la aggiunge il server in /api/analyze
+      const res = await fetch("/api/analyze", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "x-api-key": apiKey,
-          "anthropic-version": "2023-06-01",
-          "anthropic-dangerous-direct-browser-access": "true",
+          Authorization: `Bearer ${token}`,
         },
         body: JSON.stringify({
-          model: AI_MODEL,
-          // Su Claude Opus 5 il "thinking" è attivo di default e max_tokens
-          // limita ragionamento + risposta insieme: 3000 lascia margine.
-          max_tokens: 3000,
-          output_config: { effort: "low" },
-          messages: [{
-            role: "user",
-            content: [
-              {
-                type: "image",
-                source: { type: "base64", media_type: mediaType, data: base64 }
-              },
-              {
-                type: "text",
-                text: `You are a specialist technician for industrial spare part visual recognition.
-Carefully analyze this image and compare it with the database below.
-
-PARTS DATABASE:
-${JSON.stringify(partsCtx, null, 2)}
-
-Identify the matching part by analyzing: shape, color, size, component type, visible markings, physical characteristics.
-
-Reply ONLY with valid JSON (no extra text, no markdown, no backticks). Keep "reasoning" under 40 words:
-- If match found: {"matched":true,"id":"<exact id>","confidence":<0-100>,"reasoning":"<concise technical explanation>"}
-- If no match: {"matched":false,"confidence":0,"reasoning":"<describe what you see and why no part matches>"}`
-              }
-            ]
-          }]
-        })
+          image: { media_type: mediaType, data: base64 },
+          parts: partsCtx,
+        }),
       });
 
-      if (!res.ok) {
-        const errBody = await res.json().catch(() => ({}));
-        throw new Error(errBody.error?.message || `HTTP ${res.status} — check your API Key`);
-      }
+      const payload = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(payload.error || `HTTP ${res.status}`);
 
-      const data = await res.json();
-
-      if (data.stop_reason === "refusal") {
-        throw new Error("The AI declined to analyze this image. Try a different photo.");
-      }
-
-      const raw = (data.content || [])
-        .filter(c => c.type === "text")
-        .map(c => c.text || "")
-        .join("");
-
-      const parsed = extractJson(raw);
-      const matchedPart = parsed.matched ? parts.find(p => p.id === parsed.id) : null;
+      const matchedPart = payload.matched ? parts.find(p => p.id === payload.id) : null;
 
       const finalResult = {
-        ...parsed,
-        confidence: Number(parsed.confidence) || 0,
-        matched: !!parsed.matched && !!matchedPart,
+        matched: !!payload.matched && !!matchedPart,
+        confidence: Number(payload.confidence) || 0,
+        reasoning: payload.reasoning || "",
         part: matchedPart || null,
         timestamp: new Date().toISOString(),
         image,
@@ -766,7 +620,7 @@ Reply ONLY with valid JSON (no extra text, no markdown, no backticks). Keep "rea
       onAddHistory(finalResult);
     } catch (e) {
       console.error("AI error:", e);
-      setError(`AI analysis failed: ${e.message || "check your connection and API Key."}`);
+      setError(`Analisi fallita: ${e.message || "controlla la connessione."}`);
     } finally {
       setAnalyzing(false);
     }
@@ -788,7 +642,7 @@ Reply ONLY with valid JSON (no extra text, no markdown, no backticks). Keep "rea
             marginTop: 8, width: "100%", padding: 9, borderRadius: 10,
             background: T.card, color: T.error, fontSize: 13, fontWeight: 700,
             border: "1px solid #FECACA"
-          }}>↻ Retry</button>
+          }}>↻ Riprova</button>
         </div>
       )}
 
@@ -808,7 +662,7 @@ Reply ONLY with valid JSON (no extra text, no markdown, no backticks). Keep "rea
         {imgLoading ? (
           <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 12, minHeight: 240 }}>
             <Spinner size={36} />
-            <p style={{ color: T.textMid, fontWeight: 600, fontSize: 14 }}>Processing photo...</p>
+            <p style={{ color: T.textMid, fontWeight: 600, fontSize: 14 }}>Elaborazione foto...</p>
           </div>
         ) : image ? (
           <>
@@ -820,8 +674,8 @@ Reply ONLY with valid JSON (no extra text, no markdown, no backticks). Keep "rea
                 alignItems: "center", justifyContent: "center", gap: 12
               }}>
                 <Spinner size={40} color="white" />
-                <p style={{ color: "white", fontWeight: 600, fontSize: 15 }}>AI analysis in progress...</p>
-                <p style={{ color: "rgba(255,255,255,0.7)", fontSize: 12 }}>Comparing with parts database</p>
+                <p style={{ color: "white", fontWeight: 600, fontSize: 15 }}>Analisi AI in corso...</p>
+                <p style={{ color: "rgba(255,255,255,0.7)", fontSize: 12 }}>Confronto con il database ricambi</p>
               </div>
             )}
           </>
@@ -831,9 +685,9 @@ Reply ONLY with valid JSON (no extra text, no markdown, no backticks). Keep "rea
               width: 80, height: 80, borderRadius: 20, margin: "0 auto 16px",
               background: T.bluePale, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 36
             }}>📷</div>
-            <p style={{ color: T.blue, fontWeight: 700, fontSize: 17 }}>Take or upload a photo</p>
+            <p style={{ color: T.blue, fontWeight: 700, fontSize: 17 }}>Scatta o carica una foto</p>
             <p style={{ color: T.textLight, fontSize: 13, marginTop: 6, lineHeight: 1.5 }}>
-              Photograph the spare part<br />to identify
+              Fotografa il ricambio<br />da identificare
             </p>
           </div>
         )}
@@ -846,9 +700,9 @@ Reply ONLY with valid JSON (no extra text, no markdown, no backticks). Keep "rea
         }}>
           <span style={{ fontSize: 20 }}>💡</span>
           <div>
-            <p style={{ color: T.orange, fontSize: 13, fontWeight: 700 }}>How to use WERFEN SCAN</p>
+            <p style={{ color: T.orange, fontSize: 13, fontWeight: 700 }}>Come usare WERFEN SCAN</p>
             <p style={{ color: T.textMid, fontSize: 12, marginTop: 3, lineHeight: 1.5 }}>
-              Photograph a spare part or component. The AI will compare it with the database and show you the part number, description and compatibility. You can also search manually in the Catalog tab.
+              Fotografa un ricambio o componente. L'AI lo confronta con il database e mostra codice, descrizione e compatibilità. Puoi anche cercare manualmente nella scheda Catalog.
             </p>
           </div>
         </div>
@@ -867,7 +721,7 @@ Reply ONLY with valid JSON (no extra text, no markdown, no backticks). Keep "rea
             flex: 1, padding: 14, borderRadius: 14,
             background: T.card, color: T.textMid, fontSize: 15, fontWeight: 600,
             border: `1.5px solid ${T.border}`
-          }}>✕ Remove</button>
+          }}>✕ Rimuovi</button>
           <button onClick={analyze} className="tap-sc" style={{
             flex: 2, padding: 14, borderRadius: 14,
             background: `linear-gradient(135deg, ${T.blue}, ${T.blueLight})`,
@@ -875,7 +729,7 @@ Reply ONLY with valid JSON (no extra text, no markdown, no backticks). Keep "rea
             boxShadow: "0 4px 20px rgba(18,15,146,0.3)",
             display: "flex", alignItems: "center", justifyContent: "center", gap: 8
           }}>
-            <span>🔍</span> Identify Part
+            <span>🔍</span> Identifica ricambio
           </button>
         </div>
       )}
@@ -892,8 +746,8 @@ Reply ONLY with valid JSON (no extra text, no markdown, no backticks). Keep "rea
             display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18
           }}>📦</div>
           <div>
-            <p style={{ color: T.text, fontWeight: 700, fontSize: 15 }}>{parts.length} parts in the database</p>
-            <p style={{ color: T.textLight, fontSize: 12 }}>Ready for scanning</p>
+            <p style={{ color: T.text, fontWeight: 700, fontSize: 15 }}>{parts.length} ricambi nel database</p>
+            <p style={{ color: T.textLight, fontSize: 12 }}>Pronto per la scansione</p>
           </div>
         </div>
       )}
@@ -901,7 +755,7 @@ Reply ONLY with valid JSON (no extra text, no markdown, no backticks). Keep "rea
   );
 }
 
-// ===================== CATALOG SCREEN =====================
+// ===================== CATALOG =====================
 function CatalogScreen({ parts }) {
   const [search, setSearch] = useState("");
   const [selected, setSelected] = useState(null);
@@ -919,13 +773,13 @@ function CatalogScreen({ parts }) {
   return (
     <div style={{ padding: 16 }}>
       <h2 style={{ fontSize: 22, fontWeight: 800, color: T.text, marginBottom: 16, letterSpacing: "-0.4px" }}>
-        Parts Catalog
+        Catalogo ricambi
       </h2>
       <div style={{ position: "relative", marginBottom: 16 }}>
         <span style={{ position: "absolute", left: 14, top: "50%", transform: "translateY(-50%)", fontSize: 16, color: T.textLight }}>🔍</span>
         <input
           value={search} onChange={e => setSearch(e.target.value)}
-          placeholder="Search by name, code, category..."
+          placeholder="Cerca per nome, codice, categoria..."
           style={{
             width: "100%", padding: "13px 16px 13px 42px", borderRadius: 14,
             border: `1.5px solid ${T.border}`, background: T.card, fontSize: 15, color: T.text
@@ -935,13 +789,13 @@ function CatalogScreen({ parts }) {
       {parts.length === 0 ? (
         <div style={{ textAlign: "center", padding: "60px 24px" }}>
           <div style={{ fontSize: 48, marginBottom: 12 }}>📦</div>
-          <p style={{ color: T.text, fontWeight: 700, fontSize: 16 }}>Database is empty</p>
-          <p style={{ color: T.textLight, fontSize: 14, marginTop: 6 }}>Ask the administrator to add parts</p>
+          <p style={{ color: T.text, fontWeight: 700, fontSize: 16 }}>Database vuoto</p>
+          <p style={{ color: T.textLight, fontSize: 14, marginTop: 6 }}>Chiedi all'amministratore di caricare i ricambi</p>
         </div>
       ) : filtered.length === 0 ? (
         <div style={{ textAlign: "center", padding: "40px 0" }}>
           <div style={{ fontSize: 40, marginBottom: 10 }}>🔍</div>
-          <p style={{ color: T.text, fontWeight: 700 }}>No results for "{search}"</p>
+          <p style={{ color: T.text, fontWeight: 700 }}>Nessun risultato per "{search}"</p>
         </div>
       ) : (
         filtered.map((part, i) => (
@@ -957,7 +811,7 @@ function CatalogScreen({ parts }) {
               <div style={{ width: 64, height: 64, borderRadius: 12, flexShrink: 0, background: T.bluePale, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 26 }}>🔩</div>
             )}
             <div style={{ flex: 1, minWidth: 0 }}>
-              <div style={{ fontFamily: "monospace", color: T.blue, fontSize: 12, fontWeight: 600 }}>{part.code}</div>
+              <div className="wrap-anywhere" style={{ fontFamily: "monospace", color: T.blue, fontSize: 12, fontWeight: 600 }}>{part.code}</div>
               <div style={{ fontWeight: 700, color: T.text, fontSize: 15, marginTop: 2 }}>{part.name}</div>
               {part.category && (
                 <span style={{
@@ -982,7 +836,7 @@ function PartDetail({ part, onBack }) {
         background: T.card, border: `1px solid ${T.border}`,
         color: T.blue, borderRadius: 12, padding: "8px 14px",
         fontSize: 14, fontWeight: 600, marginBottom: 14
-      }}>← Back</button>
+      }}>← Indietro</button>
       <div style={{ background: T.card, borderRadius: 20, overflow: "hidden", boxShadow: T.shadowLg, border: `1px solid ${T.border}` }}>
         {part.imageBase64 ? (
           <img src={part.imageBase64} alt="" style={{ width: "100%", height: 220, objectFit: "cover", display: "block" }} />
@@ -1005,7 +859,7 @@ function PartDetail({ part, onBack }) {
           {part.description && <p style={{ fontSize: 15, color: T.textMid, lineHeight: 1.6, marginBottom: 18 }}>{part.description}</p>}
           {part.compatibility?.length > 0 && (
             <div>
-              <p style={{ fontSize: 11, color: T.textLight, fontWeight: 700, marginBottom: 8, textTransform: "uppercase", letterSpacing: 1 }}>Compatibility</p>
+              <p style={{ fontSize: 11, color: T.textLight, fontWeight: 700, marginBottom: 8, textTransform: "uppercase", letterSpacing: 1 }}>Compatibilità</p>
               <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
                 {part.compatibility.map((c, i) => (
                   <span key={i} style={{ background: T.bluePale, color: T.blue, borderRadius: 8, padding: "6px 12px", fontSize: 13, fontWeight: 600 }}>⚙️ {c}</span>
@@ -1032,10 +886,10 @@ function ResultCard({ result, onReset }) {
         }}>
           <div>
             <div style={{ color: "white", fontWeight: 700, fontSize: 17 }}>
-              {matched ? "✅ Part Identified" : "❌ No Match Found"}
+              {matched ? "✅ Ricambio identificato" : "❌ Nessuna corrispondenza"}
             </div>
             <div style={{ color: "rgba(255,255,255,0.7)", fontSize: 13, marginTop: 3 }}>
-              AI confidence: {pct}%
+              Confidenza AI: {pct}%
             </div>
           </div>
           <div style={{
@@ -1065,7 +919,7 @@ function ResultCard({ result, onReset }) {
               {part.description && <p style={{ fontSize: 14, color: T.textMid, lineHeight: 1.6, marginBottom: 16 }}>{part.description}</p>}
               {part.compatibility?.length > 0 && (
                 <div style={{ marginBottom: 16 }}>
-                  <p style={{ fontSize: 11, color: T.textLight, fontWeight: 700, marginBottom: 8, textTransform: "uppercase", letterSpacing: 1 }}>Compatibility</p>
+                  <p style={{ fontSize: 11, color: T.textLight, fontWeight: 700, marginBottom: 8, textTransform: "uppercase", letterSpacing: 1 }}>Compatibilità</p>
                   <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
                     {part.compatibility.map((c, i) => (
                       <span key={i} style={{ background: T.bluePale, color: T.blue, borderRadius: 8, padding: "5px 12px", fontSize: 13, fontWeight: 600 }}>⚙️ {c}</span>
@@ -1077,14 +931,14 @@ function ResultCard({ result, onReset }) {
           ) : (
             <div style={{ background: "#F8FAFC", borderRadius: 14, padding: 16, marginBottom: 16 }}>
               <p style={{ color: T.textMid, fontSize: 14, lineHeight: 1.6 }}>
-                The AI found no match. Try searching manually in the Catalog or contact the administrator.
+                L'AI non ha trovato corrispondenze. Prova a cercare manualmente nel Catalogo o contatta l'amministratore.
               </p>
             </div>
           )}
           {reasoning && (
             <div style={{ background: T.orangePale, border: `1px solid ${T.orange}33`, borderRadius: 12, padding: "12px 14px", marginBottom: 20 }}>
               <p style={{ color: "#92400E", fontSize: 13, lineHeight: 1.5 }}>
-                <strong>💡 AI Analysis: </strong>{reasoning}
+                <strong>💡 Analisi AI: </strong>{reasoning}
               </p>
             </div>
           )}
@@ -1093,26 +947,26 @@ function ResultCard({ result, onReset }) {
             background: `linear-gradient(135deg, ${T.orange}, ${T.orangeLight})`,
             color: "white", fontSize: 16, fontWeight: 700,
             boxShadow: "0 4px 20px rgba(255,104,32,0.3)"
-          }}>📷 New Scan</button>
+          }}>📷 Nuova scansione</button>
         </div>
       </div>
     </div>
   );
 }
 
-// ===================== HISTORY SCREEN =====================
+// ===================== HISTORY =====================
 function HistoryScreen({ history }) {
   if (!history.length) return (
     <div style={{ textAlign: "center", padding: "64px 24px" }}>
       <div style={{ fontSize: 52, marginBottom: 14 }}>🕐</div>
-      <p style={{ color: T.text, fontWeight: 700, fontSize: 17 }}>No scans yet</p>
-      <p style={{ color: T.textLight, fontSize: 14, marginTop: 6 }}>Your scans will appear here</p>
+      <p style={{ color: T.text, fontWeight: 700, fontSize: 17 }}>Nessuna scansione</p>
+      <p style={{ color: T.textLight, fontSize: 14, marginTop: 6 }}>Le tue scansioni compariranno qui</p>
     </div>
   );
   return (
     <div style={{ padding: 16 }}>
       <h2 style={{ fontSize: 22, fontWeight: 800, color: T.text, marginBottom: 16, letterSpacing: "-0.4px" }}>
-        Scan History
+        Cronologia
         <span style={{ marginLeft: 8, background: T.bluePale, color: T.blue, fontSize: 13, borderRadius: 8, padding: "2px 8px", fontWeight: 700, verticalAlign: "middle" }}>{history.length}</span>
       </h2>
       {history.map((item, i) => (
@@ -1134,10 +988,10 @@ function HistoryScreen({ history }) {
                 <div className="wrap-anywhere" style={{ fontFamily: "monospace", color: T.blue, fontSize: 12, marginTop: 2 }}>{item.part.code}</div>
               </>
             ) : (
-              <div style={{ fontWeight: 600, color: T.textMid, fontSize: 14 }}>No match found</div>
+              <div style={{ fontWeight: 600, color: T.textMid, fontSize: 14 }}>Nessuna corrispondenza</div>
             )}
             <div style={{ color: T.textLight, fontSize: 11, marginTop: 4 }}>
-              {new Date(item.timestamp).toLocaleString("en-GB")}
+              {new Date(item.timestamp).toLocaleString("it-IT")}
             </div>
           </div>
           <div style={{
@@ -1152,7 +1006,7 @@ function HistoryScreen({ history }) {
 }
 
 // ===================== ADMIN APP =====================
-function AdminApp({ parts, onAddPart, onUpdatePart, onDeletePart, reloadParts, loadError, onLogout }) {
+function AdminApp({ parts, onAddPart, onUpdatePart, onDeletePart, reloadParts, loadError, onLogout, userEmail }) {
   const [tab, setTab] = useState("parts");
   const [editingPart, setEditingPart] = useState(null);
 
@@ -1162,14 +1016,12 @@ function AdminApp({ parts, onAddPart, onUpdatePart, onDeletePart, reloadParts, l
 
   return (
     <div style={{ minHeight: "100vh", background: T.bg, maxWidth: 520, margin: "0 auto" }}>
-      <Header title="WERFEN SCAN Admin" subtitle="Administrator Area" onLogout={onLogout} />
+      <Header title="WERFEN SCAN Admin" subtitle="Area amministratore" onLogout={onLogout} />
       <div style={{ paddingBottom: 90 }}>
         {tab === "parts" && <PartsListScreen parts={parts} onEdit={handleEdit} onAdd={handleAddNew} onDeletePart={onDeletePart} reloadParts={reloadParts} loadError={loadError} />}
-        {/* ⚠️ BUG CORRETTO — la `key` forza il remount quando si passa da
-            "Edit" a "Add" restando sullo stesso tab. Prima il form manteneva
-            i dati del ricambio in modifica e il salvataggio falliva con
-            "This code already exists". */}
-        {tab === "add"   && (
+        {/* La key forza il remount passando da Edit a New Part: senza,
+            il form resterebbe precompilato col ricambio in modifica. */}
+        {tab === "add" && (
           <AddEditPartScreen
             key={editingPart?.id || "new"}
             parts={parts}
@@ -1179,13 +1031,13 @@ function AdminApp({ parts, onAddPart, onUpdatePart, onDeletePart, reloadParts, l
             onDone={handleDone}
           />
         )}
-        {tab === "settings" && <SettingsScreen partsCount={parts.length} />}
+        {tab === "settings" && <SettingsScreen partsCount={parts.length} userEmail={userEmail} />}
       </div>
       <TabBar
         tabs={[
-          { id: "parts",    label: "Parts",    icon: "🔧" },
-          { id: "add",      label: editingPart ? "Edit" : "Add",  icon: "➕" },
-          { id: "settings", label: "Settings", icon: "⚙️" },
+          { id: "parts",    label: "Ricambi",  icon: "🔧" },
+          { id: "add",      label: editingPart ? "Modifica" : "Aggiungi", icon: "➕" },
+          { id: "settings", label: "Impostazioni", icon: "⚙️" },
         ]}
         active={tab}
         onChange={t => {
@@ -1198,12 +1050,12 @@ function AdminApp({ parts, onAddPart, onUpdatePart, onDeletePart, reloadParts, l
   );
 }
 
-// ===================== PARTS LIST SCREEN =====================
+// ===================== PARTS LIST =====================
 function PartsListScreen({ parts, onEdit, onAdd, onDeletePart, reloadParts, loadError }) {
   const [search, setSearch] = useState("");
   const [confirmDelete, setConfirmDelete] = useState(null);
   const [refreshing, setRefreshing] = useState(false);
-  const [deleteError, setDeleteError] = useState("");
+  const [actionError, setActionError] = useState("");
 
   const q = search.toLowerCase();
   const filtered = parts.filter(p =>
@@ -1213,11 +1065,11 @@ function PartsListScreen({ parts, onEdit, onAdd, onDeletePart, reloadParts, load
   );
 
   async function deletePart(id) {
-    setDeleteError("");
+    setActionError("");
     try { await onDeletePart(id); }
     catch (e) {
       console.error(e);
-      setDeleteError("Could not delete the part. Check your connection.");
+      setActionError(`Impossibile eliminare: ${e.message || "controlla la connessione"}. Se hai attivato RLS, le scritture sono consentite solo all'account admin.`);
     }
     setConfirmDelete(null);
   }
@@ -1232,17 +1084,17 @@ function PartsListScreen({ parts, onEdit, onAdd, onDeletePart, reloadParts, load
     <div style={{ padding: 16 }}>
       {confirmDelete && (
         <ConfirmDialog
-          message="Delete this part from the shared database? This cannot be undone and affects all devices."
+          message="Eliminare questo ricambio dal database condiviso? L'operazione è irreversibile e vale per tutti i dispositivi."
           onConfirm={() => deletePart(confirmDelete)}
           onCancel={() => setConfirmDelete(null)}
         />
       )}
 
-      {(loadError || deleteError) && (
+      {(loadError || actionError) && (
         <div style={{
           background: "#FEF2F2", border: "1px solid #FECACA", borderRadius: 14,
           padding: "12px 14px", marginBottom: 12, color: T.error, fontSize: 13, lineHeight: 1.5
-        }}>⚠️ {loadError || deleteError}</div>
+        }}>⚠️ {loadError || actionError}</div>
       )}
 
       <div style={{
@@ -1251,16 +1103,16 @@ function PartsListScreen({ parts, onEdit, onAdd, onDeletePart, reloadParts, load
         display: "flex", alignItems: "center", justifyContent: "space-between"
       }}>
         <div>
-          <div style={{ color: "rgba(255,255,255,0.7)", fontSize: 12, fontWeight: 600, textTransform: "uppercase", letterSpacing: 1 }}>Shared Database ☁️</div>
+          <div style={{ color: "rgba(255,255,255,0.7)", fontSize: 12, fontWeight: 600, textTransform: "uppercase", letterSpacing: 1 }}>Database condiviso ☁️</div>
           <div style={{ color: "white", fontSize: 28, fontWeight: 800, marginTop: 2 }}>{parts.length}</div>
-          <div style={{ color: "rgba(255,255,255,0.6)", fontSize: 13 }}>registered parts</div>
+          <div style={{ color: "rgba(255,255,255,0.6)", fontSize: 13 }}>ricambi registrati</div>
         </div>
         <button onClick={onAdd} className="tap-sc" style={{
           padding: "12px 20px", borderRadius: 14,
           background: `linear-gradient(135deg, ${T.orange}, ${T.orangeLight})`,
           color: "white", fontSize: 15, fontWeight: 700,
           boxShadow: "0 4px 16px rgba(255,104,32,0.4)"
-        }}>+ Add</button>
+        }}>+ Aggiungi</button>
       </div>
 
       <button onClick={refresh} disabled={refreshing} style={{
@@ -1268,14 +1120,14 @@ function PartsListScreen({ parts, onEdit, onAdd, onDeletePart, reloadParts, load
         background: T.bluePale, color: T.blue, fontSize: 14, fontWeight: 700,
         display: "flex", alignItems: "center", justifyContent: "center", gap: 8
       }}>
-        {refreshing ? <><Spinner size={16} /> Refreshing...</> : "↻ Refresh from cloud"}
+        {refreshing ? <><Spinner size={16} /> Aggiornamento...</> : "↻ Ricarica dal cloud"}
       </button>
 
       <div style={{ position: "relative", marginBottom: 16 }}>
         <span style={{ position: "absolute", left: 14, top: "50%", transform: "translateY(-50%)", fontSize: 16, color: T.textLight }}>🔍</span>
         <input
           value={search} onChange={e => setSearch(e.target.value)}
-          placeholder="Search by name, code or category..."
+          placeholder="Cerca per nome, codice o categoria..."
           style={{ width: "100%", padding: "13px 16px 13px 42px", borderRadius: 14, border: `1.5px solid ${T.border}`, background: T.card, fontSize: 15, color: T.text }}
         />
       </div>
@@ -1283,15 +1135,15 @@ function PartsListScreen({ parts, onEdit, onAdd, onDeletePart, reloadParts, load
       {filtered.length === 0 ? (
         <div style={{ textAlign: "center", padding: "40px 16px" }}>
           <div style={{ fontSize: 40, marginBottom: 10 }}>📦</div>
-          <p style={{ color: T.text, fontWeight: 700 }}>{parts.length === 0 ? "Database is empty" : "No results"}</p>
-          <p style={{ color: T.textLight, fontSize: 14, marginTop: 4 }}>{parts.length === 0 ? "Add the first part to get started" : "Try a different search term"}</p>
+          <p style={{ color: T.text, fontWeight: 700 }}>{parts.length === 0 ? "Database vuoto" : "Nessun risultato"}</p>
+          <p style={{ color: T.textLight, fontSize: 14, marginTop: 4 }}>{parts.length === 0 ? "Aggiungi il primo ricambio" : "Prova un altro termine"}</p>
           {parts.length === 0 && (
             <button onClick={onAdd} className="tap-sc" style={{
               marginTop: 18, padding: "12px 24px", borderRadius: 14,
               background: `linear-gradient(135deg, ${T.orange}, ${T.orangeLight})`,
               color: "white", fontSize: 15, fontWeight: 700,
               boxShadow: "0 4px 16px rgba(255,104,32,0.35)"
-            }}>+ Add first part</button>
+            }}>+ Aggiungi il primo</button>
           )}
         </div>
       ) : (
@@ -1322,8 +1174,8 @@ function PartsListScreen({ parts, onEdit, onAdd, onDeletePart, reloadParts, load
               </div>
             </div>
             <div style={{ display: "flex", borderTop: `1px solid ${T.border}` }}>
-              <button onClick={() => onEdit(part)} style={{ flex: 1, padding: 11, background: "transparent", color: T.blue, fontSize: 14, fontWeight: 600, borderRight: `1px solid ${T.border}` }}>✏️ Edit</button>
-              <button onClick={() => setConfirmDelete(part.id)} style={{ flex: 1, padding: 11, background: "transparent", color: T.error, fontSize: 14, fontWeight: 600 }}>🗑️ Delete</button>
+              <button onClick={() => onEdit(part)} style={{ flex: 1, padding: 11, background: "transparent", color: T.blue, fontSize: 14, fontWeight: 600, borderRight: `1px solid ${T.border}` }}>✏️ Modifica</button>
+              <button onClick={() => setConfirmDelete(part.id)} style={{ flex: 1, padding: 11, background: "transparent", color: T.error, fontSize: 14, fontWeight: 600 }}>🗑️ Elimina</button>
             </div>
           </div>
         ))
@@ -1332,7 +1184,7 @@ function PartsListScreen({ parts, onEdit, onAdd, onDeletePart, reloadParts, load
   );
 }
 
-// ===================== ADD/EDIT PART SCREEN =====================
+// ===================== ADD / EDIT PART =====================
 function AddEditPartScreen({ parts, editingPart, onAddPart, onUpdatePart, onDone }) {
   const isEdit = !!editingPart;
   const [form, setForm] = useState(editingPart
@@ -1357,7 +1209,7 @@ function AddEditPartScreen({ parts, editingPart, onAddPart, onUpdatePart, onDone
       field("imageBase64", compressed);
     } catch (err) {
       console.error("compressImage:", err);
-      setErrors(prev => ({ ...prev, image: "Could not load the image. Try again." }));
+      setErrors(prev => ({ ...prev, image: "Impossibile caricare l'immagine. Riprova." }));
     } finally {
       try { input.value = ""; } catch { /* ignore */ }
       setImgLoading(false);
@@ -1373,13 +1225,12 @@ function AddEditPartScreen({ parts, editingPart, onAddPart, onUpdatePart, onDone
 
   function validate() {
     const e = {};
-    if (!form.code.trim()) e.code = "Part code is required";
-    if (!form.name.trim()) e.name = "Part name is required";
-    // optional chaining: un ricambio con `code` nullo non deve far crashare
+    if (!form.code.trim()) e.code = "Il codice è obbligatorio";
+    if (!form.name.trim()) e.name = "Il nome è obbligatorio";
     const dup = parts.find(p =>
       p.code?.toLowerCase() === form.code.trim().toLowerCase() && p.id !== editingPart?.id
     );
-    if (dup) e.code = "This code already exists in the database";
+    if (dup) e.code = "Questo codice esiste già nel database";
     return e;
   }
 
@@ -1394,7 +1245,7 @@ function AddEditPartScreen({ parts, editingPart, onAddPart, onUpdatePart, onDone
       onDone();
     } catch (e) {
       console.error("save error:", e);
-      setErrors({ general: `Could not save to the cloud: ${e.message || "check your connection."}` });
+      setErrors({ general: `Salvataggio fallito: ${e.message || "controlla la connessione"}.` });
     } finally {
       setSaving(false);
     }
@@ -1409,10 +1260,9 @@ function AddEditPartScreen({ parts, editingPart, onAddPart, onUpdatePart, onDone
   return (
     <div style={{ padding: 16 }}>
       <h2 style={{ fontSize: 22, fontWeight: 800, color: T.text, marginBottom: 20, letterSpacing: "-0.4px" }}>
-        {isEdit ? "✏️ Edit Part" : "➕ New Part"}
+        {isEdit ? "✏️ Modifica ricambio" : "➕ Nuovo ricambio"}
       </h2>
 
-      {/* Nessun capture="environment": Android mostra la scelta fotocamera/galleria */}
       <PhotoPicker
         id="admin-photo-input"
         disabled={imgLoading}
@@ -1428,75 +1278,77 @@ function AddEditPartScreen({ parts, editingPart, onAddPart, onUpdatePart, onDone
         {imgLoading ? (
           <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 10, padding: 24, minHeight: 150 }}>
             <Spinner size={32} />
-            <p style={{ color: T.textMid, fontSize: 13 }}>Processing image...</p>
+            <p style={{ color: T.textMid, fontSize: 13 }}>Elaborazione immagine...</p>
           </div>
         ) : form.imageBase64 ? (
           <img src={form.imageBase64} alt="" style={{ width: "100%", maxHeight: 220, objectFit: "cover", display: "block" }} />
         ) : (
           <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", minHeight: 150, padding: 24 }}>
             <div style={{ fontSize: 36, marginBottom: 8 }}>📷</div>
-            <p style={{ color: T.blue, fontWeight: 700 }}>Add part photo</p>
-            <p style={{ color: T.textLight, fontSize: 12, marginTop: 4 }}>Tap to take a photo or choose from gallery</p>
+            <p style={{ color: T.blue, fontWeight: 700 }}>Aggiungi foto del ricambio</p>
+            <p style={{ color: T.textLight, fontSize: 12, marginTop: 4 }}>Tocca per scattare o scegliere dalla galleria</p>
           </div>
         )}
       </PhotoPicker>
 
-      {errors.image && (
-        <p style={{ color: T.error, fontSize: 12, marginBottom: 10 }}>⚠️ {errors.image}</p>
-      )}
+      {errors.image && <p style={{ color: T.error, fontSize: 12, marginBottom: 10 }}>⚠️ {errors.image}</p>}
 
       {form.imageBase64 && (
         <button onClick={() => field("imageBase64", "")} style={{
           width: "100%", padding: 9, borderRadius: 10, marginBottom: 14,
           background: "#FEF2F2", color: T.error, fontSize: 13, fontWeight: 600,
           border: "1px solid #FECACA"
-        }}>🗑️ Remove photo</button>
+        }}>🗑️ Rimuovi foto</button>
       )}
 
       <div style={{ marginBottom: 14 }}>
-        <label style={{ display: "block", fontSize: 13, fontWeight: 600, color: T.textMid, marginBottom: 6 }}>Part Code *</label>
+        <label style={{ display: "block", fontSize: 13, fontWeight: 600, color: T.textMid, marginBottom: 6 }}>Codice ricambio *</label>
         <input value={form.code}
           onChange={e => { field("code", e.target.value); setErrors(prev => ({ ...prev, code: "" })); }}
-          placeholder="e.g. PART-001, CBN-2240-A"
+          placeholder="es. PART-001, CBN-2240-A"
           style={{ ...inp("code"), fontFamily: "monospace", letterSpacing: 0.5 }}
         />
         {errors.code && <p style={{ color: T.error, fontSize: 12, marginTop: 4 }}>⚠️ {errors.code}</p>}
       </div>
 
       <div style={{ marginBottom: 14 }}>
-        <label style={{ display: "block", fontSize: 13, fontWeight: 600, color: T.textMid, marginBottom: 6 }}>Part Name *</label>
+        <label style={{ display: "block", fontSize: 13, fontWeight: 600, color: T.textMid, marginBottom: 6 }}>Nome ricambio *</label>
         <input value={form.name}
           onChange={e => { field("name", e.target.value); setErrors(prev => ({ ...prev, name: "" })); }}
-          placeholder="e.g. Ball bearing, Hydraulic valve"
+          placeholder="es. Cuscinetto a sfere, Valvola idraulica"
           style={inp("name")}
         />
         {errors.name && <p style={{ color: T.error, fontSize: 12, marginTop: 4 }}>⚠️ {errors.name}</p>}
       </div>
 
       <div style={{ marginBottom: 14 }}>
-        <label style={{ display: "block", fontSize: 13, fontWeight: 600, color: T.textMid, marginBottom: 6 }}>Category / Type</label>
+        <label style={{ display: "block", fontSize: 13, fontWeight: 600, color: T.textMid, marginBottom: 6 }}>Categoria / Tipo</label>
         <input value={form.category} onChange={e => field("category", e.target.value)}
-          placeholder="e.g. Mechanical, Electronics, Hydraulic"
+          placeholder="es. Meccanica, Elettronica, Idraulica"
           style={inp("category")}
         />
       </div>
 
       <div style={{ marginBottom: 16 }}>
-        <label style={{ display: "block", fontSize: 13, fontWeight: 600, color: T.textMid, marginBottom: 6 }}>Technical Description</label>
+        <label style={{ display: "block", fontSize: 13, fontWeight: 600, color: T.textMid, marginBottom: 6 }}>Descrizione tecnica</label>
         <textarea value={form.description} onChange={e => field("description", e.target.value)}
-          placeholder="Material, dimensions, technical specs, installation notes..."
+          placeholder="Forma, colore, materiale, dimensioni, sigle visibili... — è questo il testo su cui l'AI riconosce il pezzo"
           rows={4}
           style={{ ...inp("description"), lineHeight: 1.5, paddingTop: 12 }}
         />
+        <p style={{ color: T.textLight, fontSize: 11, marginTop: 6, lineHeight: 1.5 }}>
+          💡 L'AI confronta la foto scattata con <strong>questa descrizione</strong>, non con la foto qui sopra.
+          Descrivi forma, colore, materiale, dimensioni indicative e marcature visibili.
+        </p>
       </div>
 
       <div style={{ marginBottom: 22 }}>
-        <label style={{ display: "block", fontSize: 13, fontWeight: 600, color: T.textMid, marginBottom: 6 }}>Machine / Model Compatibility</label>
+        <label style={{ display: "block", fontSize: 13, fontWeight: 600, color: T.textMid, marginBottom: 6 }}>Compatibilità macchine / modelli</label>
         <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
           <input value={compatInput}
             onChange={e => setCompatInput(e.target.value)}
             onKeyDown={e => { if (e.key === "Enter") { e.preventDefault(); addCompat(); } }}
-            placeholder="e.g. CNC Lathe Mazak, Hydraulic press"
+            placeholder="es. Tornio CNC Mazak, Pressa idraulica"
             style={{ ...inp(null), flex: 1, fontSize: 14 }}
           />
           <button onClick={addCompat} style={{
@@ -1520,7 +1372,7 @@ function AddEditPartScreen({ parts, editingPart, onAddPart, onUpdatePart, onDone
             ))}
           </div>
         ) : (
-          <p style={{ color: T.textLight, fontSize: 12 }}>Add compatible machines/models (press Enter or +)</p>
+          <p style={{ color: T.textLight, fontSize: 12 }}>Aggiungi macchine/modelli compatibili (Invio o +)</p>
         )}
       </div>
 
@@ -1535,7 +1387,7 @@ function AddEditPartScreen({ parts, editingPart, onAddPart, onUpdatePart, onDone
           flex: 1, padding: 14, borderRadius: 14,
           background: T.card, color: T.textMid, fontSize: 15, fontWeight: 600,
           border: `1.5px solid ${T.border}`
-        }}>Cancel</button>
+        }}>Annulla</button>
         <button onClick={save} disabled={saving} className="tap-sc" style={{
           flex: 2, padding: 14, borderRadius: 14,
           background: saving ? T.textLight : `linear-gradient(135deg, ${T.orange}, ${T.orangeLight})`,
@@ -1543,63 +1395,36 @@ function AddEditPartScreen({ parts, editingPart, onAddPart, onUpdatePart, onDone
           boxShadow: saving ? "none" : "0 4px 20px rgba(255,104,32,0.3)",
           display: "flex", alignItems: "center", justifyContent: "center", gap: 8
         }}>
-          {saving ? <><Spinner size={18} color="white" /> Saving...</> : (isEdit ? "💾 Save Changes" : "✅ Add to Database")}
+          {saving ? <><Spinner size={18} color="white" /> Salvataggio...</> : (isEdit ? "💾 Salva modifiche" : "✅ Aggiungi al database")}
         </button>
       </div>
     </div>
   );
 }
 
-// ===================== SETTINGS SCREEN =====================
-function SettingsScreen({ partsCount }) {
-  const [oldPwd, setOldPwd] = useState("");
+// ===================== SETTINGS =====================
+function SettingsScreen({ partsCount, userEmail }) {
   const [newPwd, setNewPwd] = useState("");
   const [confirmPwd, setConfirmPwd] = useState("");
-  const [pwdFeedback, setPwdFeedback] = useState({ msg: "", type: "" });
-  const [savingPwd, setSavingPwd] = useState(false);
-
-  const [apiKey, setApiKey] = useState("");
-  const [apiSaved, setApiSaved] = useState(false);
-  const [apiKeyVisible, setApiKeyVisible] = useState(false);
-
-  useEffect(() => {
-    db.get("anthropic_key").then(k => { if (k) setApiKey(k); });
-  }, []);
-
-  useEffect(() => {
-    if (!apiSaved) return;
-    const t = setTimeout(() => setApiSaved(false), 3000);
-    return () => clearTimeout(t);   // niente timer orfani se si cambia tab
-  }, [apiSaved]);
-
-  async function saveApiKey() {
-    const trimmed = apiKey.trim();
-    if (!trimmed) return;
-    await db.set("anthropic_key", trimmed);
-    setApiSaved(true);
-  }
+  const [feedback, setFeedback] = useState({ msg: "", type: "" });
+  const [saving, setSaving] = useState(false);
 
   async function changePassword() {
-    if (!oldPwd || !newPwd || !confirmPwd) { setPwdFeedback({ msg: "Fill in all fields", type: "error" }); return; }
-    if (newPwd !== confirmPwd) { setPwdFeedback({ msg: "New passwords do not match", type: "error" }); return; }
-    if (newPwd.length < 4) { setPwdFeedback({ msg: "Password must be at least 4 characters", type: "error" }); return; }
-    setSavingPwd(true);
-    const stored = await db.get("admin_password") || djbHash("admin123");
-    if (djbHash(oldPwd) !== stored) {
-      setPwdFeedback({ msg: "Current password is incorrect", type: "error" });
-      setSavingPwd(false); return;
+    if (!newPwd || !confirmPwd) { setFeedback({ msg: "Compila entrambi i campi", type: "error" }); return; }
+    if (newPwd !== confirmPwd)  { setFeedback({ msg: "Le password non coincidono", type: "error" }); return; }
+    if (newPwd.length < 8)      { setFeedback({ msg: "La password deve avere almeno 8 caratteri", type: "error" }); return; }
+    setSaving(true);
+    const { error } = await supabase.auth.updateUser({ password: newPwd });
+    if (error) setFeedback({ msg: error.message, type: "error" });
+    else {
+      setFeedback({ msg: "✅ Password aggiornata", type: "success" });
+      setNewPwd(""); setConfirmPwd("");
     }
-    await db.set("admin_password", djbHash(newPwd));
-    setPwdFeedback({ msg: "✅ Password updated successfully!", type: "success" });
-    setOldPwd(""); setNewPwd(""); setConfirmPwd("");
-    setSavingPwd(false);
+    setSaving(false);
   }
-
-  const keyInCode = ANTHROPIC_API_KEY.trim().length > 0;
 
   return (
     <div style={{ padding: 16 }}>
-      {/* Stats */}
       <div style={{
         background: `linear-gradient(135deg, ${T.blueDark}, ${T.blue})`,
         borderRadius: 20, padding: "24px 20px", marginBottom: 16,
@@ -1612,107 +1437,69 @@ function SettingsScreen({ partsCount }) {
           boxShadow: "0 4px 16px rgba(255,104,32,0.4)"
         }}>📦</div>
         <div>
-          <div style={{ color: "rgba(255,255,255,0.7)", fontSize: 12, fontWeight: 600, textTransform: "uppercase", letterSpacing: 1 }}>Total Parts</div>
+          <div style={{ color: "rgba(255,255,255,0.7)", fontSize: 12, fontWeight: 600, textTransform: "uppercase", letterSpacing: 1 }}>Ricambi totali</div>
           <div style={{ color: "white", fontSize: 36, fontWeight: 800, lineHeight: 1.1 }}>{partsCount}</div>
-          <div style={{ color: "rgba(255,255,255,0.6)", fontSize: 13 }}>in the database</div>
+          <div style={{ color: "rgba(255,255,255,0.6)", fontSize: 13 }}>nel database</div>
         </div>
       </div>
 
-      {/* ── AI API KEY ─────────────────────────────────────────────── */}
+      {/* Chiave AI — ora server-side */}
       <div style={{ background: T.card, borderRadius: 20, padding: 20, border: `1px solid ${T.border}`, boxShadow: T.shadow, marginBottom: 16 }}>
-        <h3 style={{ fontWeight: 800, color: T.text, marginBottom: 6, fontSize: 17 }}>🤖 Anthropic API Key</h3>
-        <p style={{ color: T.textMid, fontSize: 13, marginBottom: 14, lineHeight: 1.5 }}>
-          Required for AI scanning. Get your key at{" "}
-          <a href="https://console.anthropic.com" target="_blank" rel="noreferrer" style={{ color: T.blue, fontWeight: 600 }}>console.anthropic.com</a>
-        </p>
-
-        <div style={{ background: "#FEF2F2", border: "1px solid #FECACA", borderRadius: 14, padding: "12px 14px", marginBottom: 14 }}>
-          <p style={{ color: T.error, fontSize: 13, fontWeight: 700, marginBottom: 4 }}>⚠️ Security notice</p>
+        <h3 style={{ fontWeight: 800, color: T.text, marginBottom: 8, fontSize: 17 }}>🤖 Chiave AI</h3>
+        <div style={{ background: "#F0FDF4", border: "1px solid #86EFAC", borderRadius: 12, padding: "12px 14px" }}>
+          <p style={{ color: T.success, fontSize: 13, fontWeight: 700, marginBottom: 4 }}>✅ Configurata sul server</p>
           <p style={{ color: T.textMid, fontSize: 12, lineHeight: 1.6 }}>
-            The key is stored <strong>only in this browser</strong> and is sent directly to Anthropic.
-            Anyone using this device can extract it. For a shared/production deployment,
-            route the request through your own server instead of calling the API from the browser.
+            La chiave Anthropic vive nelle Environment Variables di Vercel e non raggiunge mai
+            il browser. Vale automaticamente per ogni dispositivo: non c'è nulla da inserire qui.
+            Per sostituirla: Vercel → Settings → Environment Variables → <code>ANTHROPIC_API_KEY</code>,
+            poi Redeploy.
           </p>
         </div>
-
-        <div style={{ position: "relative", marginBottom: 10 }}>
-          <input
-            type={apiKeyVisible ? "text" : "password"}
-            value={apiKey}
-            onChange={e => setApiKey(e.target.value)}
-            placeholder="sk-ant-api03-..."
-            autoComplete="off"
-            style={{
-              width: "100%", padding: "13px 48px 13px 16px", borderRadius: 14,
-              border: `1.5px solid ${T.border}`, background: T.bg, fontSize: 14,
-              color: T.text, fontFamily: "monospace"
-            }}
-          />
-          <button onClick={() => setApiKeyVisible(v => !v)} style={{
-            position: "absolute", right: 14, top: "50%", transform: "translateY(-50%)",
-            background: "transparent", color: T.textLight, fontSize: 16
-          }}>{apiKeyVisible ? "🙈" : "👁️"}</button>
-        </div>
-        <button onClick={saveApiKey} className="tap-sc" style={{
-          width: "100%", padding: 13, borderRadius: 14,
-          background: apiSaved ? T.success : `linear-gradient(135deg, ${T.blue}, ${T.blueLight})`,
-          color: "white", fontSize: 15, fontWeight: 700,
-          transition: "background 0.3s"
-        }}>
-          {apiSaved ? "✅ Saved!" : "💾 Save API Key"}
-        </button>
-        <p style={{ color: keyInCode || apiKey ? T.success : T.error, fontSize: 12, marginTop: 8, textAlign: "center" }}>
-          {keyInCode
-            ? "✅ Key set in code — AI scanning active"
-            : apiKey
-              ? "✅ Key set via Settings — AI scanning active"
-              : "⚠️ No API Key — AI scanning disabled"}
-        </p>
       </div>
 
-      {/* Password */}
+      {/* Account */}
       <div style={{ background: T.card, borderRadius: 20, padding: 20, border: `1px solid ${T.border}`, boxShadow: T.shadow, marginBottom: 16 }}>
-        <h3 style={{ fontWeight: 800, color: T.text, marginBottom: 18, fontSize: 17 }}>🔐 Change Administrator Password</h3>
+        <h3 style={{ fontWeight: 800, color: T.text, marginBottom: 6, fontSize: 17 }}>👤 Account</h3>
+        <p className="wrap-anywhere" style={{ color: T.textMid, fontSize: 13, marginBottom: 18 }}>
+          Connesso come <strong>{userEmail}</strong>
+        </p>
+
+        <h4 style={{ fontWeight: 700, color: T.text, marginBottom: 12, fontSize: 15 }}>🔐 Cambia password</h4>
         {[
-          { val: oldPwd, set: setOldPwd, label: "Current password",     ph: "Enter current password" },
-          { val: newPwd, set: setNewPwd, label: "New password",         ph: "At least 4 characters" },
-          { val: confirmPwd, set: setConfirmPwd, label: "Confirm new password", ph: "Repeat new password" },
+          { val: newPwd, set: setNewPwd, label: "Nuova password", ph: "Almeno 8 caratteri" },
+          { val: confirmPwd, set: setConfirmPwd, label: "Conferma password", ph: "Ripeti la password" },
         ].map(({ val, set, label, ph }, idx) => (
           <div key={idx} style={{ marginBottom: 14 }}>
             <label style={{ display: "block", fontSize: 13, fontWeight: 600, color: T.textMid, marginBottom: 6 }}>{label}</label>
             <input
-              type="password" value={val}
-              onChange={e => { set(e.target.value); setPwdFeedback({ msg: "", type: "" }); }}
+              type="password" value={val} autoComplete="new-password"
+              onChange={e => { set(e.target.value); setFeedback({ msg: "", type: "" }); }}
               placeholder={ph}
               style={{ width: "100%", padding: "13px 16px", borderRadius: 14, border: `1.5px solid ${T.border}`, background: T.bg, fontSize: 15, color: T.text }}
             />
           </div>
         ))}
-        {pwdFeedback.msg && (
+        {feedback.msg && (
           <div style={{
             padding: "12px 14px", borderRadius: 12, marginBottom: 14, fontSize: 14,
-            background: pwdFeedback.type === "success" ? "#F0FDF4" : "#FEF2F2",
-            color: pwdFeedback.type === "success" ? T.success : T.error,
-            border: `1px solid ${pwdFeedback.type === "success" ? "#86EFAC" : "#FECACA"}`
-          }}>{pwdFeedback.msg}</div>
+            background: feedback.type === "success" ? "#F0FDF4" : "#FEF2F2",
+            color: feedback.type === "success" ? T.success : T.error,
+            border: `1px solid ${feedback.type === "success" ? "#86EFAC" : "#FECACA"}`
+          }}>{feedback.msg}</div>
         )}
-        <button onClick={changePassword} disabled={savingPwd} className="tap-sc" style={{
+        <button onClick={changePassword} disabled={saving} className="tap-sc" style={{
           width: "100%", padding: 14, borderRadius: 14,
           background: `linear-gradient(135deg, ${T.blue}, ${T.blueLight})`,
           color: "white", fontSize: 15, fontWeight: 700,
           display: "flex", alignItems: "center", justifyContent: "center", gap: 8
         }}>
-          {savingPwd ? <><Spinner size={18} color="white" /> Updating...</> : "🔐 Update Password"}
+          {saving ? <><Spinner size={18} color="white" /> Aggiornamento...</> : "🔐 Aggiorna password"}
         </button>
-        <p style={{ color: T.textLight, fontSize: 11, marginTop: 10, lineHeight: 1.5 }}>
-          Note: this is a local device gate only (the password is stored in this browser).
-          It does not protect the shared cloud database.
-        </p>
       </div>
 
       <div style={{ background: T.card, borderRadius: 16, padding: 16, border: `1px solid ${T.border}`, textAlign: "center" }}>
         <div style={{ fontSize: 28, marginBottom: 8 }}>🔧</div>
-        <div style={{ color: T.text, fontWeight: 700, fontSize: 15 }}>WERFEN SCAN v2.1</div>
+        <div style={{ color: T.text, fontWeight: 700, fontSize: 15 }}>WERFEN SCAN v3.0</div>
         <div style={{ color: T.textLight, fontSize: 13, marginTop: 4 }}>
           Industrial Spare Parts Recognition<br />
           Powered by Claude AI (Anthropic)
@@ -1722,7 +1509,7 @@ function SettingsScreen({ partsCount }) {
   );
 }
 
-// ===================== SETUP SCREEN (cloud non configurato) =====================
+// ===================== SETUP / LOADING =====================
 function SetupScreen() {
   return (
     <div style={{
@@ -1737,16 +1524,25 @@ function SetupScreen() {
       }}>
         <div style={{ fontSize: 40, textAlign: "center", marginBottom: 16 }}>☁️</div>
         <h2 style={{ color: "white", fontWeight: 800, textAlign: "center", marginBottom: 10, fontSize: 20 }}>
-          Connect the shared database
+          Configura il database condiviso
         </h2>
-        <p style={{ color: "rgba(255,255,255,0.7)", fontSize: 14, lineHeight: 1.6, textAlign: "center", marginBottom: 20 }}>
-          To share parts across all devices, configure Supabase.
-        </p>
+
+        {cloudConfigProblem && (
+          <div style={{
+            background: "rgba(255,104,32,0.15)", border: `1px solid ${T.orange}`,
+            borderRadius: 12, padding: "10px 12px", marginBottom: 16
+          }}>
+            <p className="wrap-anywhere" style={{ color: "#FFD9C2", fontSize: 12, lineHeight: 1.5 }}>
+              ⚠️ {cloudConfigProblem}
+            </p>
+          </div>
+        )}
+
         {[
-          { n: "1", t: "Create a free project", s: "at supabase.com" },
-          { n: "2", t: "Run the SQL", s: "from GUIDA-SUPABASE.md in the SQL Editor" },
-          { n: "3", t: "Copy URL and Anon Key", s: "from Project Settings → API" },
-          { n: "4", t: "Paste into App.jsx", s: "SUPABASE_URL and SUPABASE_ANON_KEY at the top" },
+          { n: "1", t: "Crea un progetto gratuito", s: "su supabase.com" },
+          { n: "2", t: "Esegui l'SQL", s: "nello SQL Editor" },
+          { n: "3", t: "Copia URL e Anon Key", s: "da Settings → API → Project URL" },
+          { n: "4", t: "Incolla in App.jsx", s: "SUPABASE_URL e SUPABASE_ANON_KEY in cima" },
         ].map(({ n, t, s }) => (
           <div key={n} style={{ display: "flex", gap: 12, alignItems: "flex-start", marginBottom: 14 }}>
             <div style={{
@@ -1767,8 +1563,7 @@ function SetupScreen() {
   );
 }
 
-// ===================== LOADING SCREEN =====================
-function LoadingScreen() {
+function LoadingScreen({ label = "Caricamento WERFEN SCAN..." }) {
   return (
     <div style={{
       minHeight: "100vh",
@@ -1783,7 +1578,7 @@ function LoadingScreen() {
         fontSize: 34, boxShadow: "0 8px 32px rgba(255,104,32,0.4)",
         animation: "pulse 1.2s ease infinite"
       }}>🔧</div>
-      <p style={{ color: "rgba(255,255,255,0.7)", fontSize: 16, fontWeight: 600 }}>Loading WERFEN SCAN...</p>
+      <p style={{ color: "rgba(255,255,255,0.7)", fontSize: 16, fontWeight: 600 }}>{label}</p>
       <Tagline light />
     </div>
   );
@@ -1791,10 +1586,27 @@ function LoadingScreen() {
 
 // ===================== ROOT =====================
 export default function App() {
-  const [user, setUser] = useState(null);
-  const [parts, setParts] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [loadError, setLoadError] = useState("");
+  const [session, setSession]         = useState(null);
+  const [authChecked, setAuthChecked] = useState(false);
+  const [parts, setParts]             = useState([]);
+  const [partsLoading, setPartsLoading] = useState(false);
+  const [loadError, setLoadError]     = useState("");
+
+  // Sessione Supabase: persiste in localStorage, quindi il login
+  // resta valido tra le aperture dell'app sullo stesso dispositivo.
+  useEffect(() => {
+    if (!cloudReady) { setAuthChecked(true); return; }
+    let alive = true;
+    supabase.auth.getSession().then(({ data }) => {
+      if (!alive) return;
+      setSession(data.session ?? null);
+      setAuthChecked(true);
+    });
+    const { data: sub } = supabase.auth.onAuthStateChange((_event, s) => {
+      setSession(s ?? null);
+    });
+    return () => { alive = false; sub.subscription.unsubscribe(); };
+  }, []);
 
   async function reloadParts() {
     if (!cloudReady) return;
@@ -1803,16 +1615,18 @@ export default function App() {
       setParts(p);
       setLoadError("");
     } catch (e) {
-      console.error("reloadParts:", e);
-      setLoadError("Could not reach the cloud database. Check your connection and the Supabase keys.");
+      console.error("reloadParts:", e.message, e.code);
+      setLoadError("Impossibile raggiungere il database. Controlla la connessione.");
     }
   }
 
+  // I ricambi si caricano solo a sessione attiva (RLS richiede autenticazione)
   useEffect(() => {
-    if (!cloudReady) { setLoading(false); return; }
-    reloadParts().finally(() => setLoading(false));
+    if (!cloudReady || !session) { setParts([]); return; }
+    setPartsLoading(true);
+    reloadParts().finally(() => setPartsLoading(false));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [session?.user?.id]);
 
   async function handleAddPart(partData) {
     const newPart = await cloud.addPart(partData);
@@ -1826,13 +1640,19 @@ export default function App() {
     await cloud.deletePart(id);
     setParts(prev => prev.filter(p => p.id !== id));
   }
+  async function handleLogout() {
+    await supabase.auth.signOut();
+    setParts([]);
+  }
 
-  // GlobalStyles è ora fuori da ogni ramo: resta montato in TUTTE le schermate.
+  const email = session?.user?.email || "";
+
   let screen;
-  if (!cloudReady)            screen = <SetupScreen />;
-  else if (loading)           screen = <LoadingScreen />;
-  else if (!user)             screen = <LoginScreen onLogin={setUser} />;
-  else if (user.role === "admin") screen = (
+  if (!cloudReady)        screen = <SetupScreen />;
+  else if (!authChecked)  screen = <LoadingScreen />;
+  else if (!session)      screen = <LoginScreen />;
+  else if (partsLoading)  screen = <LoadingScreen label="Caricamento ricambi..." />;
+  else if (isAdminEmail(email)) screen = (
     <AdminApp
       parts={parts}
       onAddPart={handleAddPart}
@@ -1840,7 +1660,8 @@ export default function App() {
       onDeletePart={handleDeletePart}
       reloadParts={reloadParts}
       loadError={loadError}
-      onLogout={() => setUser(null)}
+      onLogout={handleLogout}
+      userEmail={email}
     />
   );
   else screen = (
@@ -1848,7 +1669,7 @@ export default function App() {
       parts={parts}
       reloadParts={reloadParts}
       loadError={loadError}
-      onLogout={() => setUser(null)}
+      onLogout={handleLogout}
     />
   );
 
