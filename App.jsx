@@ -271,10 +271,17 @@ const cloud = {
     const { error } = await supabase.from("parts").delete().eq("id", id);
     if (error) throw error;
   },
-  async loadHistory() {
-    const { data, error } = await supabase
-      .from("scan_history").select("*").order("timestamp", { ascending: false }).limit(60);
-    if (error) { console.error("loadHistory:", error.message, error.code); return []; }
+  // Carica la cronologia in un intervallo di date. Il filtro è applicato dal
+  // database, non dal client: così si possono cercare scansioni vecchie senza
+  // scaricare tutto lo storico.
+  async loadHistory({ from, to, limit = 300 } = {}) {
+    let query = supabase
+      .from("scan_history").select("*")
+      .order("timestamp", { ascending: false }).limit(limit);
+    if (from) query = query.gte("timestamp", from);
+    if (to)   query = query.lte("timestamp", to);
+    const { data, error } = await query;
+    if (error) { console.error("loadHistory:", error.message, error.code); throw error; }
     return (data || []).map(h => ({
       matched: h.matched,
       confidence: h.confidence,
@@ -284,8 +291,15 @@ const cloud = {
       part: h.part_name ? { name: h.part_name, code: h.part_code } : null,
     }));
   },
+  // Ogni scansione viene marcata con l'utente che l'ha eseguita.
+  // Le policy RLS impediscono di scrivere righe intestate ad altri e di
+  // leggere quelle altrui: l'isolamento è imposto dal database, non da qui.
   async addHistory(item) {
+    const { data: { session } } = await supabase.auth.getSession();
+    const userId = session?.user?.id;
+    if (!userId) { console.error("addHistory: nessuna sessione attiva"); return; }
     const { error } = await supabase.from("scan_history").insert([{
+      user_id: userId,
       matched: !!item.matched,
       confidence: item.confidence || 0,
       reasoning: item.reasoning || "",
@@ -296,7 +310,50 @@ const cloud = {
     }]);
     if (error) console.error("addHistory:", error.message, error.code);
   },
+  // Svuota la cronologia dell'utente collegato. Non serve filtrare per utente
+  // qui: la policy RLS limita la DELETE alle sole righe di chi la esegue.
+  // Il filtro sul timestamp c'è sempre: PostgREST rifiuta una DELETE nuda.
+  async clearHistory({ from, to } = {}) {
+    let query = supabase.from("scan_history").delete()
+      .gte("timestamp", from || "1970-01-01T00:00:00.000Z");
+    if (to) query = query.lte("timestamp", to);
+    const { error } = await query;
+    if (error) throw error;
+  },
 };
+
+// ── Intervalli di date per la cronologia ─────────────────────
+const HISTORY_DEFAULT_DAYS = 7;
+
+const pad2 = (n) => String(n).padStart(2, "0");
+const toDateInput = (d) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+const fmtDay = (input) => {
+  if (!input) return "";
+  const [y, m, d] = input.split("-");
+  return `${d}/${m}/${y}`;
+};
+function startOfDayIso(input) {
+  const d = new Date(`${input}T00:00:00`);
+  return Number.isNaN(d.getTime()) ? null : d.toISOString();
+}
+function endOfDayIso(input) {
+  const d = new Date(`${input}T23:59:59.999`);
+  return Number.isNaN(d.getTime()) ? null : d.toISOString();
+}
+// Ultimi 7 giorni = oggi più i 6 precedenti, dalla mezzanotte.
+function defaultHistoryRange() {
+  const today = new Date();
+  const from = new Date();
+  from.setDate(from.getDate() - (HISTORY_DEFAULT_DAYS - 1));
+  from.setHours(0, 0, 0, 0);
+  return {
+    preset: "7d",
+    from: from.toISOString(),
+    to: null,                       // aperto fino ad adesso
+    fromInput: toDateInput(from),
+    toInput: toDateInput(today),
+  };
+}
 
 // ===================== IMAGE HELPERS =====================
 function compressImage(file, maxSize = 1000, quality = 0.8) {
@@ -428,11 +485,11 @@ function ConfirmDialog({ message, onConfirm, onCancel }) {
             flex: 1, padding: 12, borderRadius: 12,
             background: T.bg, color: T.textMid, fontSize: 15, fontWeight: 600,
             border: `1px solid ${T.border}`
-          }}>Cancel</button>
+          }}>Annulla</button>
           <button onClick={onConfirm} style={{
             flex: 1, padding: 12, borderRadius: 12,
             background: T.error, color: "white", fontSize: 15, fontWeight: 700,
-          }}>Delete</button>
+          }}>Elimina</button>
         </div>
       </div>
     </div>
@@ -640,27 +697,64 @@ function TabBar({ tabs, active, onChange }) {
 }
 
 // ===================== USER APP =====================
-function UserApp({ parts, reloadParts, loadError, onLogout }) {
+function UserApp({ parts, reloadParts, loadError, onLogout, userEmail }) {
   const [tab, setTab] = useState("scan");
   const [history, setHistory] = useState([]);
+  const [range, setRange] = useState(defaultHistoryRange);
+  const [historyLoading, setHistoryLoading] = useState(true);
+  const [historyError, setHistoryError] = useState("");
 
+  // Ricarica dal database ogni volta che cambia l'intervallo selezionato.
   useEffect(() => {
-    cloud.loadHistory().then(setHistory).catch(() => {});
-  }, []);
+    let alive = true;
+    setHistoryLoading(true);
+    setHistoryError("");
+    cloud.loadHistory({ from: range.from, to: range.to })
+      .then(h => { if (alive) setHistory(h); })
+      .catch(() => { if (alive) setHistoryError("Impossibile caricare la cronologia."); })
+      .finally(() => { if (alive) setHistoryLoading(false); });
+    return () => { alive = false; };
+  }, [range.from, range.to]);
 
   async function addToHistory(item) {
-    setHistory(prev => [item, ...prev].slice(0, 60));
+    setHistory(prev => [item, ...prev]);
     const thumb = item.image ? await makeThumb(item.image) : "";
     await cloud.addHistory({ ...item, image: thumb });
   }
 
+  function applyRange(fromInput, toInput) {
+    setRange({
+      preset: "custom",
+      from: startOfDayIso(fromInput),
+      to: endOfDayIso(toInput),
+      fromInput,
+      toInput,
+    });
+  }
+  function resetRange() { setRange(defaultHistoryRange()); }
+
+  async function clearHistory() {
+    await cloud.clearHistory();
+    setHistory([]);
+  }
+
   return (
     <div className="app-shell">
-      <Header title="WERFEN SCAN" subtitle="Spare Parts Recognition" onLogout={onLogout} />
+      <Header title="WERFEN SCAN" subtitle={userEmail || "Spare Parts Recognition"} onLogout={onLogout} />
       <div className="app-content">
         {tab === "scan"    && <ScanScreen parts={parts} onAddHistory={addToHistory} reloadParts={reloadParts} loadError={loadError} />}
         {tab === "catalog" && <CatalogScreen parts={parts} />}
-        {tab === "history" && <HistoryScreen history={history} />}
+        {tab === "history" && (
+          <HistoryScreen
+            history={history}
+            range={range}
+            loading={historyLoading}
+            error={historyError}
+            onApply={applyRange}
+            onReset={resetRange}
+            onClear={clearHistory}
+          />
+        )}
       </div>
       <TabBar
         tabs={[
@@ -1094,21 +1188,156 @@ function ResultCard({ result, onReset }) {
 }
 
 // ===================== HISTORY =====================
-function HistoryScreen({ history }) {
-  if (!history.length) return (
-    <div style={{ textAlign: "center", padding: "64px 24px" }}>
-      <div style={{ fontSize: 52, marginBottom: 14 }}>🕐</div>
-      <p style={{ color: T.text, fontWeight: 700, fontSize: 17 }}>Nessuna scansione</p>
-      <p style={{ color: T.textLight, fontSize: 14, marginTop: 6 }}>Le tue scansioni compariranno qui</p>
-    </div>
-  );
+function HistoryScreen({ history, range, loading, error, onApply, onReset, onClear }) {
+  const [open, setOpen]                 = useState(false);
+  const [fromInput, setFromInput]       = useState(range.fromInput);
+  const [toInput, setToInput]           = useState(range.toInput);
+  const [text, setText]                 = useState("");
+  const [confirmClear, setConfirmClear] = useState(false);
+  const [clearing, setClearing]         = useState(false);
+  const [clearError, setClearError]     = useState("");
+
+  // Riallinea i campi quando l'intervallo cambia da fuori (es. "Ultimi 7 giorni")
+  useEffect(() => {
+    setFromInput(range.fromInput);
+    setToInput(range.toInput);
+  }, [range.fromInput, range.toInput]);
+
+  // Il filtro testuale lavora sui risultati già scaricati per l'intervallo:
+  // le date filtrano sul database, il testo affina in locale.
+  const q = text.trim().toLowerCase();
+  const shown = q
+    ? history.filter(h =>
+        (h.part?.name || "").toLowerCase().includes(q) ||
+        (h.part?.code || "").toLowerCase().includes(q))
+    : history;
+
+  const periodLabel = range.preset === "7d"
+    ? `Ultimi ${HISTORY_DEFAULT_DAYS} giorni`
+    : `Dal ${fmtDay(range.fromInput)} al ${fmtDay(range.toInput)}`;
+
+  const dateStyle = {
+    width: "100%", padding: "11px 12px", borderRadius: 12,
+    border: `1.5px solid ${T.border}`, background: T.bg, fontSize: 15, color: T.text,
+  };
+  const smallLabel = { display: "block", fontSize: 12, fontWeight: 600, color: T.textMid, marginBottom: 5 };
+
+  async function doClear() {
+    setClearing(true); setClearError("");
+    try {
+      await onClear();
+      setConfirmClear(false);
+      setOpen(false);
+    } catch (e) {
+      console.error("clearHistory:", e);
+      setClearError(`Eliminazione non riuscita: ${e.message || "riprova"}.`);
+      setConfirmClear(false);
+    } finally {
+      setClearing(false);
+    }
+  }
+
   return (
     <div style={{ padding: 16 }}>
-      <h2 style={{ fontSize: 22, fontWeight: 800, color: T.text, marginBottom: 16, letterSpacing: "-0.4px" }}>
-        Cronologia
-        <span style={{ marginLeft: 8, background: T.bluePale, color: T.blue, fontSize: 13, borderRadius: 8, padding: "2px 8px", fontWeight: 700, verticalAlign: "middle" }}>{history.length}</span>
-      </h2>
-      {history.map((item, i) => (
+      {confirmClear && (
+        <ConfirmDialog
+          message="Svuotare tutta la tua cronologia delle scansioni? L'operazione è irreversibile. Riguarda solo il tuo account: le scansioni degli altri tecnici non vengono toccate."
+          onConfirm={doClear}
+          onCancel={() => setConfirmClear(false)}
+        />
+      )}
+
+      <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 12, marginBottom: 14 }}>
+        <div style={{ minWidth: 0 }}>
+          <h2 style={{ fontSize: 22, fontWeight: 800, color: T.text, letterSpacing: "-0.4px" }}>
+            Cronologia
+            <span style={{ marginLeft: 8, background: T.bluePale, color: T.blue, fontSize: 13, borderRadius: 8, padding: "2px 8px", fontWeight: 700, verticalAlign: "middle" }}>{shown.length}</span>
+          </h2>
+          <p style={{ color: T.textLight, fontSize: 12, marginTop: 3 }}>{periodLabel}</p>
+        </div>
+        <button onClick={() => setOpen(o => !o)} className="tap-sc" aria-label="Filtri cronologia"
+          style={{
+            width: 42, height: 42, borderRadius: 12, flexShrink: 0, fontSize: 17,
+            background: open ? T.blue : T.card,
+            color: open ? "white" : T.blue,
+            border: `1.5px solid ${open ? T.blue : T.border}`,
+          }}>🔎</button>
+      </div>
+
+      {open && (
+        <div className="fade-in" style={{
+          background: T.card, border: `1px solid ${T.border}`, borderRadius: 16,
+          padding: 14, marginBottom: 14, boxShadow: T.shadow
+        }}>
+          <div style={{ display: "flex", gap: 10, marginBottom: 12 }}>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <label style={smallLabel}>Dal giorno</label>
+              <input type="date" value={fromInput} max={toInput}
+                onChange={e => setFromInput(e.target.value)} style={dateStyle} />
+            </div>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <label style={smallLabel}>Al giorno</label>
+              <input type="date" value={toInput} min={fromInput}
+                onChange={e => setToInput(e.target.value)} style={dateStyle} />
+            </div>
+          </div>
+
+          <label style={smallLabel}>Ricambio</label>
+          <input value={text} onChange={e => setText(e.target.value)}
+            placeholder="Filtra per codice o nome"
+            style={{ ...dateStyle, marginBottom: 12 }} />
+
+          <div style={{ display: "flex", gap: 8 }}>
+            <button onClick={onReset} style={{
+              flex: 1, padding: 12, borderRadius: 12,
+              background: T.bg, color: T.textMid, fontSize: 14, fontWeight: 600,
+              border: `1px solid ${T.border}`
+            }}>Ultimi {HISTORY_DEFAULT_DAYS} giorni</button>
+            <button onClick={() => onApply(fromInput, toInput)} className="tap-sc" style={{
+              flex: 1, padding: 12, borderRadius: 12,
+              background: T.blue, color: "white", fontSize: 14, fontWeight: 700
+            }}>Applica</button>
+          </div>
+
+          <button onClick={() => setConfirmClear(true)} disabled={clearing} style={{
+            width: "100%", marginTop: 14, padding: 11, borderRadius: 12,
+            background: "#FEF2F2", color: T.error, fontSize: 13.5, fontWeight: 700,
+            border: "1px solid #FECACA",
+            display: "flex", alignItems: "center", justifyContent: "center", gap: 8
+          }}>
+            {clearing ? <><Spinner size={15} color={T.error} /> Eliminazione...</> : "🗑️ Svuota tutta la cronologia"}
+          </button>
+        </div>
+      )}
+
+      {(error || clearError) && (
+        <div style={{
+          background: "#FEF2F2", border: "1px solid #FECACA", borderRadius: 14,
+          padding: "12px 14px", marginBottom: 12, color: T.error, fontSize: 13, lineHeight: 1.5
+        }}>⚠️ {error || clearError}</div>
+      )}
+
+      {loading ? (
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 12, padding: "48px 0" }}>
+          <Spinner size={30} />
+          <p style={{ color: T.textMid, fontSize: 14, fontWeight: 600 }}>Caricamento cronologia...</p>
+        </div>
+      ) : shown.length === 0 ? (
+        <div style={{ textAlign: "center", padding: "56px 24px" }}>
+          <div style={{ fontSize: 52, marginBottom: 14 }}>🕐</div>
+          <p style={{ color: T.text, fontWeight: 700, fontSize: 17 }}>
+            {q ? "Nessun risultato" : "Nessuna scansione nel periodo"}
+          </p>
+          <p style={{ color: T.textLight, fontSize: 14, marginTop: 6, lineHeight: 1.5 }}>
+            {q
+              ? `Nessuna scansione corrisponde a "${text}"`
+              : range.preset === "7d"
+                ? "Tocca 🔎 in alto per cercare in un periodo precedente"
+                : "Prova ad allargare l'intervallo di date"}
+          </p>
+        </div>
+      ) : (
+        shown.map((item, i) => (
         <div key={`${item.timestamp}-${i}`} className="fade-in" style={{
           background: T.card, borderRadius: 16, marginBottom: 10,
           border: `1px solid ${T.border}`, display: "flex",
@@ -1139,7 +1368,8 @@ function HistoryScreen({ history }) {
             borderRadius: 10, padding: "5px 10px", fontSize: 13, fontWeight: 700, flexShrink: 0
           }}>{item.confidence}%</div>
         </div>
-      ))}
+        ))
+      )}
     </div>
   );
 }
@@ -1843,6 +2073,7 @@ export default function App() {
       reloadParts={reloadParts}
       loadError={loadError}
       onLogout={handleLogout}
+      userEmail={email}
     />
   );
 
