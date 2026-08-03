@@ -494,20 +494,17 @@ function LoginScreen({ notice }) {
 
   return (
     <div className="screen-full" style={{
-      background: `linear-gradient(160deg, ${T.blueDark} 0%, ${T.blue} 55%, ${T.blueLight} 100%)`,
+      background: T.blue,
       display: "flex", flexDirection: "column",
       alignItems: "center", justifyContent: "center",
       position: "relative", overflow: "hidden"
     }}>
-      <div style={{ position: "absolute", top: -80, right: -80, width: 280, height: 280, borderRadius: "50%", background: "rgba(232,119,34,0.13)", pointerEvents: "none" }} />
-      <div style={{ position: "absolute", bottom: -60, left: -60, width: 200, height: 200, borderRadius: "50%", background: "rgba(51,48,179,0.22)", pointerEvents: "none" }} />
-
       <div className="fade-up" style={{ textAlign: "center", marginBottom: 40, position: "relative", zIndex: 1 }}>
         <div style={{
           width: 88, height: 88, borderRadius: 24, margin: "0 auto 16px",
-          background: `linear-gradient(135deg, ${T.orange}, ${T.orangeLight})`,
+          background: T.orange,
           display: "flex", alignItems: "center", justifyContent: "center",
-          boxShadow: "0 12px 40px rgba(232,119,34,0.45)", fontSize: 40
+          fontSize: 40
         }}>🔧</div>
         <div style={{ color: "white", fontSize: 30, fontWeight: 800, letterSpacing: "-0.8px" }}>WERFEN SCAN</div>
         <div style={{ color: "rgba(255,255,255,0.6)", fontSize: 14, marginTop: 4, fontWeight: 500 }}>
@@ -554,7 +551,7 @@ function LoginScreen({ notice }) {
 
         <button onClick={handleLogin} disabled={loading} className="tap-sc" style={{
           width: "100%", padding: 15, borderRadius: 14,
-          background: loading ? "rgba(255,255,255,0.2)" : `linear-gradient(135deg, ${T.orange}, ${T.orangeLight})`,
+          background: loading ? "rgba(255,255,255,0.2)" : T.orange,
           color: "white", fontSize: 16, fontWeight: 700,
           display: "flex", alignItems: "center", justifyContent: "center", gap: 8
         }}>
@@ -576,7 +573,7 @@ function LoginScreen({ notice }) {
 function Header({ title, subtitle, onLogout }) {
   return (
     <div style={{
-      background: `linear-gradient(135deg, ${T.blueDark}, ${T.blue})`,
+      background: T.blue,
       padding: "14px 20px",
       // Avviata dalla Home la status bar si sovrappone al contenuto: senza
       // questo padding l'orologio coprirebbe il titolo. Nel browser vale 0.
@@ -590,9 +587,9 @@ function Header({ title, subtitle, onLogout }) {
       <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
         <div style={{
           width: 40, height: 40, borderRadius: 11,
-          background: `linear-gradient(135deg, ${T.orange}, ${T.orangeLight})`,
+          background: T.orange,
           display: "flex", alignItems: "center", justifyContent: "center",
-          fontSize: 20, boxShadow: "0 4px 12px rgba(232,119,34,0.35)"
+          fontSize: 20
         }}>🔧</div>
         <div>
           <div style={{ color: "white", fontWeight: 700, fontSize: 17, letterSpacing: "-0.3px" }}>{title}</div>
@@ -868,9 +865,8 @@ function ScanScreen({ parts, onAddHistory, reloadParts, loadError }) {
           }}>✕ Rimuovi</button>
           <button onClick={analyze} className="tap-sc" style={{
             flex: 2, padding: 14, borderRadius: 14,
-            background: `linear-gradient(135deg, ${T.blue}, ${T.blueLight})`,
+            background: T.blue,
             color: "white", fontSize: 15, fontWeight: 700,
-            boxShadow: "0 4px 20px rgba(6,3,141,0.3)",
             display: "flex", alignItems: "center", justifyContent: "center", gap: 8
           }}>
             <span>🔍</span> Identifica ricambio
@@ -886,7 +882,7 @@ function ScanScreen({ parts, onAddHistory, reloadParts, loadError }) {
         }}>
           <div style={{
             width: 36, height: 36, borderRadius: 10,
-            background: `linear-gradient(135deg, ${T.orange}, ${T.orangeLight})`,
+            background: T.orange,
             display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18
           }}>📦</div>
           <div>
@@ -1025,7 +1021,7 @@ function ResultCard({ result, onReset }) {
     <div className="fade-up" style={{ padding: 16 }}>
       <div style={{ background: T.card, borderRadius: 20, overflow: "hidden", boxShadow: T.shadowLg, border: `1px solid ${T.border}` }}>
         <div style={{
-          background: matched ? `linear-gradient(135deg, ${T.blueDark}, ${T.blue})` : `linear-gradient(135deg, #374151, #6B7280)`,
+          background: matched ? T.blue : "#4B5563",
           padding: 20, display: "flex", alignItems: "center", justifyContent: "space-between"
         }}>
           <div>
@@ -1037,12 +1033,12 @@ function ResultCard({ result, onReset }) {
             </div>
           </div>
           <div style={{
-            background: matched ? `linear-gradient(135deg, ${T.orange}, ${T.orangeLight})` : "rgba(255,255,255,0.15)",
+            background: matched ? T.orange : "rgba(255,255,255,0.15)",
             borderRadius: 14, padding: "8px 14px", color: "white", fontSize: 18, fontWeight: 800
           }}>{pct}%</div>
         </div>
         <div style={{ height: 4, background: T.border }}>
-          <div style={{ height: "100%", width: `${pct}%`, background: `linear-gradient(90deg, ${T.orange}, ${T.orangeLight})`, transition: "width 0.8s ease" }} />
+          <div style={{ height: "100%", width: `${pct}%`, background: T.orange, transition: "width 0.8s ease" }} />
         </div>
         <div style={{ padding: 20 }}>
           {matched && part ? (
@@ -1088,9 +1084,8 @@ function ResultCard({ result, onReset }) {
           )}
           <button onClick={onReset} className="tap-sc" style={{
             width: "100%", padding: 15, borderRadius: 14,
-            background: `linear-gradient(135deg, ${T.orange}, ${T.orangeLight})`,
-            color: "white", fontSize: 16, fontWeight: 700,
-            boxShadow: "0 4px 20px rgba(232,119,34,0.3)"
+            background: T.orange,
+            color: "white", fontSize: 16, fontWeight: 700
           }}>📷 Nuova scansione</button>
         </div>
       </div>
@@ -1242,7 +1237,7 @@ function PartsListScreen({ parts, onEdit, onAdd, onDeletePart, reloadParts, load
       )}
 
       <div style={{
-        background: `linear-gradient(135deg, ${T.blue}, ${T.blueLight})`,
+        background: T.blue,
         borderRadius: 18, padding: "18px 20px", marginBottom: 16,
         display: "flex", alignItems: "center", justifyContent: "space-between"
       }}>
@@ -1253,9 +1248,8 @@ function PartsListScreen({ parts, onEdit, onAdd, onDeletePart, reloadParts, load
         </div>
         <button onClick={onAdd} className="tap-sc" style={{
           padding: "12px 20px", borderRadius: 14,
-          background: `linear-gradient(135deg, ${T.orange}, ${T.orangeLight})`,
-          color: "white", fontSize: 15, fontWeight: 700,
-          boxShadow: "0 4px 16px rgba(232,119,34,0.4)"
+          background: T.orange,
+          color: "white", fontSize: 15, fontWeight: 700
         }}>+ Aggiungi</button>
       </div>
 
@@ -1284,9 +1278,8 @@ function PartsListScreen({ parts, onEdit, onAdd, onDeletePart, reloadParts, load
           {parts.length === 0 && (
             <button onClick={onAdd} className="tap-sc" style={{
               marginTop: 18, padding: "12px 24px", borderRadius: 14,
-              background: `linear-gradient(135deg, ${T.orange}, ${T.orangeLight})`,
-              color: "white", fontSize: 15, fontWeight: 700,
-              boxShadow: "0 4px 16px rgba(232,119,34,0.35)"
+              background: T.orange,
+              color: "white", fontSize: 15, fontWeight: 700
             }}>+ Aggiungi il primo</button>
           )}
         </div>
@@ -1497,7 +1490,7 @@ function AddEditPartScreen({ parts, editingPart, onAddPart, onUpdatePart, onDone
           />
           <button onClick={addCompat} style={{
             padding: "13px 18px", borderRadius: 14,
-            background: `linear-gradient(135deg, ${T.blue}, ${T.blueLight})`,
+            background: T.blue,
             color: "white", fontWeight: 700, fontSize: 18
           }}>+</button>
         </div>
@@ -1534,9 +1527,8 @@ function AddEditPartScreen({ parts, editingPart, onAddPart, onUpdatePart, onDone
         }}>Annulla</button>
         <button onClick={save} disabled={saving} className="tap-sc" style={{
           flex: 2, padding: 14, borderRadius: 14,
-          background: saving ? T.textLight : `linear-gradient(135deg, ${T.orange}, ${T.orangeLight})`,
+          background: saving ? T.textLight : T.orange,
           color: "white", fontSize: 15, fontWeight: 700,
-          boxShadow: saving ? "none" : "0 4px 20px rgba(232,119,34,0.3)",
           display: "flex", alignItems: "center", justifyContent: "center", gap: 8
         }}>
           {saving ? <><Spinner size={18} color="white" /> Salvataggio...</> : (isEdit ? "💾 Salva modifiche" : "✅ Aggiungi al database")}
@@ -1570,15 +1562,14 @@ function SettingsScreen({ partsCount, userEmail }) {
   return (
     <div style={{ padding: 16 }}>
       <div style={{
-        background: `linear-gradient(135deg, ${T.blueDark}, ${T.blue})`,
+        background: T.blue,
         borderRadius: 20, padding: "24px 20px", marginBottom: 16,
         display: "flex", alignItems: "center", gap: 20
       }}>
         <div style={{
           width: 64, height: 64, borderRadius: 16,
-          background: `linear-gradient(135deg, ${T.orange}, ${T.orangeLight})`,
-          display: "flex", alignItems: "center", justifyContent: "center", fontSize: 28,
-          boxShadow: "0 4px 16px rgba(232,119,34,0.4)"
+          background: T.orange,
+          display: "flex", alignItems: "center", justifyContent: "center", fontSize: 28
         }}>📦</div>
         <div>
           <div style={{ color: "rgba(255,255,255,0.7)", fontSize: 12, fontWeight: 600, textTransform: "uppercase", letterSpacing: 1 }}>Ricambi totali</div>
@@ -1633,7 +1624,7 @@ function SettingsScreen({ partsCount, userEmail }) {
         )}
         <button onClick={changePassword} disabled={saving} className="tap-sc" style={{
           width: "100%", padding: 14, borderRadius: 14,
-          background: `linear-gradient(135deg, ${T.blue}, ${T.blueLight})`,
+          background: T.blue,
           color: "white", fontSize: 15, fontWeight: 700,
           display: "flex", alignItems: "center", justifyContent: "center", gap: 8
         }}>
@@ -1665,7 +1656,7 @@ function SettingsScreen({ partsCount, userEmail }) {
 function SetupScreen() {
   return (
     <div className="screen-full" style={{
-      background: `linear-gradient(160deg, ${T.blueDark}, ${T.blue})`,
+      background: T.blue,
       display: "flex", flexDirection: "column",
       alignItems: "center", justifyContent: "center"
     }}>
@@ -1698,7 +1689,7 @@ function SetupScreen() {
           <div key={n} style={{ display: "flex", gap: 12, alignItems: "flex-start", marginBottom: 14 }}>
             <div style={{
               width: 28, height: 28, borderRadius: 8, flexShrink: 0,
-              background: `linear-gradient(135deg, ${T.orange}, ${T.orangeLight})`,
+              background: T.orange,
               display: "flex", alignItems: "center", justifyContent: "center",
               color: "white", fontWeight: 800, fontSize: 13
             }}>{n}</div>
@@ -1717,15 +1708,15 @@ function SetupScreen() {
 function LoadingScreen({ label = "Caricamento WERFEN SCAN..." }) {
   return (
     <div className="screen-full" style={{
-      background: `linear-gradient(160deg, ${T.blueDark}, ${T.blue})`,
+      background: T.blue,
       display: "flex", flexDirection: "column",
       alignItems: "center", justifyContent: "center", gap: 20
     }}>
       <div style={{
         width: 72, height: 72, borderRadius: 20,
-        background: `linear-gradient(135deg, ${T.orange}, ${T.orangeLight})`,
+        background: T.orange,
         display: "flex", alignItems: "center", justifyContent: "center",
-        fontSize: 34, boxShadow: "0 8px 32px rgba(232,119,34,0.4)",
+        fontSize: 34,
         animation: "pulse 1.2s ease infinite"
       }}>🔧</div>
       <p style={{ color: "rgba(255,255,255,0.7)", fontSize: 16, fontWeight: 600 }}>{label}</p>
