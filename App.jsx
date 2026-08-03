@@ -40,15 +40,58 @@ const supabase = cloudReady ? createClient(SUPABASE_URL_CLEAN, SUPABASE_KEY_CLEA
 const isAdminEmail = (email) =>
   !!email && email.trim().toLowerCase() === ADMIN_EMAIL.trim().toLowerCase();
 
+// ── Durata massima della sessione ────────────────────────────
+// Dopo SESSION_MAX_HOURS dal login l'utente viene disconnesso e deve
+// riautenticarsi. Si applica ai tecnici; l'admin ne è escluso.
+// Per applicarlo anche all'admin: togli la riga isAdminEmail() in
+// sessionExpired(). Per cambiare la durata: modifica il numero qui sotto.
+const SESSION_MAX_HOURS = 24;
+const LOGIN_AT_KEY = "werfen_login_at";
+
+function rememberLoginTime() {
+  try { localStorage.setItem(LOGIN_AT_KEY, String(Date.now())); } catch { /* ignore */ }
+}
+function forgetLoginTime() {
+  try { localStorage.removeItem(LOGIN_AT_KEY); } catch { /* ignore */ }
+}
+
+// Momento di inizio sessione. Incrocia due fonti e tiene la più vecchia,
+// così un refresh del token non fa ripartire il conteggio:
+//  - last_sign_in_at, fornito dal server al login
+//  - il timestamp locale salvato al momento del login
+function sessionStartedAt(session) {
+  const stamps = [];
+  const serverTs = session?.user?.last_sign_in_at;
+  if (serverTs) {
+    const t = new Date(serverTs).getTime();
+    if (!Number.isNaN(t)) stamps.push(t);
+  }
+  try {
+    const local = Number(localStorage.getItem(LOGIN_AT_KEY));
+    if (local > 0) stamps.push(local);
+  } catch { /* ignore */ }
+  return stamps.length ? Math.min(...stamps) : null;
+}
+
+function sessionExpired(session) {
+  if (!session) return false;
+  if (isAdminEmail(session.user?.email)) return false;   // l'admin non scade
+  const start = sessionStartedAt(session);
+  if (!start) return false;
+  return Date.now() - start > SESSION_MAX_HOURS * 3600 * 1000;
+}
+
 // ===================== THEME =====================
+// Palette. I due colori istituzionali sono `blue` e `orange`; le varianti
+// dark/light/pale sono derivate da quelli mantenendo gli stessi rapporti.
 const T = {
-  blueDark:    "#0A0980",
-  blue:        "rgb(18, 15, 146)",
-  blueLight:   "#3F3CB8",
-  bluePale:    "#E8E7F8",
-  orange:      "#FF6820",
-  orangeLight: "#FF8C4A",
-  orangePale:  "#FFF1E8",
+  blueDark:    "#04026B",           // rgb(4, 2, 107)
+  blue:        "rgb(6, 3, 141)",    // ← colore istituzionale
+  blueLight:   "#3330B3",           // rgb(51, 48, 179)
+  bluePale:    "#E9E8F5",
+  orange:      "rgb(232, 119, 34)", // ← colore istituzionale
+  orangeLight: "#E89B4C",           // rgb(232, 155, 76)
+  orangePale:  "#FDF4ED",
   bg:          "#F4F5FB",
   card:        "#FFFFFF",
   text:        "#0F1140",
@@ -57,13 +100,47 @@ const T = {
   border:      "#DCDEF0",
   success:     "#059669",
   error:       "#DC2626",
-  shadow:      "0 2px 12px rgba(18,15,146,0.10)",
-  shadowLg:    "0 8px 32px rgba(18,15,146,0.18)",
+  shadow:      "0 2px 12px rgba(6,3,141,0.10)",
+  shadowLg:    "0 8px 32px rgba(6,3,141,0.18)",
 };
 
 const FONT = `-apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Helvetica Neue", Arial, sans-serif`;
 
+// ── Modalità di visualizzazione ──────────────────────────────
+//  standalone = avviata dalla schermata Home (iOS "Aggiungi a Home",
+//               Android "Installa app"): niente barra del browser, contenuto
+//               a tutto schermo, status bar sovrapposta al contenuto.
+//  browser    = aperta come scheda normale in Chrome/Safari.
+// Il valore è fissato al caricamento: la modalità non cambia a runtime.
+function detectStandalone() {
+  if (typeof window === "undefined") return false;
+  const mm = (q) => window.matchMedia && window.matchMedia(q).matches;
+  return (
+    window.navigator?.standalone === true ||   // iOS, aggiunta alla Home
+    mm("(display-mode: standalone)") ||        // PWA installata
+    mm("(display-mode: fullscreen)") ||
+    mm("(display-mode: minimal-ui)")
+  );
+}
+const IS_STANDALONE = detectStandalone();
+
+if (typeof document !== "undefined") {
+  document.documentElement.classList.add(IS_STANDALONE ? "mode-standalone" : "mode-browser");
+}
+
 const GLOBAL_STYLES = `
+  :root {
+    /* Margini di sicurezza: valgono 0 nel browser, diventano l'altezza della
+       status bar / home indicator quando l'app parte dalla Home. Richiedono
+       viewport-fit=cover nel meta viewport di index.html. */
+    --safe-top:    env(safe-area-inset-top, 0px);
+    --safe-bottom: env(safe-area-inset-bottom, 0px);
+    --safe-left:   env(safe-area-inset-left, 0px);
+    --safe-right:  env(safe-area-inset-right, 0px);
+    --app-w: 520px;
+    --tabbar-h: 58px;
+  }
+
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
   html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
   html, body {
@@ -77,6 +154,51 @@ const GLOBAL_STYLES = `
   }
   body { overscroll-behavior-y: contain; line-height: 1.4; }
   #root { width: 100%; overflow-x: hidden; }
+
+  /* Colonna dell'app. 100dvh segue il ridimensionamento della barra di
+     Chrome su mobile; 100vh resta come fallback per i browser più vecchi. */
+  .app-shell {
+    width: 100%;
+    max-width: var(--app-w);
+    margin: 0 auto;
+    min-height: 100vh;
+    min-height: 100dvh;
+    background: ${T.bg};
+    position: relative;
+  }
+  .app-content {
+    padding-left: var(--safe-left);
+    padding-right: var(--safe-right);
+    padding-bottom: calc(var(--tabbar-h) + var(--safe-bottom) + 32px);
+  }
+
+  /* Schermate a tutta pagina (login, setup, caricamento) */
+  .screen-full {
+    min-height: 100vh;
+    min-height: 100dvh;
+    padding-top:    calc(24px + var(--safe-top));
+    padding-bottom: calc(24px + var(--safe-bottom));
+    padding-left:   calc(24px + var(--safe-left));
+    padding-right:  calc(24px + var(--safe-right));
+  }
+
+  /* Su schermi larghi la colonna diventa una scheda, invece di galleggiare
+     su un fondo bianco a tutta larghezza. */
+  @media (min-width: 700px) {
+    body { background: #EBECF4; }
+    .app-shell {
+      box-shadow: 0 0 0 1px ${T.border}, 0 20px 60px rgba(6,3,141,0.10);
+    }
+  }
+
+  /* Avviata dalla Home: niente selezione testo accidentale sui comandi,
+     per un comportamento più vicino a quello di un'app nativa. */
+  html.mode-standalone button,
+  html.mode-standalone label {
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
+  }
 
   input, textarea, select, button {
     font-family: ${FONT};
@@ -262,27 +384,34 @@ function Spinner({ size = 28, color = T.blue }) {
   );
 }
 
+// Allineata al bordo destro della colonna dell'app, non della finestra:
+// su desktop restava altrimenti staccata, in fondo allo schermo.
 function Tagline({ light = false, raised = false }) {
   return (
     <div style={{
-      position: "fixed",
+      position: "fixed", left: 0, right: 0,
       bottom: raised
-        ? "calc(max(12px, env(safe-area-inset-bottom)) + 64px)"
-        : "max(12px, env(safe-area-inset-bottom))",
-      right: 18,
-      fontSize: 11, fontWeight: 600, letterSpacing: 0.5,
-      fontStyle: "italic",
-      color: light ? "rgba(255,255,255,0.6)" : T.textLight,
-      pointerEvents: "none",
-      zIndex: 50,
-    }}>Powering Patient Care</div>
+        ? "calc(var(--tabbar-h) + var(--safe-bottom) + 10px)"
+        : "calc(12px + var(--safe-bottom))",
+      display: "flex", justifyContent: "center",
+      pointerEvents: "none", zIndex: 50,
+    }}>
+      <div style={{
+        width: "100%", maxWidth: "var(--app-w)",
+        paddingRight: "calc(18px + var(--safe-right))",
+        textAlign: "right",
+        fontSize: 11, fontWeight: 600, letterSpacing: 0.5,
+        fontStyle: "italic",
+        color: light ? "rgba(255,255,255,0.6)" : T.textLight,
+      }}>Powering Patient Care</div>
+    </div>
   );
 }
 
 function ConfirmDialog({ message, onConfirm, onCancel }) {
   return (
     <div style={{
-      position: "fixed", inset: 0, background: "rgba(10,9,128,0.45)",
+      position: "fixed", inset: 0, background: "rgba(4,2,107,0.45)",
       display: "flex", alignItems: "center", justifyContent: "center",
       zIndex: 9999, padding: 24, animation: "fadeIn 0.2s ease"
     }}>
@@ -331,7 +460,7 @@ function PhotoPicker({ id, disabled, onFile, children, style }) {
 }
 
 // ===================== LOGIN SCREEN (Supabase Auth) =====================
-function LoginScreen() {
+function LoginScreen({ notice }) {
   const [email, setEmail]       = useState("");
   const [password, setPassword] = useState("");
   const [error, setError]       = useState("");
@@ -364,22 +493,21 @@ function LoginScreen() {
   };
 
   return (
-    <div style={{
-      minHeight: "100vh",
+    <div className="screen-full" style={{
       background: `linear-gradient(160deg, ${T.blueDark} 0%, ${T.blue} 55%, ${T.blueLight} 100%)`,
       display: "flex", flexDirection: "column",
       alignItems: "center", justifyContent: "center",
-      padding: 24, position: "relative", overflow: "hidden"
+      position: "relative", overflow: "hidden"
     }}>
-      <div style={{ position: "absolute", top: -80, right: -80, width: 280, height: 280, borderRadius: "50%", background: "rgba(255,104,32,0.13)", pointerEvents: "none" }} />
-      <div style={{ position: "absolute", bottom: -60, left: -60, width: 200, height: 200, borderRadius: "50%", background: "rgba(63,60,184,0.22)", pointerEvents: "none" }} />
+      <div style={{ position: "absolute", top: -80, right: -80, width: 280, height: 280, borderRadius: "50%", background: "rgba(232,119,34,0.13)", pointerEvents: "none" }} />
+      <div style={{ position: "absolute", bottom: -60, left: -60, width: 200, height: 200, borderRadius: "50%", background: "rgba(51,48,179,0.22)", pointerEvents: "none" }} />
 
       <div className="fade-up" style={{ textAlign: "center", marginBottom: 40, position: "relative", zIndex: 1 }}>
         <div style={{
           width: 88, height: 88, borderRadius: 24, margin: "0 auto 16px",
           background: `linear-gradient(135deg, ${T.orange}, ${T.orangeLight})`,
           display: "flex", alignItems: "center", justifyContent: "center",
-          boxShadow: "0 12px 40px rgba(255,104,32,0.45)", fontSize: 40
+          boxShadow: "0 12px 40px rgba(232,119,34,0.45)", fontSize: 40
         }}>🔧</div>
         <div style={{ color: "white", fontSize: 30, fontWeight: 800, letterSpacing: "-0.8px" }}>WERFEN SCAN</div>
         <div style={{ color: "rgba(255,255,255,0.6)", fontSize: 14, marginTop: 4, fontWeight: 500 }}>
@@ -397,6 +525,15 @@ function LoginScreen() {
         <h3 style={{ color: "white", marginBottom: 18, textAlign: "center", fontSize: 18, fontWeight: 700 }}>
           Accedi
         </h3>
+
+        {notice && (
+          <div style={{
+            background: "rgba(232,119,34,0.18)", border: `1px solid ${T.orange}`,
+            borderRadius: 12, padding: "10px 12px", marginBottom: 14
+          }}>
+            <p style={{ color: "#FFD9C2", fontSize: 12.5, lineHeight: 1.5 }}>⏱️ {notice}</p>
+          </div>
+        )}
 
         <input
           type="email" placeholder="Email" autoComplete="username"
@@ -441,16 +578,21 @@ function Header({ title, subtitle, onLogout }) {
     <div style={{
       background: `linear-gradient(135deg, ${T.blueDark}, ${T.blue})`,
       padding: "14px 20px",
+      // Avviata dalla Home la status bar si sovrappone al contenuto: senza
+      // questo padding l'orologio coprirebbe il titolo. Nel browser vale 0.
+      paddingTop:   "calc(14px + var(--safe-top))",
+      paddingLeft:  "calc(20px + var(--safe-left))",
+      paddingRight: "calc(20px + var(--safe-right))",
       display: "flex", alignItems: "center", justifyContent: "space-between",
       position: "sticky", top: 0, zIndex: 100,
-      boxShadow: "0 4px 20px rgba(18,15,146,0.25)"
+      boxShadow: "0 4px 20px rgba(6,3,141,0.25)"
     }}>
       <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
         <div style={{
           width: 40, height: 40, borderRadius: 11,
           background: `linear-gradient(135deg, ${T.orange}, ${T.orangeLight})`,
           display: "flex", alignItems: "center", justifyContent: "center",
-          fontSize: 20, boxShadow: "0 4px 12px rgba(255,104,32,0.35)"
+          fontSize: 20, boxShadow: "0 4px 12px rgba(232,119,34,0.35)"
         }}>🔧</div>
         <div>
           <div style={{ color: "white", fontWeight: 700, fontSize: 17, letterSpacing: "-0.3px" }}>{title}</div>
@@ -471,12 +613,14 @@ function TabBar({ tabs, active, onChange }) {
     <div style={{
       position: "fixed", bottom: 0,
       left: "50%", transform: "translateX(-50%)",
-      width: "100%", maxWidth: 520,
+      width: "100%", maxWidth: "var(--app-w)",
       background: T.card, borderTop: `1px solid ${T.border}`,
       display: "flex",
-      paddingBottom: "max(10px, env(safe-area-inset-bottom))",
+      paddingBottom: "calc(10px + var(--safe-bottom))",
+      paddingLeft: "var(--safe-left)",
+      paddingRight: "var(--safe-right)",
       paddingTop: 6,
-      boxShadow: "0 -4px 24px rgba(18,15,146,0.09)", zIndex: 100
+      boxShadow: "0 -4px 24px rgba(6,3,141,0.09)", zIndex: 100
     }}>
       {tabs.map(t => {
         const on = active === t.id;
@@ -514,9 +658,9 @@ function UserApp({ parts, reloadParts, loadError, onLogout }) {
   }
 
   return (
-    <div style={{ minHeight: "100vh", background: T.bg, maxWidth: 520, margin: "0 auto" }}>
+    <div className="app-shell">
       <Header title="WERFEN SCAN" subtitle="Spare Parts Recognition" onLogout={onLogout} />
-      <div style={{ paddingBottom: 90 }}>
+      <div className="app-content">
         {tab === "scan"    && <ScanScreen parts={parts} onAddHistory={addToHistory} reloadParts={reloadParts} loadError={loadError} />}
         {tab === "catalog" && <CatalogScreen parts={parts} />}
         {tab === "history" && <HistoryScreen history={history} />}
@@ -669,7 +813,7 @@ function ScanScreen({ parts, onAddHistory, reloadParts, loadError }) {
             <img src={image} alt="part" style={{ width: "100%", maxHeight: 320, objectFit: "cover", display: "block" }} />
             {analyzing && (
               <div style={{
-                position: "absolute", inset: 0, background: "rgba(18,15,146,0.65)",
+                position: "absolute", inset: 0, background: "rgba(6,3,141,0.65)",
                 display: "flex", flexDirection: "column",
                 alignItems: "center", justifyContent: "center", gap: 12
               }}>
@@ -726,7 +870,7 @@ function ScanScreen({ parts, onAddHistory, reloadParts, loadError }) {
             flex: 2, padding: 14, borderRadius: 14,
             background: `linear-gradient(135deg, ${T.blue}, ${T.blueLight})`,
             color: "white", fontSize: 15, fontWeight: 700,
-            boxShadow: "0 4px 20px rgba(18,15,146,0.3)",
+            boxShadow: "0 4px 20px rgba(6,3,141,0.3)",
             display: "flex", alignItems: "center", justifyContent: "center", gap: 8
           }}>
             <span>🔍</span> Identifica ricambio
@@ -946,7 +1090,7 @@ function ResultCard({ result, onReset }) {
             width: "100%", padding: 15, borderRadius: 14,
             background: `linear-gradient(135deg, ${T.orange}, ${T.orangeLight})`,
             color: "white", fontSize: 16, fontWeight: 700,
-            boxShadow: "0 4px 20px rgba(255,104,32,0.3)"
+            boxShadow: "0 4px 20px rgba(232,119,34,0.3)"
           }}>📷 Nuova scansione</button>
         </div>
       </div>
@@ -1015,9 +1159,9 @@ function AdminApp({ parts, onAddPart, onUpdatePart, onDeletePart, reloadParts, l
   function handleDone()      { setEditingPart(null); setTab("parts"); reloadParts(); }
 
   return (
-    <div style={{ minHeight: "100vh", background: T.bg, maxWidth: 520, margin: "0 auto" }}>
+    <div className="app-shell">
       <Header title="WERFEN SCAN Admin" subtitle="Area amministratore" onLogout={onLogout} />
-      <div style={{ paddingBottom: 90 }}>
+      <div className="app-content">
         {tab === "parts" && <PartsListScreen parts={parts} onEdit={handleEdit} onAdd={handleAddNew} onDeletePart={onDeletePart} reloadParts={reloadParts} loadError={loadError} />}
         {/* La key forza il remount passando da Edit a New Part: senza,
             il form resterebbe precompilato col ricambio in modifica. */}
@@ -1111,7 +1255,7 @@ function PartsListScreen({ parts, onEdit, onAdd, onDeletePart, reloadParts, load
           padding: "12px 20px", borderRadius: 14,
           background: `linear-gradient(135deg, ${T.orange}, ${T.orangeLight})`,
           color: "white", fontSize: 15, fontWeight: 700,
-          boxShadow: "0 4px 16px rgba(255,104,32,0.4)"
+          boxShadow: "0 4px 16px rgba(232,119,34,0.4)"
         }}>+ Aggiungi</button>
       </div>
 
@@ -1142,7 +1286,7 @@ function PartsListScreen({ parts, onEdit, onAdd, onDeletePart, reloadParts, load
               marginTop: 18, padding: "12px 24px", borderRadius: 14,
               background: `linear-gradient(135deg, ${T.orange}, ${T.orangeLight})`,
               color: "white", fontSize: 15, fontWeight: 700,
-              boxShadow: "0 4px 16px rgba(255,104,32,0.35)"
+              boxShadow: "0 4px 16px rgba(232,119,34,0.35)"
             }}>+ Aggiungi il primo</button>
           )}
         </div>
@@ -1392,7 +1536,7 @@ function AddEditPartScreen({ parts, editingPart, onAddPart, onUpdatePart, onDone
           flex: 2, padding: 14, borderRadius: 14,
           background: saving ? T.textLight : `linear-gradient(135deg, ${T.orange}, ${T.orangeLight})`,
           color: "white", fontSize: 15, fontWeight: 700,
-          boxShadow: saving ? "none" : "0 4px 20px rgba(255,104,32,0.3)",
+          boxShadow: saving ? "none" : "0 4px 20px rgba(232,119,34,0.3)",
           display: "flex", alignItems: "center", justifyContent: "center", gap: 8
         }}>
           {saving ? <><Spinner size={18} color="white" /> Salvataggio...</> : (isEdit ? "💾 Salva modifiche" : "✅ Aggiungi al database")}
@@ -1434,7 +1578,7 @@ function SettingsScreen({ partsCount, userEmail }) {
           width: 64, height: 64, borderRadius: 16,
           background: `linear-gradient(135deg, ${T.orange}, ${T.orangeLight})`,
           display: "flex", alignItems: "center", justifyContent: "center", fontSize: 28,
-          boxShadow: "0 4px 16px rgba(255,104,32,0.4)"
+          boxShadow: "0 4px 16px rgba(232,119,34,0.4)"
         }}>📦</div>
         <div>
           <div style={{ color: "rgba(255,255,255,0.7)", fontSize: 12, fontWeight: 600, textTransform: "uppercase", letterSpacing: 1 }}>Ricambi totali</div>
@@ -1499,10 +1643,18 @@ function SettingsScreen({ partsCount, userEmail }) {
 
       <div style={{ background: T.card, borderRadius: 16, padding: 16, border: `1px solid ${T.border}`, textAlign: "center" }}>
         <div style={{ fontSize: 28, marginBottom: 8 }}>🔧</div>
-        <div style={{ color: T.text, fontWeight: 700, fontSize: 15 }}>WERFEN SCAN v3.0</div>
+        <div style={{ color: T.text, fontWeight: 700, fontSize: 15 }}>WERFEN SCAN v3.1</div>
         <div style={{ color: T.textLight, fontSize: 13, marginTop: 4 }}>
           Industrial Spare Parts Recognition<br />
           Powered by Claude AI (Anthropic)
+        </div>
+        <div style={{
+          marginTop: 12, paddingTop: 12, borderTop: `1px solid ${T.border}`,
+          color: T.textLight, fontSize: 12
+        }}>
+          Modalità: <strong style={{ color: T.textMid }}>
+            {IS_STANDALONE ? "📱 avviata dalla Home" : "🌐 scheda del browser"}
+          </strong>
         </div>
       </div>
     </div>
@@ -1512,11 +1664,10 @@ function SettingsScreen({ partsCount, userEmail }) {
 // ===================== SETUP / LOADING =====================
 function SetupScreen() {
   return (
-    <div style={{
-      minHeight: "100vh",
+    <div className="screen-full" style={{
       background: `linear-gradient(160deg, ${T.blueDark}, ${T.blue})`,
       display: "flex", flexDirection: "column",
-      alignItems: "center", justifyContent: "center", padding: 24
+      alignItems: "center", justifyContent: "center"
     }}>
       <div style={{
         background: "rgba(255,255,255,0.10)", border: "1px solid rgba(255,255,255,0.2)",
@@ -1529,7 +1680,7 @@ function SetupScreen() {
 
         {cloudConfigProblem && (
           <div style={{
-            background: "rgba(255,104,32,0.15)", border: `1px solid ${T.orange}`,
+            background: "rgba(232,119,34,0.15)", border: `1px solid ${T.orange}`,
             borderRadius: 12, padding: "10px 12px", marginBottom: 16
           }}>
             <p className="wrap-anywhere" style={{ color: "#FFD9C2", fontSize: 12, lineHeight: 1.5 }}>
@@ -1565,8 +1716,7 @@ function SetupScreen() {
 
 function LoadingScreen({ label = "Caricamento WERFEN SCAN..." }) {
   return (
-    <div style={{
-      minHeight: "100vh",
+    <div className="screen-full" style={{
       background: `linear-gradient(160deg, ${T.blueDark}, ${T.blue})`,
       display: "flex", flexDirection: "column",
       alignItems: "center", justifyContent: "center", gap: 20
@@ -1575,7 +1725,7 @@ function LoadingScreen({ label = "Caricamento WERFEN SCAN..." }) {
         width: 72, height: 72, borderRadius: 20,
         background: `linear-gradient(135deg, ${T.orange}, ${T.orangeLight})`,
         display: "flex", alignItems: "center", justifyContent: "center",
-        fontSize: 34, boxShadow: "0 8px 32px rgba(255,104,32,0.4)",
+        fontSize: 34, boxShadow: "0 8px 32px rgba(232,119,34,0.4)",
         animation: "pulse 1.2s ease infinite"
       }}>🔧</div>
       <p style={{ color: "rgba(255,255,255,0.7)", fontSize: 16, fontWeight: 600 }}>{label}</p>
@@ -1591,6 +1741,7 @@ export default function App() {
   const [parts, setParts]             = useState([]);
   const [partsLoading, setPartsLoading] = useState(false);
   const [loadError, setLoadError]     = useState("");
+  const [expiredNotice, setExpiredNotice] = useState("");
 
   // Sessione Supabase: persiste in localStorage, quindi il login
   // resta valido tra le aperture dell'app sullo stesso dispositivo.
@@ -1602,11 +1753,42 @@ export default function App() {
       setSession(data.session ?? null);
       setAuthChecked(true);
     });
-    const { data: sub } = supabase.auth.onAuthStateChange((_event, s) => {
+    const { data: sub } = supabase.auth.onAuthStateChange((event, s) => {
+      if (event === "SIGNED_IN")  { rememberLoginTime(); setExpiredNotice(""); }
+      if (event === "SIGNED_OUT") { forgetLoginTime(); }
       setSession(s ?? null);
     });
     return () => { alive = false; sub.subscription.unsubscribe(); };
   }, []);
+
+  // Scadenza della sessione dopo SESSION_MAX_HOURS.
+  // Controlla all'avvio, ogni minuto, e ogni volta che l'app torna in primo
+  // piano — il caso tipico è il telefono riaperto il giorno dopo, dove
+  // nessun timer sarebbe rimasto in esecuzione.
+  useEffect(() => {
+    if (!session) return;
+    let done = false;
+
+    const check = async () => {
+      if (done || !sessionExpired(session)) return;
+      done = true;
+      setExpiredNotice(`Sessione scaduta dopo ${SESSION_MAX_HOURS} ore. Accedi di nuovo con le tue credenziali.`);
+      forgetLoginTime();
+      await supabase.auth.signOut();
+    };
+
+    check();
+    const id = setInterval(check, 60_000);
+    const onWake = () => { if (!document.hidden) check(); };
+    document.addEventListener("visibilitychange", onWake);
+    window.addEventListener("focus", onWake);
+    return () => {
+      done = true;
+      clearInterval(id);
+      document.removeEventListener("visibilitychange", onWake);
+      window.removeEventListener("focus", onWake);
+    };
+  }, [session]);
 
   async function reloadParts() {
     if (!cloudReady) return;
@@ -1650,7 +1832,7 @@ export default function App() {
   let screen;
   if (!cloudReady)        screen = <SetupScreen />;
   else if (!authChecked)  screen = <LoadingScreen />;
-  else if (!session)      screen = <LoginScreen />;
+  else if (!session)      screen = <LoginScreen notice={expiredNotice} />;
   else if (partsLoading)  screen = <LoadingScreen label="Caricamento ricambi..." />;
   else if (isAdminEmail(email)) screen = (
     <AdminApp
