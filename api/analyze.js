@@ -48,7 +48,9 @@ function extractJson(raw) {
   throw new Error("JSON malformato nella risposta AI");
 }
 
-function buildPrompt(parts, confusions) {
+function buildPrompt(parts, confusions, lang) {
+  // Il campo "reasoning" viene mostrato al tecnico: deve essere nella sua lingua.
+  const language = lang === "en" ? "English" : "Italian";
   // I feedback dei tecnici entrano nel contesto della richiesta. Non
   // riaddestrano il modello — lo informano: contano quante volte un ricambio
   // è stato confermato e quali coppie vengono storicamente scambiate.
@@ -78,7 +80,8 @@ before — treat it with more scrutiny and require clearer visual evidence befor
 ${feedbackSection}
 Identify the matching part by analyzing: shape, color, size, component type, visible markings, physical characteristics.
 
-Reply ONLY with valid JSON (no extra text, no markdown, no backticks). Keep "reasoning" under 40 words:
+Reply ONLY with valid JSON (no extra text, no markdown, no backticks).
+Write the "reasoning" value in ${language}, under 40 words. Keys stay in English:
 - If match found: {"matched":true,"id":"<exact id>","confidence":<0-100>,"reasoning":"<concise technical explanation>"}
 - If no match: {"matched":false,"confidence":0,"reasoning":"<describe what you see and why no part matches>"}`;
 }
@@ -193,7 +196,7 @@ export default async function handler(req, res) {
               type: "image",
               source: { type: "base64", media_type: image.media_type, data: image.data },
             },
-            { type: "text", text: buildPrompt(safeParts, safeConfusions) },
+            { type: "text", text: buildPrompt(safeParts, safeConfusions, body?.lang) },
           ],
         }],
       }),
