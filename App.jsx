@@ -310,6 +310,59 @@ const cloud = {
     }]);
     if (error) console.error("addHistory:", error.message, error.code);
   },
+  // ── Feedback sulle scansioni ──────────────────────────────
+  // Registra se il riconoscimento era corretto e, quando sbagliato, qual era
+  // il ricambio giusto. È il materiale che alimenta il contesto delle
+  // scansioni successive.
+  async addFeedback({ predictedPartId, correctPartId, isCorrect, confidence }) {
+    const { data: { session } } = await supabase.auth.getSession();
+    const userId = session?.user?.id;
+    if (!userId) throw new Error("Sessione non attiva");
+    const { error } = await supabase.from("scan_feedback").insert([{
+      user_id: userId,
+      predicted_part_id: predictedPartId || null,
+      correct_part_id: correctPartId || null,
+      is_correct: !!isCorrect,
+      confidence: confidence ?? null,
+    }]);
+    if (error) throw error;
+  },
+
+  // Aggrega i feedback di tutti i tecnici: conteggi per ricambio e coppie
+  // di confusione ricorrenti. Serve al prompt, non all'interfaccia.
+  async loadFeedbackStats() {
+    const { data, error } = await supabase
+      .from("scan_feedback")
+      .select("predicted_part_id, correct_part_id, is_correct")
+      .order("created_at", { ascending: false })
+      .limit(2000);
+    if (error) {
+      console.error("loadFeedbackStats:", error.message, error.code);
+      return { byPart: {}, confusions: [] };
+    }
+    const byPart = {};
+    const pairs = {};
+    for (const f of data || []) {
+      const pid = f.predicted_part_id;
+      if (pid) {
+        byPart[pid] = byPart[pid] || { ok: 0, ko: 0 };
+        if (f.is_correct) byPart[pid].ok++; else byPart[pid].ko++;
+      }
+      if (!f.is_correct && pid && f.correct_part_id && pid !== f.correct_part_id) {
+        const key = `${pid}>${f.correct_part_id}`;
+        pairs[key] = (pairs[key] || 0) + 1;
+      }
+    }
+    const confusions = Object.entries(pairs)
+      .map(([k, count]) => {
+        const [predicted, actual] = k.split(">");
+        return { predicted, actual, count };
+      })
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 20);
+    return { byPart, confusions };
+  },
+
   // Svuota la cronologia dell'utente collegato. Non serve filtrare per utente
   // qui: la policy RLS limita la DELETE alle sole righe di chi la esegue.
   // Il filtro sul timestamp c'è sempre: PostgREST rifiuta una DELETE nuda.
@@ -321,6 +374,49 @@ const cloud = {
     if (error) throw error;
   },
 };
+
+// ── Ricambi simili ───────────────────────────────────────────
+// Quando l'AI sbaglia, proponiamo i candidati più plausibili invece di far
+// scorrere tutto il catalogo. La somiglianza è calcolata sulle parole in
+// comune fra descrizioni, nomi e categoria — quindi su colore, forma e
+// materiale, che è come sono scritte le descrizioni. Nessun modello dietro:
+// è un confronto testuale, deterministico e leggibile.
+const STOPWORDS = new Set([
+  "di","del","della","delle","dei","con","per","in","il","la","le","lo","gli",
+  "una","uno","che","non","più","circa","alla","allo","sul","sulla","dal",
+  "and","the","with","for","mm","cm","tipo","parte","pezzo",
+]);
+
+function tokenize(s) {
+  return String(s || "")
+    .toLowerCase()
+    .replace(/[^a-zà-ù0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter(w => w.length > 2 && !STOPWORDS.has(w));
+}
+
+function partTokens(p) {
+  return new Set([...tokenize(p.name), ...tokenize(p.description), ...tokenize(p.category)]);
+}
+
+function findSimilarParts(parts, target, limit = 5) {
+  if (!target) return parts.slice(0, limit);
+  const t = partTokens(target);
+  return parts
+    .filter(p => p.id !== target.id)
+    .map(p => {
+      let shared = 0;
+      partTokens(p).forEach(w => { if (t.has(w)) shared++; });
+      const sameCategory =
+        p.category && target.category &&
+        p.category.trim().toLowerCase() === target.category.trim().toLowerCase();
+      return { part: p, score: shared + (sameCategory ? 2 : 0) };
+    })
+    .filter(x => x.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit)
+    .map(x => x.part);
+}
 
 // ── Intervalli di date per la cronologia ─────────────────────
 const HISTORY_DEFAULT_DAYS = 7;
@@ -703,6 +799,23 @@ function UserApp({ parts, reloadParts, loadError, onLogout, userEmail }) {
   const [range, setRange] = useState(defaultHistoryRange);
   const [historyLoading, setHistoryLoading] = useState(true);
   const [historyError, setHistoryError] = useState("");
+  const [feedbackStats, setFeedbackStats] = useState({ byPart: {}, confusions: [] });
+
+  // I feedback aggregati di tutti i tecnici, caricati una volta e aggiornati
+  // dopo ogni nuova valutazione.
+  useEffect(() => {
+    let alive = true;
+    cloud.loadFeedbackStats()
+      .then(s => { if (alive) setFeedbackStats(s); })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, []);
+
+  async function handleFeedback(payload) {
+    await cloud.addFeedback(payload);
+    const fresh = await cloud.loadFeedbackStats().catch(() => null);
+    if (fresh) setFeedbackStats(fresh);
+  }
 
   // Ricarica dal database ogni volta che cambia l'intervallo selezionato.
   useEffect(() => {
@@ -742,7 +855,7 @@ function UserApp({ parts, reloadParts, loadError, onLogout, userEmail }) {
     <div className="app-shell">
       <Header title="WERFEN SCAN" subtitle={userEmail || "Spare Parts Recognition"} onLogout={onLogout} />
       <div className="app-content">
-        {tab === "scan"    && <ScanScreen parts={parts} onAddHistory={addToHistory} reloadParts={reloadParts} loadError={loadError} />}
+        {tab === "scan"    && <ScanScreen parts={parts} onAddHistory={addToHistory} reloadParts={reloadParts} loadError={loadError} feedbackStats={feedbackStats} onFeedback={handleFeedback} />}
         {tab === "catalog" && <CatalogScreen parts={parts} />}
         {tab === "history" && (
           <HistoryScreen
@@ -771,7 +884,7 @@ function UserApp({ parts, reloadParts, loadError, onLogout, userEmail }) {
 }
 
 // ===================== SCAN SCREEN =====================
-function ScanScreen({ parts, onAddHistory, reloadParts, loadError }) {
+function ScanScreen({ parts, onAddHistory, reloadParts, loadError, feedbackStats, onFeedback }) {
   const [image, setImage]         = useState(null);
   const [analyzing, setAnalyzing] = useState(false);
   const [result, setResult]       = useState(null);
@@ -818,11 +931,30 @@ function ScanScreen({ parts, onAddHistory, reloadParts, loadError }) {
       const [meta, base64] = image.split(",");
       const mediaType = meta.split(";")[0].split(":")[1];
 
-      const partsCtx = parts.map(p => ({
-        id: p.id, code: p.code, name: p.name,
-        description: p.description,
-        category: p.category || "",
-        compatibility: p.compatibility || []
+      // Ai dati di ogni ricambio affianchiamo il bilancio dei feedback
+      // ricevuti: è così che le segnalazioni dei tecnici influenzano le
+      // scansioni successive.
+      const byPart = feedbackStats?.byPart || {};
+      const partsCtx = parts.map(p => {
+        const s = byPart[p.id];
+        return {
+          id: p.id, code: p.code, name: p.name,
+          description: p.description,
+          category: p.category || "",
+          compatibility: p.compatibility || [],
+          ...(s ? { confirmed_by_technicians: s.ok, reported_wrong: s.ko } : {}),
+        };
+      });
+
+      // Coppie di confusione ricorrenti, tradotte in codici leggibili
+      const labelOf = (id) => {
+        const p = parts.find(x => x.id === id);
+        return p ? `${p.code} (${p.name})` : id;
+      };
+      const confusions = (feedbackStats?.confusions || []).map(c => ({
+        wrongly_identified_as: labelOf(c.predicted),
+        actually_was: labelOf(c.actual),
+        times: c.count,
       }));
 
       // 🔑 Nessuna chiave qui: la aggiunge il server in /api/analyze
@@ -835,6 +967,7 @@ function ScanScreen({ parts, onAddHistory, reloadParts, loadError }) {
         body: JSON.stringify({
           image: { media_type: mediaType, data: base64 },
           parts: partsCtx,
+          confusions,
         }),
       });
 
@@ -863,7 +996,9 @@ function ScanScreen({ parts, onAddHistory, reloadParts, loadError }) {
 
   function reset() { setImage(null); setResult(null); setError(""); }
 
-  if (result) return <ResultCard result={result} onReset={reset} />;
+  if (result) return (
+    <ResultCard result={result} parts={parts} onReset={reset} onFeedback={onFeedback} />
+  );
 
   return (
     <div style={{ padding: 16 }}>
@@ -1108,9 +1243,60 @@ function PartDetail({ part, onBack }) {
 }
 
 // ===================== RESULT CARD =====================
-function ResultCard({ result, onReset }) {
+function ResultCard({ result, parts = [], onReset, onFeedback }) {
   const { matched, part, confidence, reasoning } = result;
   const pct = Math.max(0, Math.min(100, Number(confidence) || 0));
+
+  // idle = in attesa di giudizio · wrong = sta indicando il pezzo giusto · done
+  const [phase, setPhase]   = useState("idle");
+  const [saving, setSaving] = useState(false);
+  const [fbError, setFbError] = useState("");
+  const [search, setSearch] = useState("");
+
+  const similar = findSimilarParts(parts, part, 5);
+  const sq = search.trim().toLowerCase();
+  const searchResults = sq
+    ? parts.filter(p =>
+        (p.name || "").toLowerCase().includes(sq) ||
+        (p.code || "").toLowerCase().includes(sq)
+      ).slice(0, 6)
+    : [];
+
+  async function send(isCorrect, correctPartId) {
+    setSaving(true); setFbError("");
+    try {
+      await onFeedback({
+        isCorrect,
+        predictedPartId: part?.id || null,
+        correctPartId: correctPartId || null,
+        confidence: pct,
+      });
+      setPhase("done");
+    } catch (e) {
+      console.error("feedback:", e);
+      setFbError(`Invio non riuscito: ${e.message || "riprova"}.`);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const pickStyle = {
+    width: "100%", textAlign: "left", marginBottom: 6,
+    background: T.card, border: `1px solid ${T.border}`, borderRadius: 12,
+    padding: "10px 12px", display: "flex", alignItems: "center", gap: 10,
+  };
+
+  const PickButton = ({ p }) => (
+    <button key={p.id} onClick={() => send(false, p.id)} disabled={saving} style={pickStyle}>
+      {p.imageBase64
+        ? <img src={p.imageBase64} alt="" style={{ width: 36, height: 36, borderRadius: 8, objectFit: "cover", flexShrink: 0 }} />
+        : <div style={{ width: 36, height: 36, borderRadius: 8, flexShrink: 0, background: T.bluePale, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 17 }}>🔩</div>}
+      <span style={{ flex: 1, minWidth: 0 }}>
+        <span className="wrap-anywhere" style={{ display: "block", fontFamily: "monospace", color: T.blue, fontSize: 11, fontWeight: 600 }}>{p.code}</span>
+        <span style={{ display: "block", color: T.text, fontSize: 13.5, fontWeight: 600 }}>{p.name}</span>
+      </span>
+    </button>
+  );
   return (
     <div className="fade-up" style={{ padding: 16 }}>
       <div style={{ background: T.card, borderRadius: 20, overflow: "hidden", boxShadow: T.shadowLg, border: `1px solid ${T.border}` }}>
@@ -1176,6 +1362,84 @@ function ResultCard({ result, onReset }) {
               </p>
             </div>
           )}
+          {/* ── Feedback ──────────────────────────────────────────── */}
+          <div style={{
+            background: T.bg, border: `1px solid ${T.border}`,
+            borderRadius: 14, padding: 14, marginBottom: 16
+          }}>
+            {phase === "done" ? (
+              <p style={{ color: T.success, fontSize: 14, fontWeight: 700, textAlign: "center" }}>
+                ✅ Grazie, feedback registrato
+              </p>
+            ) : phase === "idle" ? (
+              <>
+                <p style={{ color: T.text, fontSize: 14, fontWeight: 700, marginBottom: 3 }}>
+                  Il riconoscimento è corretto?
+                </p>
+                <p style={{ color: T.textLight, fontSize: 12, marginBottom: 12, lineHeight: 1.5 }}>
+                  Le risposte dei tecnici affinano le scansioni successive.
+                </p>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button onClick={() => send(true, part?.id || null)} disabled={saving}
+                    className="tap-sc" style={{
+                      flex: 1, padding: 12, borderRadius: 12, background: T.success,
+                      color: "white", fontSize: 14, fontWeight: 700,
+                      display: "flex", alignItems: "center", justifyContent: "center", gap: 6
+                    }}>
+                    {saving ? <Spinner size={15} color="white" /> : "👍"} Corretto
+                  </button>
+                  <button onClick={() => { setPhase("wrong"); setFbError(""); }} disabled={saving}
+                    style={{
+                      flex: 1, padding: 12, borderRadius: 12, background: T.card,
+                      color: T.error, fontSize: 14, fontWeight: 700,
+                      border: `1.5px solid ${T.error}55`
+                    }}>👎 Sbagliato</button>
+                </div>
+              </>
+            ) : (
+              <>
+                <p style={{ color: T.text, fontSize: 14, fontWeight: 700, marginBottom: 3 }}>
+                  Qual era il ricambio giusto?
+                </p>
+                <p style={{ color: T.textLight, fontSize: 12, marginBottom: 10, lineHeight: 1.5 }}>
+                  {similar.length > 0
+                    ? "I più simili per forma, colore e categoria:"
+                    : "Cerca il ricambio corretto nel catalogo."}
+                </p>
+
+                {similar.map(p => <PickButton key={p.id} p={p} />)}
+
+                <input
+                  value={search} onChange={e => setSearch(e.target.value)}
+                  placeholder="Cerca un altro ricambio..."
+                  style={{
+                    width: "100%", padding: "10px 12px", borderRadius: 12, marginTop: 4,
+                    marginBottom: searchResults.length ? 8 : 0,
+                    border: `1.5px solid ${T.border}`, background: T.card,
+                    fontSize: 14, color: T.text
+                  }}
+                />
+                {searchResults.map(p => <PickButton key={`s-${p.id}`} p={p} />)}
+
+                <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+                  <button onClick={() => setPhase("idle")} disabled={saving} style={{
+                    flex: 1, padding: 11, borderRadius: 12, background: T.card,
+                    color: T.textMid, fontSize: 13.5, fontWeight: 600,
+                    border: `1px solid ${T.border}`
+                  }}>← Indietro</button>
+                  <button onClick={() => send(false, null)} disabled={saving} style={{
+                    flex: 1, padding: 11, borderRadius: 12, background: T.card,
+                    color: T.textMid, fontSize: 13.5, fontWeight: 600,
+                    border: `1px solid ${T.border}`
+                  }}>Nessuno di questi</button>
+                </div>
+              </>
+            )}
+            {fbError && (
+              <p style={{ color: T.error, fontSize: 12.5, marginTop: 10, lineHeight: 1.5 }}>⚠️ {fbError}</p>
+            )}
+          </div>
+
           <button onClick={onReset} className="tap-sc" style={{
             width: "100%", padding: 15, borderRadius: 14,
             background: T.orange,
