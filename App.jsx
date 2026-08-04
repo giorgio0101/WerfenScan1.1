@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, createContext, useContext } from "react";
 import { createClient } from "@supabase/supabase-js";
 
 // ════════════════════════════════════════════════════════════
@@ -79,6 +79,255 @@ function sessionExpired(session) {
   const start = sessionStartedAt(session);
   if (!start) return false;
   return Date.now() - start > SESSION_MAX_HOURS * 3600 * 1000;
+}
+
+// ═══════════════════ LINGUE ═══════════════════
+// La preferenza vive nei metadati dell'utente Supabase: è quindi legata alla
+// persona, non al dispositivo, e lo segue su qualunque telefono. La copia in
+// localStorage serve solo a dipingere subito la schermata di login, prima che
+// la sessione sia disponibile.
+const LANGS = ["it", "en"];
+const LANG_KEY = "werfen_lang";
+const DEFAULT_LANG = "it";
+
+const STRINGS = {
+  it: {
+    "app.subtitle": "Riconoscimento ricambi — con AI",
+    "common.cancel": "Annulla",
+    "common.delete": "Elimina",
+    "common.retry": "↻ Riprova",
+    "common.back": "← Indietro",
+    "error.dbUnreachable": "Impossibile raggiungere il database. Controlla la connessione.",
+
+    "login.title": "Accedi",
+    "login.email": "Email",
+    "login.password": "Password",
+    "login.fillBoth": "Inserisci email e password",
+    "login.badCredentials": "Email o password non corretti",
+    "login.submit": "Accedi →",
+    "login.loading": "Accesso in corso...",
+    "login.note": "L'accesso resta memorizzato su questo dispositivo. Le credenziali le fornisce l'amministratore.",
+    "login.expired": "Sessione scaduta dopo {h} ore. Accedi di nuovo con le tue credenziali.",
+    "header.logout": "Esci",
+
+    "tab.scan": "Scansiona",
+    "tab.catalog": "Catalogo",
+    "tab.history": "Cronologia",
+
+    "scan.takePhoto": "Scatta o carica una foto",
+    "scan.photoHint": "Fotografa il ricambio da identificare",
+    "scan.processing": "Elaborazione foto...",
+    "scan.analyzing": "Analisi AI in corso...",
+    "scan.comparing": "Confronto con il database ricambi",
+    "scan.howToTitle": "Come usare WERFEN SCAN",
+    "scan.howToBody": "Fotografa un ricambio o componente. L'AI lo confronta con il database e mostra codice, descrizione e compatibilità. Puoi anche cercare manualmente nella scheda Catalogo.",
+    "scan.remove": "✕ Rimuovi",
+    "scan.identify": "Identifica ricambio",
+    "scan.partsCount": "{n} ricambi nel database",
+    "scan.ready": "Pronto per la scansione",
+    "scan.dbEmpty": "Il database è vuoto. Chiedi all'amministratore di caricare i ricambi.",
+    "scan.imgError": "Impossibile caricare l'immagine. Riprova.",
+    "scan.sessionExpired": "Sessione scaduta. Esegui di nuovo il login.",
+    "scan.failed": "Analisi fallita: {msg}",
+    "scan.checkConnection": "controlla la connessione.",
+
+    "result.identified": "✅ Ricambio identificato",
+    "result.noMatch": "❌ Nessuna corrispondenza",
+    "result.confidence": "Confidenza AI: {n}%",
+    "result.compat": "Compatibilità",
+    "result.noMatchBody": "L'AI non ha trovato corrispondenze. Prova a cercare manualmente nel Catalogo o contatta l'amministratore.",
+    "result.aiAnalysis": "💡 Analisi AI: ",
+    "result.newScan": "📷 Nuova scansione",
+
+    "fb.question": "Il riconoscimento è corretto?",
+    "fb.hint": "Le risposte dei tecnici affinano le scansioni successive.",
+    "fb.correct": "Corretto",
+    "fb.wrong": "👎 Sbagliato",
+    "fb.thanks": "✅ Grazie, feedback registrato",
+    "fb.whichWas": "Qual era il ricambio giusto?",
+    "fb.similar": "I più simili per forma, colore e categoria:",
+    "fb.searchCatalog": "Cerca il ricambio corretto nel catalogo.",
+    "fb.searchOther": "Cerca un altro ricambio...",
+    "fb.none": "Nessuno di questi",
+    "fb.failed": "Invio non riuscito: {msg}.",
+
+    "cat.title": "Catalogo ricambi",
+    "cat.search": "Cerca per nome, codice, categoria...",
+    "cat.empty": "Database vuoto",
+    "cat.emptyHint": "Chiedi all'amministratore di caricare i ricambi",
+    "cat.noResults": "Nessun risultato per \"{q}\"",
+
+    "hist.title": "Cronologia",
+    "hist.last": "Ultimi {n} giorni",
+    "hist.range": "Dal {a} al {b}",
+    "hist.from": "Dal giorno",
+    "hist.to": "Al giorno",
+    "hist.part": "Ricambio",
+    "hist.filterPart": "Filtra per codice o nome",
+    "hist.apply": "Applica",
+    "hist.clear": "🗑️ Svuota tutta la cronologia",
+    "hist.clearing": "Eliminazione...",
+    "hist.confirmClear": "Svuotare tutta la tua cronologia delle scansioni? L'operazione è irreversibile. Riguarda solo il tuo account: le scansioni degli altri tecnici non vengono toccate.",
+    "hist.loading": "Caricamento cronologia...",
+    "hist.noResults": "Nessun risultato",
+    "hist.noneInPeriod": "Nessuna scansione nel periodo",
+    "hist.noMatchText": "Nessuna scansione corrisponde a \"{q}\"",
+    "hist.hintFilter": "Tocca 🔎 in alto per cercare in un periodo precedente",
+    "hist.hintWiden": "Prova ad allargare l'intervallo di date",
+    "hist.noMatchLabel": "Nessuna corrispondenza",
+    "hist.clearFailed": "Eliminazione non riuscita: {msg}.",
+    "hist.loadFailed": "Impossibile caricare la cronologia.",
+
+    "loading.app": "Caricamento WERFEN SCAN...",
+    "loading.parts": "Caricamento ricambi...",
+  },
+
+  en: {
+    "app.subtitle": "Spare Parts Recognition — AI Powered",
+    "common.cancel": "Cancel",
+    "common.delete": "Delete",
+    "common.retry": "↻ Retry",
+    "common.back": "← Back",
+    "error.dbUnreachable": "Could not reach the database. Check your connection.",
+
+    "login.title": "Sign in",
+    "login.email": "Email",
+    "login.password": "Password",
+    "login.fillBoth": "Enter email and password",
+    "login.badCredentials": "Incorrect email or password",
+    "login.submit": "Sign in →",
+    "login.loading": "Signing in...",
+    "login.note": "You stay signed in on this device. Credentials are provided by the administrator.",
+    "login.expired": "Session expired after {h} hours. Please sign in again with your credentials.",
+    "header.logout": "Log out",
+
+    "tab.scan": "Scan",
+    "tab.catalog": "Catalogue",
+    "tab.history": "History",
+
+    "scan.takePhoto": "Take or upload a photo",
+    "scan.photoHint": "Photograph the spare part to identify",
+    "scan.processing": "Processing photo...",
+    "scan.analyzing": "AI analysis in progress...",
+    "scan.comparing": "Comparing with the parts database",
+    "scan.howToTitle": "How to use WERFEN SCAN",
+    "scan.howToBody": "Photograph a spare part or component. The AI compares it with the database and shows the part code, description and compatibility. You can also search manually in the Catalogue tab.",
+    "scan.remove": "✕ Remove",
+    "scan.identify": "Identify part",
+    "scan.partsCount": "{n} parts in the database",
+    "scan.ready": "Ready for scanning",
+    "scan.dbEmpty": "The database is empty. Ask the administrator to add spare parts.",
+    "scan.imgError": "Could not load the image. Please try again.",
+    "scan.sessionExpired": "Session expired. Please sign in again.",
+    "scan.failed": "Analysis failed: {msg}",
+    "scan.checkConnection": "check your connection.",
+
+    "result.identified": "✅ Part identified",
+    "result.noMatch": "❌ No match found",
+    "result.confidence": "AI confidence: {n}%",
+    "result.compat": "Compatibility",
+    "result.noMatchBody": "The AI found no match. Try searching manually in the Catalogue or contact the administrator.",
+    "result.aiAnalysis": "💡 AI analysis: ",
+    "result.newScan": "📷 New scan",
+
+    "fb.question": "Is the recognition correct?",
+    "fb.hint": "Technicians' answers refine future scans.",
+    "fb.correct": "Correct",
+    "fb.wrong": "👎 Wrong",
+    "fb.thanks": "✅ Thanks, feedback recorded",
+    "fb.whichWas": "Which was the correct part?",
+    "fb.similar": "Most similar by shape, colour and category:",
+    "fb.searchCatalog": "Search the correct part in the catalogue.",
+    "fb.searchOther": "Search another part...",
+    "fb.none": "None of these",
+    "fb.failed": "Could not send: {msg}.",
+
+    "cat.title": "Parts catalogue",
+    "cat.search": "Search by name, code, category...",
+    "cat.empty": "Database is empty",
+    "cat.emptyHint": "Ask the administrator to add parts",
+    "cat.noResults": "No results for \"{q}\"",
+
+    "hist.title": "History",
+    "hist.last": "Last {n} days",
+    "hist.range": "From {a} to {b}",
+    "hist.from": "From",
+    "hist.to": "To",
+    "hist.part": "Part",
+    "hist.filterPart": "Filter by code or name",
+    "hist.apply": "Apply",
+    "hist.clear": "🗑️ Clear all history",
+    "hist.clearing": "Deleting...",
+    "hist.confirmClear": "Clear your whole scan history? This cannot be undone. It only affects your account: other technicians' scans are untouched.",
+    "hist.loading": "Loading history...",
+    "hist.noResults": "No results",
+    "hist.noneInPeriod": "No scans in this period",
+    "hist.noMatchText": "No scan matches \"{q}\"",
+    "hist.hintFilter": "Tap 🔎 above to search an earlier period",
+    "hist.hintWiden": "Try widening the date range",
+    "hist.noMatchLabel": "No match",
+    "hist.clearFailed": "Could not delete: {msg}.",
+    "hist.loadFailed": "Could not load the history.",
+
+    "loading.app": "Loading WERFEN SCAN...",
+    "loading.parts": "Loading parts...",
+  },
+};
+
+function translate(lang, key, vars) {
+  const table = STRINGS[lang] || STRINGS[DEFAULT_LANG];
+  let s = table[key] ?? STRINGS[DEFAULT_LANG][key] ?? key;
+  if (vars) {
+    for (const [k, v] of Object.entries(vars)) {
+      s = s.split(`{${k}}`).join(String(v));
+    }
+  }
+  return s;
+}
+
+function readCachedLang() {
+  try {
+    const v = localStorage.getItem(LANG_KEY);
+    if (LANGS.includes(v)) return v;
+  } catch { /* ignore */ }
+  const nav = typeof navigator !== "undefined" ? (navigator.language || "") : "";
+  return nav.toLowerCase().startsWith("en") ? "en" : DEFAULT_LANG;
+}
+
+const LangContext = createContext(null);
+function useT() {
+  return useContext(LangContext) || {
+    lang: DEFAULT_LANG,
+    t: (k, v) => translate(DEFAULT_LANG, k, v),
+    setLang: () => {},
+  };
+}
+
+// Selettore compatto IT | EN
+function LangSwitch({ light = false }) {
+  const { lang, setLang } = useT();
+  const base = {
+    padding: "5px 9px", fontSize: 12, fontWeight: 700, lineHeight: 1,
+    background: "transparent", borderRadius: 8,
+  };
+  return (
+    <div style={{
+      display: "inline-flex", gap: 2, padding: 2, borderRadius: 10,
+      background: light ? "rgba(255,255,255,0.12)" : T.bluePale,
+      border: light ? "1px solid rgba(255,255,255,0.2)" : `1px solid ${T.border}`,
+    }}>
+      {LANGS.map(code => {
+        const on = lang === code;
+        return (
+          <button key={code} onClick={() => setLang(code)} aria-pressed={on} style={{
+            ...base,
+            background: on ? (light ? "rgba(255,255,255,0.9)" : T.blue) : "transparent",
+            color: on ? (light ? T.blue : "white") : (light ? "rgba(255,255,255,0.75)" : T.textMid),
+          }}>{code.toUpperCase()}</button>
+        );
+      })}
+    </div>
+  );
 }
 
 // ===================== THEME =====================
@@ -562,6 +811,7 @@ function Tagline({ light = false, raised = false }) {
 }
 
 function ConfirmDialog({ message, onConfirm, onCancel }) {
+  const { t } = useT();
   return (
     <div style={{
       position: "fixed", inset: 0, background: "rgba(4,2,107,0.45)",
@@ -581,11 +831,11 @@ function ConfirmDialog({ message, onConfirm, onCancel }) {
             flex: 1, padding: 12, borderRadius: 12,
             background: T.bg, color: T.textMid, fontSize: 15, fontWeight: 600,
             border: `1px solid ${T.border}`
-          }}>Annulla</button>
+          }}>{t("common.cancel")}</button>
           <button onClick={onConfirm} style={{
             flex: 1, padding: 12, borderRadius: 12,
             background: T.error, color: "white", fontSize: 15, fontWeight: 700,
-          }}>Elimina</button>
+          }}>{t("common.delete")}</button>
         </div>
       </div>
     </div>
@@ -613,14 +863,15 @@ function PhotoPicker({ id, disabled, onFile, children, style }) {
 }
 
 // ===================== LOGIN SCREEN (Supabase Auth) =====================
-function LoginScreen({ notice }) {
+function LoginScreen({ expired }) {
+  const { t } = useT();
   const [email, setEmail]       = useState("");
   const [password, setPassword] = useState("");
   const [error, setError]       = useState("");
   const [loading, setLoading]   = useState(false);
 
   async function handleLogin() {
-    if (!email.trim() || !password) { setError("Inserisci email e password"); return; }
+    if (!email.trim() || !password) { setError(t("login.fillBoth")); return; }
     setLoading(true);
     setError("");
     const { error } = await supabase.auth.signInWithPassword({
@@ -630,7 +881,7 @@ function LoginScreen({ notice }) {
     if (error) {
       setError(
         error.message === "Invalid login credentials"
-          ? "Email o password non corretti"
+          ? t("login.badCredentials")
           : error.message
       );
       setLoading(false);
@@ -661,8 +912,9 @@ function LoginScreen({ notice }) {
         }}>🔧</div>
         <div style={{ color: "white", fontSize: 30, fontWeight: 800, letterSpacing: "-0.8px" }}>WERFEN SCAN</div>
         <div style={{ color: "rgba(255,255,255,0.6)", fontSize: 14, marginTop: 4, fontWeight: 500 }}>
-          Spare Parts Recognition — AI Powered
+          {t("app.subtitle")}
         </div>
+        <div style={{ marginTop: 16 }}><LangSwitch light /></div>
       </div>
 
       <div className="fade-up" style={{
@@ -673,27 +925,29 @@ function LoginScreen({ notice }) {
         position: "relative", zIndex: 1
       }}>
         <h3 style={{ color: "white", marginBottom: 18, textAlign: "center", fontSize: 18, fontWeight: 700 }}>
-          Accedi
+          {t("login.title")}
         </h3>
 
-        {notice && (
+        {expired && (
           <div style={{
             background: "rgba(232,119,34,0.18)", border: `1px solid ${T.orange}`,
             borderRadius: 12, padding: "10px 12px", marginBottom: 14
           }}>
-            <p style={{ color: "#FFD9C2", fontSize: 12.5, lineHeight: 1.5 }}>⏱️ {notice}</p>
+            <p style={{ color: "#FFD9C2", fontSize: 12.5, lineHeight: 1.5 }}>
+              ⏱️ {t("login.expired", { h: SESSION_MAX_HOURS })}
+            </p>
           </div>
         )}
 
         <input
-          type="email" placeholder="Email" autoComplete="username"
+          type="email" placeholder={t("login.email")} autoComplete="username"
           inputMode="email" autoCapitalize="none" autoCorrect="off"
           value={email}
           onChange={e => { setEmail(e.target.value); setError(""); }}
           style={inputStyle}
         />
         <input
-          type="password" placeholder="Password" autoComplete="current-password"
+          type="password" placeholder={t("login.password")} autoComplete="current-password"
           value={password}
           onChange={e => { setPassword(e.target.value); setError(""); }}
           onKeyDown={e => e.key === "Enter" && handleLogin()}
@@ -708,12 +962,11 @@ function LoginScreen({ notice }) {
           color: "white", fontSize: 16, fontWeight: 700,
           display: "flex", alignItems: "center", justifyContent: "center", gap: 8
         }}>
-          {loading ? <><Spinner size={18} color="white" /> Accesso in corso...</> : "Accedi →"}
+          {loading ? <><Spinner size={18} color="white" /> {t("login.loading")}</> : t("login.submit")}
         </button>
 
         <p style={{ color: "rgba(255,255,255,0.45)", fontSize: 11, textAlign: "center", marginTop: 14, lineHeight: 1.5 }}>
-          L'accesso resta memorizzato su questo dispositivo.<br />
-          Le credenziali le fornisce l'amministratore.
+          {t("login.note")}
         </p>
       </div>
 
@@ -723,7 +976,8 @@ function LoginScreen({ notice }) {
 }
 
 // ===================== HEADER / TABBAR =====================
-function Header({ title, subtitle, onLogout }) {
+function Header({ title, subtitle, onLogout, showLang = false }) {
+  const { t } = useT();
   return (
     <div style={{
       background: T.blue,
@@ -749,11 +1003,14 @@ function Header({ title, subtitle, onLogout }) {
           <div style={{ color: "rgba(255,255,255,0.55)", fontSize: 11, fontWeight: 500 }}>{subtitle}</div>
         </div>
       </div>
-      <button onClick={onLogout} style={{
-        background: "rgba(255,255,255,0.12)", border: "1px solid rgba(255,255,255,0.2)",
-        color: "rgba(255,255,255,0.85)", borderRadius: 10, padding: "7px 14px",
-        fontSize: 13, fontWeight: 600
-      }}>Log Out</button>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
+        {showLang && <LangSwitch light />}
+        <button onClick={onLogout} style={{
+          background: "rgba(255,255,255,0.12)", border: "1px solid rgba(255,255,255,0.2)",
+          color: "rgba(255,255,255,0.85)", borderRadius: 10, padding: "7px 12px",
+          fontSize: 13, fontWeight: 600, whiteSpace: "nowrap"
+        }}>{t("header.logout")}</button>
+      </div>
     </div>
   );
 }
@@ -798,8 +1055,9 @@ function UserApp({ parts, reloadParts, loadError, onLogout, userEmail }) {
   const [history, setHistory] = useState([]);
   const [range, setRange] = useState(defaultHistoryRange);
   const [historyLoading, setHistoryLoading] = useState(true);
-  const [historyError, setHistoryError] = useState("");
+  const [historyError, setHistoryError] = useState(false);
   const [feedbackStats, setFeedbackStats] = useState({ byPart: {}, confusions: [] });
+  const { t, lang } = useT();
 
   // I feedback aggregati di tutti i tecnici, caricati una volta e aggiornati
   // dopo ogni nuova valutazione.
@@ -821,10 +1079,10 @@ function UserApp({ parts, reloadParts, loadError, onLogout, userEmail }) {
   useEffect(() => {
     let alive = true;
     setHistoryLoading(true);
-    setHistoryError("");
+    setHistoryError(false);
     cloud.loadHistory({ from: range.from, to: range.to })
       .then(h => { if (alive) setHistory(h); })
-      .catch(() => { if (alive) setHistoryError("Impossibile caricare la cronologia."); })
+      .catch(() => { if (alive) setHistoryError(true); })
       .finally(() => { if (alive) setHistoryLoading(false); });
     return () => { alive = false; };
   }, [range.from, range.to]);
@@ -853,7 +1111,7 @@ function UserApp({ parts, reloadParts, loadError, onLogout, userEmail }) {
 
   return (
     <div className="app-shell">
-      <Header title="WERFEN SCAN" subtitle={userEmail || "Spare Parts Recognition"} onLogout={onLogout} />
+      <Header title="WERFEN SCAN" subtitle={userEmail || t("app.subtitle")} onLogout={onLogout} showLang />
       <div className="app-content">
         {tab === "scan"    && <ScanScreen parts={parts} onAddHistory={addToHistory} reloadParts={reloadParts} loadError={loadError} feedbackStats={feedbackStats} onFeedback={handleFeedback} />}
         {tab === "catalog" && <CatalogScreen parts={parts} />}
@@ -871,9 +1129,9 @@ function UserApp({ parts, reloadParts, loadError, onLogout, userEmail }) {
       </div>
       <TabBar
         tabs={[
-          { id: "scan",    label: "Scan",    icon: "📷" },
-          { id: "catalog", label: "Catalog", icon: "📚" },
-          { id: "history", label: "History", icon: "🕐" },
+          { id: "scan",    label: t("tab.scan"),    icon: "📷" },
+          { id: "catalog", label: t("tab.catalog"), icon: "📚" },
+          { id: "history", label: t("tab.history"), icon: "🕐" },
         ]}
         active={tab}
         onChange={setTab}
@@ -885,6 +1143,7 @@ function UserApp({ parts, reloadParts, loadError, onLogout, userEmail }) {
 
 // ===================== SCAN SCREEN =====================
 function ScanScreen({ parts, onAddHistory, reloadParts, loadError, feedbackStats, onFeedback }) {
+  const { t, lang } = useT();
   const [image, setImage]         = useState(null);
   const [analyzing, setAnalyzing] = useState(false);
   const [result, setResult]       = useState(null);
@@ -903,7 +1162,7 @@ function ScanScreen({ parts, onAddHistory, reloadParts, loadError, feedbackStats
       setResult(null);
     } catch (err) {
       console.error("compressImage:", err);
-      setError("Impossibile caricare l'immagine. Riprova.");
+      setError(t("scan.imgError"));
     } finally {
       // Sempre, anche dopo un errore: altrimenti riselezionare la STESSA
       // foto non farebbe più scattare onChange e l'app sembrerebbe bloccata.
@@ -915,7 +1174,7 @@ function ScanScreen({ parts, onAddHistory, reloadParts, loadError, feedbackStats
   async function analyze() {
     if (!image) return;
     if (parts.length === 0) {
-      setError("Il database è vuoto. Chiedi all'amministratore di caricare i ricambi.");
+      setError(t("scan.dbEmpty"));
       return;
     }
 
@@ -926,7 +1185,7 @@ function ScanScreen({ parts, onAddHistory, reloadParts, loadError, feedbackStats
       // La sessione Supabase autorizza la chiamata al proxy.
       const { data: { session } } = await supabase.auth.getSession();
       const token = session?.access_token;
-      if (!token) throw new Error("Sessione scaduta. Esegui di nuovo il login.");
+      if (!token) throw new Error(t("scan.sessionExpired"));
 
       const [meta, base64] = image.split(",");
       const mediaType = meta.split(";")[0].split(":")[1];
@@ -968,6 +1227,7 @@ function ScanScreen({ parts, onAddHistory, reloadParts, loadError, feedbackStats
           image: { media_type: mediaType, data: base64 },
           parts: partsCtx,
           confusions,
+          lang,     // il server chiede all'AI di rispondere in questa lingua
         }),
       });
 
@@ -988,7 +1248,7 @@ function ScanScreen({ parts, onAddHistory, reloadParts, loadError, feedbackStats
       onAddHistory(finalResult);
     } catch (e) {
       console.error("AI error:", e);
-      setError(`Analisi fallita: ${e.message || "controlla la connessione."}`);
+      setError(t("scan.failed", { msg: e.message || t("scan.checkConnection") }));
     } finally {
       setAnalyzing(false);
     }
@@ -1007,12 +1267,12 @@ function ScanScreen({ parts, onAddHistory, reloadParts, loadError, feedbackStats
           background: "#FEF2F2", border: "1px solid #FECACA", borderRadius: 14,
           padding: "12px 14px", marginBottom: 12, color: T.error, fontSize: 13, lineHeight: 1.5
         }}>
-          ⚠️ {loadError}
+          ⚠️ {t("error.dbUnreachable")}
           <button onClick={reloadParts} style={{
             marginTop: 8, width: "100%", padding: 9, borderRadius: 10,
             background: T.card, color: T.error, fontSize: 13, fontWeight: 700,
             border: "1px solid #FECACA"
-          }}>↻ Riprova</button>
+          }}>{t("common.retry")}</button>
         </div>
       )}
 
@@ -1032,7 +1292,7 @@ function ScanScreen({ parts, onAddHistory, reloadParts, loadError, feedbackStats
         {imgLoading ? (
           <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 12, minHeight: 240 }}>
             <Spinner size={36} />
-            <p style={{ color: T.textMid, fontWeight: 600, fontSize: 14 }}>Elaborazione foto...</p>
+            <p style={{ color: T.textMid, fontWeight: 600, fontSize: 14 }}>{t("scan.processing")}</p>
           </div>
         ) : image ? (
           <>
@@ -1044,8 +1304,8 @@ function ScanScreen({ parts, onAddHistory, reloadParts, loadError, feedbackStats
                 alignItems: "center", justifyContent: "center", gap: 12
               }}>
                 <Spinner size={40} color="white" />
-                <p style={{ color: "white", fontWeight: 600, fontSize: 15 }}>Analisi AI in corso...</p>
-                <p style={{ color: "rgba(255,255,255,0.7)", fontSize: 12 }}>Confronto con il database ricambi</p>
+                <p style={{ color: "white", fontWeight: 600, fontSize: 15 }}>{t("scan.analyzing")}</p>
+                <p style={{ color: "rgba(255,255,255,0.7)", fontSize: 12 }}>{t("scan.comparing")}</p>
               </div>
             )}
           </>
@@ -1055,9 +1315,9 @@ function ScanScreen({ parts, onAddHistory, reloadParts, loadError, feedbackStats
               width: 80, height: 80, borderRadius: 20, margin: "0 auto 16px",
               background: T.bluePale, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 36
             }}>📷</div>
-            <p style={{ color: T.blue, fontWeight: 700, fontSize: 17 }}>Scatta o carica una foto</p>
+            <p style={{ color: T.blue, fontWeight: 700, fontSize: 17 }}>{t("scan.takePhoto")}</p>
             <p style={{ color: T.textLight, fontSize: 13, marginTop: 6, lineHeight: 1.5 }}>
-              Fotografa il ricambio<br />da identificare
+              {t("scan.photoHint")}
             </p>
           </div>
         )}
@@ -1070,9 +1330,9 @@ function ScanScreen({ parts, onAddHistory, reloadParts, loadError, feedbackStats
         }}>
           <span style={{ fontSize: 20 }}>💡</span>
           <div>
-            <p style={{ color: T.orange, fontSize: 13, fontWeight: 700 }}>Come usare WERFEN SCAN</p>
+            <p style={{ color: T.orange, fontSize: 13, fontWeight: 700 }}>{t("scan.howToTitle")}</p>
             <p style={{ color: T.textMid, fontSize: 12, marginTop: 3, lineHeight: 1.5 }}>
-              Fotografa un ricambio o componente. L'AI lo confronta con il database e mostra codice, descrizione e compatibilità. Puoi anche cercare manualmente nella scheda Catalog.
+              {t("scan.howToBody")}
             </p>
           </div>
         </div>
@@ -1091,14 +1351,14 @@ function ScanScreen({ parts, onAddHistory, reloadParts, loadError, feedbackStats
             flex: 1, padding: 14, borderRadius: 14,
             background: T.card, color: T.textMid, fontSize: 15, fontWeight: 600,
             border: `1.5px solid ${T.border}`
-          }}>✕ Rimuovi</button>
+          }}>{t("scan.remove")}</button>
           <button onClick={analyze} className="tap-sc" style={{
             flex: 2, padding: 14, borderRadius: 14,
             background: T.blue,
             color: "white", fontSize: 15, fontWeight: 700,
             display: "flex", alignItems: "center", justifyContent: "center", gap: 8
           }}>
-            <span>🔍</span> Identifica ricambio
+            <span>🔍</span> {t("scan.identify")}
           </button>
         </div>
       )}
@@ -1115,8 +1375,8 @@ function ScanScreen({ parts, onAddHistory, reloadParts, loadError, feedbackStats
             display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18
           }}>📦</div>
           <div>
-            <p style={{ color: T.text, fontWeight: 700, fontSize: 15 }}>{parts.length} ricambi nel database</p>
-            <p style={{ color: T.textLight, fontSize: 12 }}>Pronto per la scansione</p>
+            <p style={{ color: T.text, fontWeight: 700, fontSize: 15 }}>{t("scan.partsCount", { n: parts.length })}</p>
+            <p style={{ color: T.textLight, fontSize: 12 }}>{t("scan.ready")}</p>
           </div>
         </div>
       )}
@@ -1126,6 +1386,7 @@ function ScanScreen({ parts, onAddHistory, reloadParts, loadError, feedbackStats
 
 // ===================== CATALOG =====================
 function CatalogScreen({ parts }) {
+  const { t } = useT();
   const [search, setSearch] = useState("");
   const [selected, setSelected] = useState(null);
 
@@ -1142,13 +1403,13 @@ function CatalogScreen({ parts }) {
   return (
     <div style={{ padding: 16 }}>
       <h2 style={{ fontSize: 22, fontWeight: 800, color: T.text, marginBottom: 16, letterSpacing: "-0.4px" }}>
-        Catalogo ricambi
+        {t("cat.title")}
       </h2>
       <div style={{ position: "relative", marginBottom: 16 }}>
         <span style={{ position: "absolute", left: 14, top: "50%", transform: "translateY(-50%)", fontSize: 16, color: T.textLight }}>🔍</span>
         <input
           value={search} onChange={e => setSearch(e.target.value)}
-          placeholder="Cerca per nome, codice, categoria..."
+          placeholder={t("cat.search")}
           style={{
             width: "100%", padding: "13px 16px 13px 42px", borderRadius: 14,
             border: `1.5px solid ${T.border}`, background: T.card, fontSize: 15, color: T.text
@@ -1158,13 +1419,13 @@ function CatalogScreen({ parts }) {
       {parts.length === 0 ? (
         <div style={{ textAlign: "center", padding: "60px 24px" }}>
           <div style={{ fontSize: 48, marginBottom: 12 }}>📦</div>
-          <p style={{ color: T.text, fontWeight: 700, fontSize: 16 }}>Database vuoto</p>
-          <p style={{ color: T.textLight, fontSize: 14, marginTop: 6 }}>Chiedi all'amministratore di caricare i ricambi</p>
+          <p style={{ color: T.text, fontWeight: 700, fontSize: 16 }}>{t("cat.empty")}</p>
+          <p style={{ color: T.textLight, fontSize: 14, marginTop: 6 }}>{t("cat.emptyHint")}</p>
         </div>
       ) : filtered.length === 0 ? (
         <div style={{ textAlign: "center", padding: "40px 0" }}>
           <div style={{ fontSize: 40, marginBottom: 10 }}>🔍</div>
-          <p style={{ color: T.text, fontWeight: 700 }}>Nessun risultato per "{search}"</p>
+          <p style={{ color: T.text, fontWeight: 700 }}>{t("cat.noResults", { q: search })}</p>
         </div>
       ) : (
         filtered.map((part, i) => (
@@ -1199,13 +1460,14 @@ function CatalogScreen({ parts }) {
 }
 
 function PartDetail({ part, onBack }) {
+  const { t } = useT();
   return (
     <div className="fade-up" style={{ padding: 16 }}>
       <button onClick={onBack} className="tap-sc" style={{
         background: T.card, border: `1px solid ${T.border}`,
         color: T.blue, borderRadius: 12, padding: "8px 14px",
         fontSize: 14, fontWeight: 600, marginBottom: 14
-      }}>← Indietro</button>
+      }}>{t("common.back")}</button>
       <div style={{ background: T.card, borderRadius: 20, overflow: "hidden", boxShadow: T.shadowLg, border: `1px solid ${T.border}` }}>
         {part.imageBase64 ? (
           <img src={part.imageBase64} alt="" style={{ width: "100%", height: 220, objectFit: "cover", display: "block" }} />
@@ -1228,7 +1490,7 @@ function PartDetail({ part, onBack }) {
           {part.description && <p style={{ fontSize: 15, color: T.textMid, lineHeight: 1.6, marginBottom: 18 }}>{part.description}</p>}
           {part.compatibility?.length > 0 && (
             <div>
-              <p style={{ fontSize: 11, color: T.textLight, fontWeight: 700, marginBottom: 8, textTransform: "uppercase", letterSpacing: 1 }}>Compatibilità</p>
+              <p style={{ fontSize: 11, color: T.textLight, fontWeight: 700, marginBottom: 8, textTransform: "uppercase", letterSpacing: 1 }}>{t("result.compat")}</p>
               <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
                 {part.compatibility.map((c, i) => (
                   <span key={i} style={{ background: T.bluePale, color: T.blue, borderRadius: 8, padding: "6px 12px", fontSize: 13, fontWeight: 600 }}>⚙️ {c}</span>
@@ -1244,6 +1506,7 @@ function PartDetail({ part, onBack }) {
 
 // ===================== RESULT CARD =====================
 function ResultCard({ result, parts = [], onReset, onFeedback }) {
+  const { t } = useT();
   const { matched, part, confidence, reasoning } = result;
   const pct = Math.max(0, Math.min(100, Number(confidence) || 0));
 
@@ -1274,7 +1537,7 @@ function ResultCard({ result, parts = [], onReset, onFeedback }) {
       setPhase("done");
     } catch (e) {
       console.error("feedback:", e);
-      setFbError(`Invio non riuscito: ${e.message || "riprova"}.`);
+      setFbError(t("fb.failed", { msg: e.message || "" }));
     } finally {
       setSaving(false);
     }
@@ -1306,10 +1569,10 @@ function ResultCard({ result, parts = [], onReset, onFeedback }) {
         }}>
           <div>
             <div style={{ color: "white", fontWeight: 700, fontSize: 17 }}>
-              {matched ? "✅ Ricambio identificato" : "❌ Nessuna corrispondenza"}
+              {matched ? t("result.identified") : t("result.noMatch")}
             </div>
             <div style={{ color: "rgba(255,255,255,0.7)", fontSize: 13, marginTop: 3 }}>
-              Confidenza AI: {pct}%
+              {t("result.confidence", { n: pct })}
             </div>
           </div>
           <div style={{
@@ -1339,7 +1602,7 @@ function ResultCard({ result, parts = [], onReset, onFeedback }) {
               {part.description && <p style={{ fontSize: 14, color: T.textMid, lineHeight: 1.6, marginBottom: 16 }}>{part.description}</p>}
               {part.compatibility?.length > 0 && (
                 <div style={{ marginBottom: 16 }}>
-                  <p style={{ fontSize: 11, color: T.textLight, fontWeight: 700, marginBottom: 8, textTransform: "uppercase", letterSpacing: 1 }}>Compatibilità</p>
+                  <p style={{ fontSize: 11, color: T.textLight, fontWeight: 700, marginBottom: 8, textTransform: "uppercase", letterSpacing: 1 }}>{t("result.compat")}</p>
                   <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
                     {part.compatibility.map((c, i) => (
                       <span key={i} style={{ background: T.bluePale, color: T.blue, borderRadius: 8, padding: "5px 12px", fontSize: 13, fontWeight: 600 }}>⚙️ {c}</span>
@@ -1351,14 +1614,14 @@ function ResultCard({ result, parts = [], onReset, onFeedback }) {
           ) : (
             <div style={{ background: "#F8FAFC", borderRadius: 14, padding: 16, marginBottom: 16 }}>
               <p style={{ color: T.textMid, fontSize: 14, lineHeight: 1.6 }}>
-                L'AI non ha trovato corrispondenze. Prova a cercare manualmente nel Catalogo o contatta l'amministratore.
+                {t("result.noMatchBody")}
               </p>
             </div>
           )}
           {reasoning && (
             <div style={{ background: T.orangePale, border: `1px solid ${T.orange}33`, borderRadius: 12, padding: "12px 14px", marginBottom: 20 }}>
               <p style={{ color: "#92400E", fontSize: 13, lineHeight: 1.5 }}>
-                <strong>💡 Analisi AI: </strong>{reasoning}
+                <strong>{t("result.aiAnalysis")}</strong>{reasoning}
               </p>
             </div>
           )}
@@ -1369,15 +1632,15 @@ function ResultCard({ result, parts = [], onReset, onFeedback }) {
           }}>
             {phase === "done" ? (
               <p style={{ color: T.success, fontSize: 14, fontWeight: 700, textAlign: "center" }}>
-                ✅ Grazie, feedback registrato
+                {t("fb.thanks")}
               </p>
             ) : phase === "idle" ? (
               <>
                 <p style={{ color: T.text, fontSize: 14, fontWeight: 700, marginBottom: 3 }}>
-                  Il riconoscimento è corretto?
+                  {t("fb.question")}
                 </p>
                 <p style={{ color: T.textLight, fontSize: 12, marginBottom: 12, lineHeight: 1.5 }}>
-                  Le risposte dei tecnici affinano le scansioni successive.
+                  {t("fb.hint")}
                 </p>
                 <div style={{ display: "flex", gap: 8 }}>
                   <button onClick={() => send(true, part?.id || null)} disabled={saving}
@@ -1386,32 +1649,30 @@ function ResultCard({ result, parts = [], onReset, onFeedback }) {
                       color: "white", fontSize: 14, fontWeight: 700,
                       display: "flex", alignItems: "center", justifyContent: "center", gap: 6
                     }}>
-                    {saving ? <Spinner size={15} color="white" /> : "👍"} Corretto
+                    {saving ? <Spinner size={15} color="white" /> : "👍"} {t("fb.correct")}
                   </button>
                   <button onClick={() => { setPhase("wrong"); setFbError(""); }} disabled={saving}
                     style={{
                       flex: 1, padding: 12, borderRadius: 12, background: T.card,
                       color: T.error, fontSize: 14, fontWeight: 700,
                       border: `1.5px solid ${T.error}55`
-                    }}>👎 Sbagliato</button>
+                    }}>{t("fb.wrong")}</button>
                 </div>
               </>
             ) : (
               <>
                 <p style={{ color: T.text, fontSize: 14, fontWeight: 700, marginBottom: 3 }}>
-                  Qual era il ricambio giusto?
+                  {t("fb.whichWas")}
                 </p>
                 <p style={{ color: T.textLight, fontSize: 12, marginBottom: 10, lineHeight: 1.5 }}>
-                  {similar.length > 0
-                    ? "I più simili per forma, colore e categoria:"
-                    : "Cerca il ricambio corretto nel catalogo."}
+                  {similar.length > 0 ? t("fb.similar") : t("fb.searchCatalog")}
                 </p>
 
                 {similar.map(p => <PickButton key={p.id} p={p} />)}
 
                 <input
                   value={search} onChange={e => setSearch(e.target.value)}
-                  placeholder="Cerca un altro ricambio..."
+                  placeholder={t("fb.searchOther")}
                   style={{
                     width: "100%", padding: "10px 12px", borderRadius: 12, marginTop: 4,
                     marginBottom: searchResults.length ? 8 : 0,
@@ -1426,12 +1687,12 @@ function ResultCard({ result, parts = [], onReset, onFeedback }) {
                     flex: 1, padding: 11, borderRadius: 12, background: T.card,
                     color: T.textMid, fontSize: 13.5, fontWeight: 600,
                     border: `1px solid ${T.border}`
-                  }}>← Indietro</button>
+                  }}>{t("common.back")}</button>
                   <button onClick={() => send(false, null)} disabled={saving} style={{
                     flex: 1, padding: 11, borderRadius: 12, background: T.card,
                     color: T.textMid, fontSize: 13.5, fontWeight: 600,
                     border: `1px solid ${T.border}`
-                  }}>Nessuno di questi</button>
+                  }}>{t("fb.none")}</button>
                 </div>
               </>
             )}
@@ -1444,7 +1705,7 @@ function ResultCard({ result, parts = [], onReset, onFeedback }) {
             width: "100%", padding: 15, borderRadius: 14,
             background: T.orange,
             color: "white", fontSize: 16, fontWeight: 700
-          }}>📷 Nuova scansione</button>
+          }}>{t("result.newScan")}</button>
         </div>
       </div>
     </div>
@@ -1453,6 +1714,7 @@ function ResultCard({ result, parts = [], onReset, onFeedback }) {
 
 // ===================== HISTORY =====================
 function HistoryScreen({ history, range, loading, error, onApply, onReset, onClear }) {
+  const { t, lang } = useT();
   const [open, setOpen]                 = useState(false);
   const [fromInput, setFromInput]       = useState(range.fromInput);
   const [toInput, setToInput]           = useState(range.toInput);
@@ -1477,8 +1739,8 @@ function HistoryScreen({ history, range, loading, error, onApply, onReset, onCle
     : history;
 
   const periodLabel = range.preset === "7d"
-    ? `Ultimi ${HISTORY_DEFAULT_DAYS} giorni`
-    : `Dal ${fmtDay(range.fromInput)} al ${fmtDay(range.toInput)}`;
+    ? t("hist.last", { n: HISTORY_DEFAULT_DAYS })
+    : t("hist.range", { a: fmtDay(range.fromInput), b: fmtDay(range.toInput) });
 
   const dateStyle = {
     width: "100%", padding: "11px 12px", borderRadius: 12,
@@ -1494,7 +1756,7 @@ function HistoryScreen({ history, range, loading, error, onApply, onReset, onCle
       setOpen(false);
     } catch (e) {
       console.error("clearHistory:", e);
-      setClearError(`Eliminazione non riuscita: ${e.message || "riprova"}.`);
+      setClearError(t("hist.clearFailed", { msg: e.message || "" }));
       setConfirmClear(false);
     } finally {
       setClearing(false);
@@ -1505,7 +1767,7 @@ function HistoryScreen({ history, range, loading, error, onApply, onReset, onCle
     <div style={{ padding: 16 }}>
       {confirmClear && (
         <ConfirmDialog
-          message="Svuotare tutta la tua cronologia delle scansioni? L'operazione è irreversibile. Riguarda solo il tuo account: le scansioni degli altri tecnici non vengono toccate."
+          message={t("hist.confirmClear")}
           onConfirm={doClear}
           onCancel={() => setConfirmClear(false)}
         />
@@ -1514,7 +1776,7 @@ function HistoryScreen({ history, range, loading, error, onApply, onReset, onCle
       <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 12, marginBottom: 14 }}>
         <div style={{ minWidth: 0 }}>
           <h2 style={{ fontSize: 22, fontWeight: 800, color: T.text, letterSpacing: "-0.4px" }}>
-            Cronologia
+            {t("hist.title")}
             <span style={{ marginLeft: 8, background: T.bluePale, color: T.blue, fontSize: 13, borderRadius: 8, padding: "2px 8px", fontWeight: 700, verticalAlign: "middle" }}>{shown.length}</span>
           </h2>
           <p style={{ color: T.textLight, fontSize: 12, marginTop: 3 }}>{periodLabel}</p>
@@ -1535,20 +1797,20 @@ function HistoryScreen({ history, range, loading, error, onApply, onReset, onCle
         }}>
           <div style={{ display: "flex", gap: 10, marginBottom: 12 }}>
             <div style={{ flex: 1, minWidth: 0 }}>
-              <label style={smallLabel}>Dal giorno</label>
+              <label style={smallLabel}>{t("hist.from")}</label>
               <input type="date" value={fromInput} max={toInput}
                 onChange={e => setFromInput(e.target.value)} style={dateStyle} />
             </div>
             <div style={{ flex: 1, minWidth: 0 }}>
-              <label style={smallLabel}>Al giorno</label>
+              <label style={smallLabel}>{t("hist.to")}</label>
               <input type="date" value={toInput} min={fromInput}
                 onChange={e => setToInput(e.target.value)} style={dateStyle} />
             </div>
           </div>
 
-          <label style={smallLabel}>Ricambio</label>
+          <label style={smallLabel}>{t("hist.part")}</label>
           <input value={text} onChange={e => setText(e.target.value)}
-            placeholder="Filtra per codice o nome"
+            placeholder={t("hist.filterPart")}
             style={{ ...dateStyle, marginBottom: 12 }} />
 
           <div style={{ display: "flex", gap: 8 }}>
@@ -1556,11 +1818,11 @@ function HistoryScreen({ history, range, loading, error, onApply, onReset, onCle
               flex: 1, padding: 12, borderRadius: 12,
               background: T.bg, color: T.textMid, fontSize: 14, fontWeight: 600,
               border: `1px solid ${T.border}`
-            }}>Ultimi {HISTORY_DEFAULT_DAYS} giorni</button>
+            }}>{t("hist.last", { n: HISTORY_DEFAULT_DAYS })}</button>
             <button onClick={() => onApply(fromInput, toInput)} className="tap-sc" style={{
               flex: 1, padding: 12, borderRadius: 12,
               background: T.blue, color: "white", fontSize: 14, fontWeight: 700
-            }}>Applica</button>
+            }}>{t("hist.apply")}</button>
           </div>
 
           <button onClick={() => setConfirmClear(true)} disabled={clearing} style={{
@@ -1569,7 +1831,7 @@ function HistoryScreen({ history, range, loading, error, onApply, onReset, onCle
             border: "1px solid #FECACA",
             display: "flex", alignItems: "center", justifyContent: "center", gap: 8
           }}>
-            {clearing ? <><Spinner size={15} color={T.error} /> Eliminazione...</> : "🗑️ Svuota tutta la cronologia"}
+            {clearing ? <><Spinner size={15} color={T.error} /> {t("hist.clearing")}</> : t("hist.clear")}
           </button>
         </div>
       )}
@@ -1578,26 +1840,26 @@ function HistoryScreen({ history, range, loading, error, onApply, onReset, onCle
         <div style={{
           background: "#FEF2F2", border: "1px solid #FECACA", borderRadius: 14,
           padding: "12px 14px", marginBottom: 12, color: T.error, fontSize: 13, lineHeight: 1.5
-        }}>⚠️ {error || clearError}</div>
+        }}>⚠️ {clearError || t("hist.loadFailed")}</div>
       )}
 
       {loading ? (
         <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 12, padding: "48px 0" }}>
           <Spinner size={30} />
-          <p style={{ color: T.textMid, fontSize: 14, fontWeight: 600 }}>Caricamento cronologia...</p>
+          <p style={{ color: T.textMid, fontSize: 14, fontWeight: 600 }}>{t("hist.loading")}</p>
         </div>
       ) : shown.length === 0 ? (
         <div style={{ textAlign: "center", padding: "56px 24px" }}>
           <div style={{ fontSize: 52, marginBottom: 14 }}>🕐</div>
           <p style={{ color: T.text, fontWeight: 700, fontSize: 17 }}>
-            {q ? "Nessun risultato" : "Nessuna scansione nel periodo"}
+            {q ? t("hist.noResults") : t("hist.noneInPeriod")}
           </p>
           <p style={{ color: T.textLight, fontSize: 14, marginTop: 6, lineHeight: 1.5 }}>
             {q
-              ? `Nessuna scansione corrisponde a "${text}"`
+              ? t("hist.noMatchText", { q: text })
               : range.preset === "7d"
-                ? "Tocca 🔎 in alto per cercare in un periodo precedente"
-                : "Prova ad allargare l'intervallo di date"}
+                ? t("hist.hintFilter")
+                : t("hist.hintWiden")}
           </p>
         </div>
       ) : (
@@ -1620,10 +1882,10 @@ function HistoryScreen({ history, range, loading, error, onApply, onReset, onCle
                 <div className="wrap-anywhere" style={{ fontFamily: "monospace", color: T.blue, fontSize: 12, marginTop: 2 }}>{item.part.code}</div>
               </>
             ) : (
-              <div style={{ fontWeight: 600, color: T.textMid, fontSize: 14 }}>Nessuna corrispondenza</div>
+              <div style={{ fontWeight: 600, color: T.textMid, fontSize: 14 }}>{t("hist.noMatchLabel")}</div>
             )}
             <div style={{ color: T.textLight, fontSize: 11, marginTop: 4 }}>
-              {new Date(item.timestamp).toLocaleString("it-IT")}
+              {new Date(item.timestamp).toLocaleString(lang === "en" ? "en-GB" : "it-IT")}
             </div>
           </div>
           <div style={{
@@ -2199,7 +2461,8 @@ function SetupScreen() {
   );
 }
 
-function LoadingScreen({ label = "Caricamento WERFEN SCAN..." }) {
+function LoadingScreen({ labelKey = "loading.app" }) {
+  const { t } = useT();
   return (
     <div className="screen-full" style={{
       background: T.blue,
@@ -2213,7 +2476,7 @@ function LoadingScreen({ label = "Caricamento WERFEN SCAN..." }) {
         fontSize: 34,
         animation: "pulse 1.2s ease infinite"
       }}>🔧</div>
-      <p style={{ color: "rgba(255,255,255,0.7)", fontSize: 16, fontWeight: 600 }}>{label}</p>
+      <p style={{ color: "rgba(255,255,255,0.7)", fontSize: 16, fontWeight: 600 }}>{t(labelKey)}</p>
       <Tagline light />
     </div>
   );
@@ -2226,7 +2489,36 @@ export default function App() {
   const [parts, setParts]             = useState([]);
   const [partsLoading, setPartsLoading] = useState(false);
   const [loadError, setLoadError]     = useState("");
-  const [expiredNotice, setExpiredNotice] = useState("");
+  const [expiredNotice, setExpiredNotice] = useState(false);
+  const [lang, setLangState] = useState(readCachedLang);
+
+  // Appena la sessione è nota, adotta la lingua salvata sull'account:
+  // la preferenza segue la persona, non il dispositivo.
+  useEffect(() => {
+    if (!session) return;
+    const saved = session.user?.user_metadata?.language;
+    if (saved && LANGS.includes(saved)) {
+      // L'account ha già una preferenza: comanda quella.
+      setLangState(saved);
+      try { localStorage.setItem(LANG_KEY, saved); } catch { /* ignore */ }
+    } else {
+      // Primo accesso: adotta la lingua scelta sulla schermata di login,
+      // così non cambia sotto gli occhi dell'utente subito dopo l'accesso.
+      supabase.auth.updateUser({ data: { language: lang } })
+        .catch(e => console.error("setLang:", e?.message));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session?.user?.id]);
+
+  async function setLang(next) {
+    if (!LANGS.includes(next)) return;
+    setLangState(next);
+    try { localStorage.setItem(LANG_KEY, next); } catch { /* ignore */ }
+    if (session) {
+      const { error } = await supabase.auth.updateUser({ data: { language: next } });
+      if (error) console.error("setLang:", error.message);
+    }
+  }
 
   // Sessione Supabase: persiste in localStorage, quindi il login
   // resta valido tra le aperture dell'app sullo stesso dispositivo.
@@ -2239,7 +2531,7 @@ export default function App() {
       setAuthChecked(true);
     });
     const { data: sub } = supabase.auth.onAuthStateChange((event, s) => {
-      if (event === "SIGNED_IN")  { rememberLoginTime(); setExpiredNotice(""); }
+      if (event === "SIGNED_IN")  { rememberLoginTime(); setExpiredNotice(false); }
       if (event === "SIGNED_OUT") { forgetLoginTime(); }
       setSession(s ?? null);
     });
@@ -2257,7 +2549,7 @@ export default function App() {
     const check = async () => {
       if (done || !sessionExpired(session)) return;
       done = true;
-      setExpiredNotice(`Sessione scaduta dopo ${SESSION_MAX_HOURS} ore. Accedi di nuovo con le tue credenziali.`);
+      setExpiredNotice(true);
       forgetLoginTime();
       await supabase.auth.signOut();
     };
@@ -2317,8 +2609,8 @@ export default function App() {
   let screen;
   if (!cloudReady)        screen = <SetupScreen />;
   else if (!authChecked)  screen = <LoadingScreen />;
-  else if (!session)      screen = <LoginScreen notice={expiredNotice} />;
-  else if (partsLoading)  screen = <LoadingScreen label="Caricamento ricambi..." />;
+  else if (!session)      screen = <LoginScreen expired={expiredNotice} />;
+  else if (partsLoading)  screen = <LoadingScreen labelKey="loading.parts" />;
   else if (isAdminEmail(email)) screen = (
     <AdminApp
       parts={parts}
@@ -2342,9 +2634,9 @@ export default function App() {
   );
 
   return (
-    <>
+    <LangContext.Provider value={{ lang, setLang, t: (k, v) => translate(lang, k, v) }}>
       <GlobalStyles />
       {screen}
-    </>
+    </LangContext.Provider>
   );
 }
