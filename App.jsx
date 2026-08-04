@@ -461,6 +461,10 @@ const GLOBAL_STYLES = `
   table { width: 100%; border-collapse: collapse; }
   .wrap-anywhere { overflow-wrap: anywhere; word-break: break-word; }
 
+  .thumbs { -webkit-overflow-scrolling: touch; scrollbar-width: thin; }
+  .thumbs::-webkit-scrollbar { height: 4px; }
+  .thumbs::-webkit-scrollbar-thumb { background: ${T.border}; border-radius: 4px; }
+
   @keyframes spin    { to { transform: rotate(360deg); } }
   @keyframes fadeUp  { from { opacity:0; transform:translateY(20px); } to { opacity:1; transform:translateY(0); } }
   @keyframes fadeIn  { from { opacity:0; } to { opacity:1; } }
@@ -477,9 +481,14 @@ function GlobalStyles() {
 
 // ===================== CLOUD DATA LAYER =====================
 const cloud = {
+  // Le liste NON scaricano la galleria: solo la copertina, che è una
+  // miniatura. Con più foto per ricambio, un select("*") su cento pezzi
+  // significherebbe decine di megabyte a ogni avvio.
   async loadParts() {
     const { data, error } = await supabase
-      .from("parts").select("*").order("created_at", { ascending: false });
+      .from("parts")
+      .select("id,code,name,description,category,compatibility,image_base64,created_at")
+      .order("created_at", { ascending: false });
     if (error) { console.error("loadParts:", error.message, error.code); throw error; }
     return (data || []).map(p => ({
       id: p.id,
@@ -491,7 +500,20 @@ const cloud = {
       imageBase64: p.image_base64 || "",
     }));
   },
+  // Galleria di un singolo ricambio, caricata su richiesta.
+  // Se il ricambio è precedente alla galleria, ricade sulla vecchia
+  // immagine singola: nessun record resta senza foto.
+  async loadPartImages(id) {
+    const { data, error } = await supabase
+      .from("parts").select("images,image_base64").eq("id", id).single();
+    if (error) { console.error("loadPartImages:", error.message, error.code); throw error; }
+    const arr = Array.isArray(data?.images) ? data.images.filter(Boolean) : [];
+    if (arr.length) return arr;
+    return data?.image_base64 ? [data.image_base64] : [];
+  },
+
   async addPart(part) {
+    const images = (part.images || []).filter(Boolean);
     const { data, error } = await supabase.from("parts").insert([{
       id: `p_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
       code: part.code.trim(),
@@ -499,20 +521,23 @@ const cloud = {
       description: part.description || "",
       category: part.category || "",
       compatibility: part.compatibility || [],
-      image_base64: part.imageBase64 || "",
-    }]).select().single();
+      images,
+      image_base64: part.coverBase64 || "",   // miniatura di copertina
+    }]).select("id,code,name,description,category,compatibility,image_base64,created_at").single();
     if (error) throw error;
     return { ...data, imageBase64: data.image_base64 || "", compatibility: data.compatibility || [] };
   },
   async updatePart(id, part) {
+    const images = (part.images || []).filter(Boolean);
     const { data, error } = await supabase.from("parts").update({
       code: part.code.trim(),
       name: part.name.trim(),
       description: part.description || "",
       category: part.category || "",
       compatibility: part.compatibility || [],
-      image_base64: part.imageBase64 || "",
-    }).eq("id", id).select().single();
+      images,
+      image_base64: part.coverBase64 || "",
+    }).eq("id", id).select("id,code,name,description,category,compatibility,image_base64,created_at").single();
     if (error) throw error;
     return { ...data, imageBase64: data.image_base64 || "", compatibility: data.compatibility || [] };
   },
@@ -859,6 +884,52 @@ function PhotoPicker({ id, disabled, onFile, children, style }) {
         style={{ display: "none" }}
       />
     </>
+  );
+}
+
+// ===================== GALLERIA =====================
+// Immagine grande più striscia di miniature. Le foto da angolazioni diverse
+// servono al tecnico per confrontare i dettagli che una sola inquadratura
+// non mostra: filettature, marcature, profilo laterale.
+const MAX_PART_IMAGES = 6;
+
+function Gallery({ images, height = 200 }) {
+  const [idx, setIdx] = useState(0);
+  useEffect(() => { setIdx(0); }, [images]);
+  if (!images?.length) return null;
+  const i = Math.min(idx, images.length - 1);
+
+  return (
+    <div style={{ marginBottom: 16 }}>
+      <div style={{ position: "relative" }}>
+        <img src={images[i]} alt="" style={{
+          width: "100%", height, objectFit: "cover",
+          borderRadius: 14, display: "block", background: T.bluePale
+        }} />
+        {images.length > 1 && (
+          <div style={{
+            position: "absolute", right: 10, bottom: 10,
+            background: "rgba(0,0,0,0.55)", color: "white",
+            fontSize: 12, fontWeight: 700, borderRadius: 8, padding: "3px 8px"
+          }}>{i + 1} / {images.length}</div>
+        )}
+      </div>
+
+      {images.length > 1 && (
+        <div className="thumbs" style={{ display: "flex", gap: 6, marginTop: 8, overflowX: "auto", paddingBottom: 2 }}>
+          {images.map((src, n) => (
+            <button key={n} onClick={() => setIdx(n)} aria-label={`Foto ${n + 1}`} style={{
+              flexShrink: 0, width: 54, height: 54, borderRadius: 10,
+              overflow: "hidden", padding: 0, background: T.card,
+              border: n === i ? `2.5px solid ${T.blue}` : `1px solid ${T.border}`,
+              opacity: n === i ? 1 : 0.7,
+            }}>
+              <img src={src} alt="" style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} />
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -1461,6 +1532,17 @@ function CatalogScreen({ parts }) {
 
 function PartDetail({ part, onBack }) {
   const { t } = useT();
+  const [images, setImages] = useState(part.imageBase64 ? [part.imageBase64] : []);
+
+  // La galleria si scarica solo qui, non nella lista del catalogo
+  useEffect(() => {
+    let alive = true;
+    cloud.loadPartImages(part.id)
+      .then(imgs => { if (alive && imgs.length) setImages(imgs); })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, [part.id]);
+
   return (
     <div className="fade-up" style={{ padding: 16 }}>
       <button onClick={onBack} className="tap-sc" style={{
@@ -1469,12 +1551,12 @@ function PartDetail({ part, onBack }) {
         fontSize: 14, fontWeight: 600, marginBottom: 14
       }}>{t("common.back")}</button>
       <div style={{ background: T.card, borderRadius: 20, overflow: "hidden", boxShadow: T.shadowLg, border: `1px solid ${T.border}` }}>
-        {part.imageBase64 ? (
-          <img src={part.imageBase64} alt="" style={{ width: "100%", height: 220, objectFit: "cover", display: "block" }} />
-        ) : (
-          <div style={{ height: 160, background: T.bluePale, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 60 }}>🔩</div>
-        )}
         <div style={{ padding: 20 }}>
+          {images.length > 0 ? (
+            <Gallery images={images} height={220} />
+          ) : (
+            <div style={{ height: 160, marginBottom: 16, borderRadius: 14, background: T.bluePale, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 60 }}>🔩</div>
+          )}
           <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 12 }}>
             <div style={{ display: "inline-flex", alignItems: "center", gap: 8, background: T.bluePale, borderRadius: 12, padding: "8px 14px" }}>
               <span>🏷️</span>
@@ -1509,6 +1591,18 @@ function ResultCard({ result, parts = [], onReset, onFeedback }) {
   const { t } = useT();
   const { matched, part, confidence, reasoning } = result;
   const pct = Math.max(0, Math.min(100, Number(confidence) || 0));
+
+  // Galleria del pezzo riconosciuto: è qui che serve di più, perché il
+  // tecnico confronta la foto appena scattata con le angolazioni di riferimento.
+  const [gallery, setGallery] = useState(part?.imageBase64 ? [part.imageBase64] : []);
+  useEffect(() => {
+    if (!part?.id) return;
+    let alive = true;
+    cloud.loadPartImages(part.id)
+      .then(imgs => { if (alive && imgs.length) setGallery(imgs); })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, [part?.id]);
 
   // idle = in attesa di giudizio · wrong = sta indicando il pezzo giusto · done
   const [phase, setPhase]   = useState("idle");
@@ -1586,7 +1680,7 @@ function ResultCard({ result, parts = [], onReset, onFeedback }) {
         <div style={{ padding: 20 }}>
           {matched && part ? (
             <>
-              {part.imageBase64 && <img src={part.imageBase64} alt="" style={{ width: "100%", height: 160, objectFit: "cover", borderRadius: 14, marginBottom: 16 }} />}
+              <Gallery images={gallery} height={190} />
               <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 12 }}>
                 <div style={{ display: "inline-flex", alignItems: "center", gap: 8, background: T.bluePale, borderRadius: 12, padding: "8px 14px" }}>
                   <span>🏷️</span>
@@ -2081,9 +2175,22 @@ function PartsListScreen({ parts, onEdit, onAdd, onDeletePart, reloadParts, load
 function AddEditPartScreen({ parts, editingPart, onAddPart, onUpdatePart, onDone }) {
   const isEdit = !!editingPart;
   const [form, setForm] = useState(editingPart
-    ? { ...editingPart }
-    : { code: "", name: "", description: "", category: "", compatibility: [], imageBase64: "" }
+    ? { ...editingPart, images: [] }
+    : { code: "", name: "", description: "", category: "", compatibility: [], images: [] }
   );
+  const [galleryLoading, setGalleryLoading] = useState(!!editingPart);
+
+  // In modifica la galleria non arriva con la lista: va richiesta a parte.
+  useEffect(() => {
+    if (!editingPart) return;
+    let alive = true;
+    cloud.loadPartImages(editingPart.id)
+      .then(imgs => { if (alive) setForm(f => ({ ...f, images: imgs })); })
+      .catch(() => {})
+      .finally(() => { if (alive) setGalleryLoading(false); });
+    return () => { alive = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const [compatInput, setCompatInput] = useState("");
   const [saving, setSaving] = useState(false);
   const [errors, setErrors] = useState({});
@@ -2095,11 +2202,16 @@ function AddEditPartScreen({ parts, editingPart, onAddPart, onUpdatePart, onDone
     const input = e.target;
     const file = input.files?.[0];
     if (!file) return;
+    if ((form.images || []).length >= MAX_PART_IMAGES) {
+      setErrors(prev => ({ ...prev, image: `Massimo ${MAX_PART_IMAGES} foto per ricambio.` }));
+      try { input.value = ""; } catch { /* ignore */ }
+      return;
+    }
     setImgLoading(true);
     setErrors(prev => ({ ...prev, image: "" }));
     try {
       const compressed = await compressImage(file, 800, 0.78);
-      field("imageBase64", compressed);
+      setForm(f => ({ ...f, images: [...(f.images || []), compressed] }));
     } catch (err) {
       console.error("compressImage:", err);
       setErrors(prev => ({ ...prev, image: "Impossibile caricare l'immagine. Riprova." }));
@@ -2107,6 +2219,19 @@ function AddEditPartScreen({ parts, editingPart, onAddPart, onUpdatePart, onDone
       try { input.value = ""; } catch { /* ignore */ }
       setImgLoading(false);
     }
+  }
+
+  function removeImage(i) {
+    setForm(f => ({ ...f, images: (f.images || []).filter((_, n) => n !== i) }));
+  }
+
+  // Promuove una foto a copertina spostandola in testa all'array
+  function makeCover(i) {
+    setForm(f => {
+      const imgs = [...(f.images || [])];
+      const [pick] = imgs.splice(i, 1);
+      return { ...f, images: [pick, ...imgs] };
+    });
   }
 
   function addCompat() {
@@ -2132,6 +2257,11 @@ function AddEditPartScreen({ parts, editingPart, onAddPart, onUpdatePart, onDone
     if (Object.keys(errs).length) { setErrors(errs); return; }
     setSaving(true);
     const cleaned = { ...form, code: form.code.trim(), name: form.name.trim() };
+    // La copertina è una miniatura della prima foto: è l'unica immagine che
+    // viaggia con la lista dei ricambi, quindi va tenuta leggera.
+    cleaned.coverBase64 = form.images?.[0]
+      ? await makeThumb(form.images[0], 400, 0.75)
+      : "";
     try {
       if (isEdit) await onUpdatePart(editingPart.id, cleaned);
       else        await onAddPart(cleaned);
@@ -2156,43 +2286,72 @@ function AddEditPartScreen({ parts, editingPart, onAddPart, onUpdatePart, onDone
         {isEdit ? "✏️ Modifica ricambio" : "➕ Nuovo ricambio"}
       </h2>
 
-      <PhotoPicker
-        id="admin-photo-input"
-        disabled={imgLoading}
-        onFile={handleImage}
-        style={{
-          display: "block", borderRadius: 18, overflow: "hidden", marginBottom: 12,
-          border: `2px dashed ${form.imageBase64 ? T.blue : T.border}`,
-          minHeight: 150,
-          background: form.imageBase64 ? "black" : T.card,
-          cursor: imgLoading ? "default" : "pointer", position: "relative"
-        }}
-      >
-        {imgLoading ? (
-          <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 10, padding: 24, minHeight: 150 }}>
-            <Spinner size={32} />
-            <p style={{ color: T.textMid, fontSize: 13 }}>Elaborazione immagine...</p>
-          </div>
-        ) : form.imageBase64 ? (
-          <img src={form.imageBase64} alt="" style={{ width: "100%", maxHeight: 220, objectFit: "cover", display: "block" }} />
-        ) : (
-          <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", minHeight: 150, padding: 24 }}>
-            <div style={{ fontSize: 36, marginBottom: 8 }}>📷</div>
-            <p style={{ color: T.blue, fontWeight: 700 }}>Aggiungi foto del ricambio</p>
-            <p style={{ color: T.textLight, fontSize: 12, marginTop: 4 }}>Tocca per scattare o scegliere dalla galleria</p>
-          </div>
-        )}
-      </PhotoPicker>
+      <label style={{ display: "block", fontSize: 13, fontWeight: 600, color: T.textMid, marginBottom: 4 }}>
+        Foto del ricambio ({(form.images || []).length}/{MAX_PART_IMAGES})
+      </label>
+      <p style={{ color: T.textLight, fontSize: 11, marginBottom: 10, lineHeight: 1.5 }}>
+        Più angolazioni aiutano il tecnico a confrontare i dettagli. La prima foto è la
+        copertina: è quella che compare nelle liste e nei risultati.
+      </p>
+
+      {galleryLoading ? (
+        <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "18px 0", marginBottom: 10 }}>
+          <Spinner size={22} />
+          <span style={{ color: T.textMid, fontSize: 13 }}>Caricamento foto...</span>
+        </div>
+      ) : (
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 8, marginBottom: 10 }}>
+          {(form.images || []).map((src, i) => (
+            <div key={i} style={{
+              position: "relative", borderRadius: 12, overflow: "hidden",
+              border: `1.5px solid ${i === 0 ? T.blue : T.border}`,
+              aspectRatio: "1 / 1", background: T.bg
+            }}>
+              <img src={src} alt="" style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} />
+              {i === 0 && (
+                <span style={{
+                  position: "absolute", left: 4, top: 4, background: T.blue, color: "white",
+                  fontSize: 9, fontWeight: 700, borderRadius: 5, padding: "2px 5px", letterSpacing: 0.3
+                }}>COPERTINA</span>
+              )}
+              <button onClick={() => removeImage(i)} aria-label="Rimuovi foto" style={{
+                position: "absolute", right: 4, top: 4, width: 22, height: 22, borderRadius: 11,
+                background: "rgba(0,0,0,0.6)", color: "white", fontSize: 14, fontWeight: 700,
+                lineHeight: 1, padding: 0
+              }}>×</button>
+              {i !== 0 && (
+                <button onClick={() => makeCover(i)} style={{
+                  position: "absolute", left: 0, right: 0, bottom: 0, padding: "4px 0",
+                  background: "rgba(0,0,0,0.55)", color: "white", fontSize: 10, fontWeight: 700
+                }}>★ Copertina</button>
+              )}
+            </div>
+          ))}
+
+          {(form.images || []).length < MAX_PART_IMAGES && (
+            <PhotoPicker
+              id="admin-photo-input"
+              disabled={imgLoading}
+              onFile={handleImage}
+              style={{
+                display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
+                gap: 4, aspectRatio: "1 / 1", borderRadius: 12,
+                border: `2px dashed ${T.border}`, background: T.card,
+                cursor: imgLoading ? "default" : "pointer"
+              }}
+            >
+              {imgLoading ? <Spinner size={22} /> : (
+                <>
+                  <span style={{ fontSize: 22 }}>📷</span>
+                  <span style={{ color: T.blue, fontSize: 11, fontWeight: 700 }}>Aggiungi</span>
+                </>
+              )}
+            </PhotoPicker>
+          )}
+        </div>
+      )}
 
       {errors.image && <p style={{ color: T.error, fontSize: 12, marginBottom: 10 }}>⚠️ {errors.image}</p>}
-
-      {form.imageBase64 && (
-        <button onClick={() => field("imageBase64", "")} style={{
-          width: "100%", padding: 9, borderRadius: 10, marginBottom: 14,
-          background: "#FEF2F2", color: T.error, fontSize: 13, fontWeight: 600,
-          border: "1px solid #FECACA"
-        }}>🗑️ Rimuovi foto</button>
-      )}
 
       <div style={{ marginBottom: 14 }}>
         <label style={{ display: "block", fontSize: 13, fontWeight: 600, color: T.textMid, marginBottom: 6 }}>Codice ricambio *</label>
