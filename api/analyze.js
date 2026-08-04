@@ -17,6 +17,7 @@ const ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
 const MODEL         = process.env.AI_MODEL || "claude-opus-5";
 
 const MAX_PARTS       = 500;       // tetto anti-abuso sul contesto
+const MAX_CONFUSIONS  = 30;        // coppie di confusione passate nel prompt
 const MAX_IMAGE_CHARS = 8_000_000; // ~6 MB di base64
 
 // Estrae il primo oggetto JSON bilanciato, anche se il modello
@@ -47,13 +48,34 @@ function extractJson(raw) {
   throw new Error("JSON malformato nella risposta AI");
 }
 
-function buildPrompt(parts) {
+function buildPrompt(parts, confusions) {
+  // I feedback dei tecnici entrano nel contesto della richiesta. Non
+  // riaddestrano il modello — lo informano: contano quante volte un ricambio
+  // è stato confermato e quali coppie vengono storicamente scambiate.
+  const feedbackSection = confusions.length
+    ? `
+TECHNICIAN FEEDBACK — RECURRING CONFUSIONS:
+${JSON.stringify(confusions, null, 2)}
+
+Each entry means: technicians reported that a part identified as "wrongly_identified_as"
+turned out to be "actually_was", that many times. When the image could plausibly match
+either side of such a pair, weigh the evidence more carefully and prefer the part whose
+specific visual details actually appear in the photo. Do not blindly flip to the other
+part — use these only as a warning that the two are easily mistaken.
+`
+    : "";
+
   return `You are a specialist technician for industrial spare part visual recognition.
 Carefully analyze this image and compare it with the database below.
 
 PARTS DATABASE:
 ${JSON.stringify(parts, null, 2)}
 
+Some entries carry "confirmed_by_technicians" and "reported_wrong" counters, collected
+from technicians reviewing past scans. A high confirmed count means the description is
+reliable; a high reported_wrong count means that entry has been proposed incorrectly
+before — treat it with more scrutiny and require clearer visual evidence before choosing it.
+${feedbackSection}
 Identify the matching part by analyzing: shape, color, size, component type, visible markings, physical characteristics.
 
 Reply ONLY with valid JSON (no extra text, no markdown, no backticks). Keep "reasoning" under 40 words:
@@ -124,16 +146,32 @@ export default async function handler(req, res) {
 
   // Non ci fidiamo del client: teniamo solo i campi testuali che servono,
   // e tagliamo eventuali payload gonfiati ad arte.
-  const safeParts = parts.slice(0, MAX_PARTS).map((p) => ({
-    id: String(p?.id ?? "").slice(0, 100),
-    code: String(p?.code ?? "").slice(0, 100),
-    name: String(p?.name ?? "").slice(0, 200),
-    description: String(p?.description ?? "").slice(0, 1500),
-    category: String(p?.category ?? "").slice(0, 100),
-    compatibility: Array.isArray(p?.compatibility)
-      ? p.compatibility.slice(0, 30).map((c) => String(c).slice(0, 120))
-      : [],
-  }));
+  const clampCount = (v) =>
+    Number.isFinite(Number(v)) ? Math.max(0, Math.min(99999, Math.round(Number(v)))) : 0;
+
+  const safeParts = parts.slice(0, MAX_PARTS).map((p) => {
+    const base = {
+      id: String(p?.id ?? "").slice(0, 100),
+      code: String(p?.code ?? "").slice(0, 100),
+      name: String(p?.name ?? "").slice(0, 200),
+      description: String(p?.description ?? "").slice(0, 1500),
+      category: String(p?.category ?? "").slice(0, 100),
+      compatibility: Array.isArray(p?.compatibility)
+        ? p.compatibility.slice(0, 30).map((c) => String(c).slice(0, 120))
+        : [],
+    };
+    if (p?.confirmed_by_technicians != null) base.confirmed_by_technicians = clampCount(p.confirmed_by_technicians);
+    if (p?.reported_wrong != null)           base.reported_wrong = clampCount(p.reported_wrong);
+    return base;
+  });
+
+  const safeConfusions = Array.isArray(body?.confusions)
+    ? body.confusions.slice(0, MAX_CONFUSIONS).map((c) => ({
+        wrongly_identified_as: String(c?.wrongly_identified_as ?? "").slice(0, 200),
+        actually_was: String(c?.actually_was ?? "").slice(0, 200),
+        times: clampCount(c?.times),
+      })).filter((c) => c.wrongly_identified_as && c.actually_was)
+    : [];
 
   // ── 3. Chiamata ad Anthropic con la chiave server-side ─────────────
   try {
@@ -155,7 +193,7 @@ export default async function handler(req, res) {
               type: "image",
               source: { type: "base64", media_type: image.media_type, data: image.data },
             },
-            { type: "text", text: buildPrompt(safeParts) },
+            { type: "text", text: buildPrompt(safeParts, safeConfusions) },
           ],
         }],
       }),
