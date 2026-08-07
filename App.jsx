@@ -40,19 +40,50 @@ const supabase = cloudReady ? createClient(SUPABASE_URL_CLEAN, SUPABASE_KEY_CLEA
 const isAdminEmail = (email) =>
   !!email && email.trim().toLowerCase() === ADMIN_EMAIL.trim().toLowerCase();
 
-// ── Durata massima della sessione ────────────────────────────
-// Dopo SESSION_MAX_HOURS dal login l'utente viene disconnesso e deve
-// riautenticarsi. Si applica ai tecnici; l'admin ne è escluso.
-// Per applicarlo anche all'admin: togli la riga isAdminEmail() in
-// sessionExpired(). Per cambiare la durata: modifica il numero qui sotto.
+// ── Scadenza della sessione ──────────────────────────────────
+// Due limiti indipendenti: chiude la sessione il primo che scatta.
+//   • SESSION_MAX_HOURS — tempo massimo dal login, anche usando l'app
+//   • IDLE_MAX_HOURS    — nessuna interazione per N ore
+// Per cambiare le durate basta il numero. EXPIRE_ADMIN_TOO estende le
+// regole anche all'amministratore: oggi è escluso per non ritrovarsi
+// buttato fuori mentre lavora al catalogo.
+//
+// ⚠️ Questi tre valori sono replicati nelle funzioni SQL session_state()
+//    e nella sezione 4b di SETUP.md. Se cambi qui, cambia anche là:
+//    il database applica le SUE regole, non queste.
 const SESSION_MAX_HOURS = 24;
-const LOGIN_AT_KEY = "werfen_login_at";
+const IDLE_MAX_HOURS    = 12;
+const EXPIRE_ADMIN_TOO  = false;
+
+const LOGIN_AT_KEY  = "werfen_login_at";
+const LAST_SEEN_KEY = "werfen_last_seen";
+
+// Ogni quanto, al massimo, l'attività viene riscritta su localStorage:
+// senza freno un semplice scroll scriverebbe centinaia di volte al minuto.
+const TOUCH_THROTTLE_MS = 60_000;
+
+const HOUR_MS = 3600 * 1000;
+
+function readStamp(key) {
+  try {
+    const n = Number(localStorage.getItem(key));
+    return n > 0 ? n : null;
+  } catch { return null; }
+}
+function writeStamp(key, ts) {
+  try { localStorage.setItem(key, String(ts)); } catch { /* ignore */ }
+}
 
 function rememberLoginTime() {
-  try { localStorage.setItem(LOGIN_AT_KEY, String(Date.now())); } catch { /* ignore */ }
+  const now = Date.now();
+  writeStamp(LOGIN_AT_KEY, now);
+  writeStamp(LAST_SEEN_KEY, now);
 }
 function forgetLoginTime() {
-  try { localStorage.removeItem(LOGIN_AT_KEY); } catch { /* ignore */ }
+  try {
+    localStorage.removeItem(LOGIN_AT_KEY);
+    localStorage.removeItem(LAST_SEEN_KEY);
+  } catch { /* ignore */ }
 }
 
 // Momento di inizio sessione. Incrocia due fonti e tiene la più vecchia,
@@ -73,12 +104,39 @@ function sessionStartedAt(session) {
   return stamps.length ? Math.min(...stamps) : null;
 }
 
-function sessionExpired(session) {
-  if (!session) return false;
-  if (isAdminEmail(session.user?.email)) return false;   // l'admin non scade
+const expiryExempt = (session) =>
+  !EXPIRE_ADMIN_TOO && isAdminEmail(session?.user?.email);
+
+// Motivo della scadenza — "age" | "idle" | null — così la schermata di
+// login può spiegare *perché* la sessione è stata chiusa.
+function expiryReason(session) {
+  if (!session || expiryExempt(session)) return null;
+  const now = Date.now();
+
   const start = sessionStartedAt(session);
-  if (!start) return false;
-  return Date.now() - start > SESSION_MAX_HOURS * 3600 * 1000;
+  if (start && now - start > SESSION_MAX_HOURS * HOUR_MS) return "age";
+
+  const seen = readStamp(LAST_SEEN_KEY);
+  // Nessun timestamp di attività: sessione aperta prima di questo
+  // aggiornamento, o localStorage ripulito. Si riparte da adesso — non si
+  // butta fuori nessuno per un dato che non è mai stato scritto.
+  if (!seen) { writeStamp(LAST_SEEN_KEY, now); return null; }
+  if (now - seen > IDLE_MAX_HOURS * HOUR_MS) return "idle";
+
+  return null;
+}
+
+// Segna un'interazione dell'utente. Verifica da sé anche l'inattività: se
+// il tempo era già scaduto NON aggiorna il timestamp, altrimenti il primo
+// tocco al risveglio cancellerebbe la prova dell'inattività prima che il
+// controllo periodico se ne accorga. true = la sessione va chiusa.
+function touchActivity(session) {
+  if (!session || expiryExempt(session)) return false;
+  const now  = Date.now();
+  const seen = readStamp(LAST_SEEN_KEY);
+  if (seen && now - seen > IDLE_MAX_HOURS * HOUR_MS) return true;
+  if (!seen || now - seen > TOUCH_THROTTLE_MS) writeStamp(LAST_SEEN_KEY, now);
+  return false;
 }
 
 // ═══════════════════ LINGUE ═══════════════════
@@ -98,6 +156,7 @@ const STRINGS = {
     "common.retry": "↻ Riprova",
     "common.back": "← Indietro",
     "error.dbUnreachable": "Impossibile raggiungere il database. Controlla la connessione.",
+    "error.sessionUnverified": "Il catalogo risulta vuoto, ma la verifica della sessione non ha risposto: probabilmente è un problema di permessi, non un database senza ricambi. Avvisa l'amministratore.",
 
     "login.title": "Accedi",
     "login.email": "Email",
@@ -107,7 +166,23 @@ const STRINGS = {
     "login.submit": "Accedi →",
     "login.loading": "Accesso in corso...",
     "login.note": "L'accesso resta memorizzato su questo dispositivo. Le credenziali le fornisce l'amministratore.",
+    "login.forgot": "Password dimenticata?",
+    "login.forgotTitle": "Recupero password",
+    "login.forgotBody": "Inserisci la tua email: ricevi un link per impostare una nuova password. Vale 60 minuti.",
+    "login.forgotSend": "Invia il link →",
+    "login.forgotSending": "Invio in corso...",
+    "login.forgotSent": "✉️ Se quell'indirizzo è registrato, il link è partito. Controlla la posta, anche nello spam.",
+    "login.forgotBack": "← Torna all'accesso",
+    "login.newPwdTitle": "Nuova password",
+    "login.newPwdBody": "Scegli la password che userai d'ora in poi su questo e sugli altri dispositivi.",
+    "login.newPwd": "Nuova password",
+    "login.newPwdConfirm": "Ripeti la password",
+    "login.newPwdShort": "La password deve avere almeno 8 caratteri",
+    "login.newPwdMismatch": "Le due password non coincidono",
+    "login.newPwdSave": "🔐 Imposta password",
+    "login.newPwdSaving": "Salvataggio...",
     "login.expired": "Sessione scaduta dopo {h} ore. Accedi di nuovo con le tue credenziali.",
+    "login.expiredIdle": "Sessione chiusa dopo {h} ore di inattività. Accedi di nuovo con le tue credenziali.",
     "header.logout": "Esci",
 
     "tab.scan": "Scansiona",
@@ -152,6 +227,20 @@ const STRINGS = {
     "fb.failed": "Invio non riuscito: {msg}.",
 
     "cat.title": "Catalogo ricambi",
+    "cat.tooMany": "Mostrati i primi {n}. Restringi la ricerca per vedere gli altri.",
+    "cat.pickMachine": "Scegli il macchinario su cui stai lavorando. Le foto si caricano solo da qui in poi.",
+    "cat.machineParts": "{n} ricambi",
+    "cat.searchIn": "Cerca in {m}...",
+    "cat.noMachines": "Nessun macchinario",
+    "cat.noMachinesHint": "I ricambi non hanno il campo compatibilità compilato. Chiedi all'amministratore di aggiungerlo, oppure cerca direttamente per codice.",
+    "cat.emptyMachine": "Nessun ricambio per questo macchinario",
+    "scan.machine": "Macchinario",
+    "scan.machineAll": "Tutti i macchinari",
+    "scan.machineHint": "Facoltativo. Senza filtro il confronto usa tutto il catalogo; sceglierlo lo restringe a quella macchina — più preciso e molto più economico.",
+    "scan.partialTitle": "Confronto parziale",
+    "scan.partialBody": "Il catalogo è troppo grande: sono stati confrontati {n} ricambi, non tutti. Scegli il macchinario per un confronto completo.",
+    "scan.photosPartialTitle": "Controllo visivo parziale",
+    "scan.photosPartialBody": "All'AI sono arrivate {n} foto di riferimento su {tot}: sui ricambi restanti il confronto è avvenuto solo sulla descrizione scritta. Scegli il macchinario per avere anche le loro foto.",
     "cat.search": "Cerca per nome, codice, categoria...",
     "cat.empty": "Database vuoto",
     "cat.emptyHint": "Chiedi all'amministratore di caricare i ricambi",
@@ -159,21 +248,19 @@ const STRINGS = {
 
     "hist.title": "Cronologia",
     "hist.last": "Ultimi {n} giorni",
-    "hist.range": "Dal {a} al {b}",
-    "hist.from": "Dal giorno",
-    "hist.to": "Al giorno",
+    "hist.autoDelete": "Le scansioni si cancellano da sole dopo {n} giorni.",
     "hist.part": "Ricambio",
     "hist.filterPart": "Filtra per codice o nome",
-    "hist.apply": "Applica",
     "hist.clear": "🗑️ Svuota tutta la cronologia",
     "hist.clearing": "Eliminazione...",
     "hist.confirmClear": "Svuotare tutta la tua cronologia delle scansioni? L'operazione è irreversibile. Riguarda solo il tuo account: le scansioni degli altri tecnici non vengono toccate.",
+    "hist.cleared": "✅ {n} scansioni eliminate.",
+    "hist.clearedNone": "Non c'era nulla da eliminare.",
     "hist.loading": "Caricamento cronologia...",
     "hist.noResults": "Nessun risultato",
-    "hist.noneInPeriod": "Nessuna scansione nel periodo",
+    "hist.noneInPeriod": "Nessuna scansione negli ultimi {n} giorni",
     "hist.noMatchText": "Nessuna scansione corrisponde a \"{q}\"",
-    "hist.hintFilter": "Tocca 🔎 in alto per cercare in un periodo precedente",
-    "hist.hintWiden": "Prova ad allargare l'intervallo di date",
+    "hist.hintScan": "Le scansioni che farai compariranno qui",
     "hist.noMatchLabel": "Nessuna corrispondenza",
     "hist.clearFailed": "Eliminazione non riuscita: {msg}.",
     "hist.loadFailed": "Impossibile caricare la cronologia.",
@@ -189,6 +276,7 @@ const STRINGS = {
     "common.retry": "↻ Retry",
     "common.back": "← Back",
     "error.dbUnreachable": "Could not reach the database. Check your connection.",
+    "error.sessionUnverified": "The catalogue looks empty, but the session check did not respond: this is most likely a permissions problem, not a database without parts. Please tell the administrator.",
 
     "login.title": "Sign in",
     "login.email": "Email",
@@ -198,7 +286,23 @@ const STRINGS = {
     "login.submit": "Sign in →",
     "login.loading": "Signing in...",
     "login.note": "You stay signed in on this device. Credentials are provided by the administrator.",
+    "login.forgot": "Forgot your password?",
+    "login.forgotTitle": "Password recovery",
+    "login.forgotBody": "Enter your email: you'll get a link to set a new password. It's valid for 60 minutes.",
+    "login.forgotSend": "Send the link →",
+    "login.forgotSending": "Sending...",
+    "login.forgotSent": "✉️ If that address is registered, the link is on its way. Check your inbox, and your spam folder.",
+    "login.forgotBack": "← Back to sign in",
+    "login.newPwdTitle": "New password",
+    "login.newPwdBody": "Choose the password you'll use from now on, here and on your other devices.",
+    "login.newPwd": "New password",
+    "login.newPwdConfirm": "Repeat the password",
+    "login.newPwdShort": "The password must be at least 8 characters",
+    "login.newPwdMismatch": "The two passwords don't match",
+    "login.newPwdSave": "🔐 Set password",
+    "login.newPwdSaving": "Saving...",
     "login.expired": "Session expired after {h} hours. Please sign in again with your credentials.",
+    "login.expiredIdle": "Signed out after {h} hours of inactivity. Please sign in again with your credentials.",
     "header.logout": "Log out",
 
     "tab.scan": "Scan",
@@ -243,6 +347,20 @@ const STRINGS = {
     "fb.failed": "Could not send: {msg}.",
 
     "cat.title": "Parts catalogue",
+    "cat.tooMany": "Showing the first {n}. Narrow your search to see the others.",
+    "cat.pickMachine": "Pick the machine you are working on. Photos only load from here on.",
+    "cat.machineParts": "{n} parts",
+    "cat.searchIn": "Search in {m}...",
+    "cat.noMachines": "No machines",
+    "cat.noMachinesHint": "Parts have no compatibility field filled in. Ask the administrator to add it, or search by code directly.",
+    "cat.emptyMachine": "No parts for this machine",
+    "scan.machine": "Machine",
+    "scan.machineAll": "All machines",
+    "scan.machineHint": "Optional. Without a filter the comparison uses the whole catalogue; picking one narrows it to that machine — more accurate and far cheaper.",
+    "scan.partialTitle": "Partial comparison",
+    "scan.partialBody": "The catalogue is too large: {n} parts were compared, not all of them. Pick the machine for a complete comparison.",
+    "scan.photosPartialTitle": "Partial visual check",
+    "scan.photosPartialBody": "The AI received {n} reference photos out of {tot}: for the remaining parts the comparison used the written description only. Pick the machine to include their photos too.",
     "cat.search": "Search by name, code, category...",
     "cat.empty": "Database is empty",
     "cat.emptyHint": "Ask the administrator to add parts",
@@ -250,21 +368,19 @@ const STRINGS = {
 
     "hist.title": "History",
     "hist.last": "Last {n} days",
-    "hist.range": "From {a} to {b}",
-    "hist.from": "From",
-    "hist.to": "To",
+    "hist.autoDelete": "Scans are deleted automatically after {n} days.",
     "hist.part": "Part",
     "hist.filterPart": "Filter by code or name",
-    "hist.apply": "Apply",
     "hist.clear": "🗑️ Clear all history",
     "hist.clearing": "Deleting...",
     "hist.confirmClear": "Clear your whole scan history? This cannot be undone. It only affects your account: other technicians' scans are untouched.",
+    "hist.cleared": "✅ {n} scans deleted.",
+    "hist.clearedNone": "There was nothing to delete.",
     "hist.loading": "Loading history...",
     "hist.noResults": "No results",
-    "hist.noneInPeriod": "No scans in this period",
+    "hist.noneInPeriod": "No scans in the last {n} days",
     "hist.noMatchText": "No scan matches \"{q}\"",
-    "hist.hintFilter": "Tap 🔎 above to search an earlier period",
-    "hist.hintWiden": "Try widening the date range",
+    "hist.hintScan": "The scans you make will show up here",
     "hist.noMatchLabel": "No match",
     "hist.clearFailed": "Could not delete: {msg}.",
     "hist.loadFailed": "Could not load the history.",
@@ -481,54 +597,212 @@ function GlobalStyles() {
 
 // ===================== CLOUD DATA LAYER =====================
 const cloud = {
-  // Le liste NON scaricano la galleria: solo la copertina, che è una
-  // miniatura. Con più foto per ricambio, un select("*") su cento pezzi
-  // significherebbe decine di megabyte a ogni avvio.
-  async loadParts() {
-    const { data, error } = await supabase
-      .from("parts")
-      .select("id,code,name,description,category,compatibility,image_base64,created_at")
-      .order("created_at", { ascending: false });
-    if (error) { console.error("loadParts:", error.message, error.code); throw error; }
+  // Registra l'attività sul server e chiede il verdetto:
+  //   "ok" | "age" | "idle" | "unavailable"
+  // È il database a decidere — l'orologio del telefono e il localStorage sono
+  // manipolabili, le sue tabelle no.
+  //
+  // "unavailable" quando la chiamata non riesce: funzione SQL non installata,
+  // permesso mancante, rete caduta. L'app prosegue lo stesso — preferisco un
+  // tecnico che lavora a un tecnico bloccato — ma il caso NON viene più
+  // confuso con "ok".
+  //
+  // La distinzione è nata da un guasto vero: proseguire in silenzio, mentre
+  // le policy RLS negavano ogni riga, faceva apparire il catalogo vuoto senza
+  // che nulla segnalasse il perché. Fallire in modo permissivo va bene;
+  // fallire in modo invisibile no.
+  async touchSession() {
+    if (!supabase) return "ok";
+    const { data, error } = await supabase.rpc("touch_session");
+    if (error) { console.error("touchSession:", error.message, error.code); return "unavailable"; }
+    return data === "idle" || data === "age" ? data : "ok";
+  },
+  // ── Il catalogo non vive più nel client ───────────────────
+  // All'avvio si chiede soltanto QUANTI ricambi esistono: un numero, non un
+  // elenco. Tutto il resto arriva su richiesta — la ricerca, il dettaglio,
+  // i simili. Con 2000 ricambi il vecchio caricamento iniziale era ~1 MB di
+  // testo per ogni apertura dell'app, su ogni telefono.
+
+  // Righe leggere per gli elenchi: niente descrizioni, niente immagini,
+  // solo l'URL della miniatura. Con ricerca vuota restituisce i più recenti.
+  // L'elenco dei macchinari, ricavato dalle compatibilità dei ricambi. Solo
+  // testo: è la schermata che si apre per prima, e non scarica immagini.
+  async listMachines() {
+    const { data, error } = await supabase.rpc("list_machines");
+    if (error) { console.error("listMachines:", error.message, error.code); return []; }
+    return (data || []).map(m => ({ machine: m.machine, parts: m.parts }));
+  },
+
+  // Quanti ricambi vedrebbe l'AI con questo filtro: serve ad avvisare prima
+  // di scansionare, non dopo.
+  async countParts(machine) {
+    const { data, error } = await supabase.rpc("count_parts", { machine: machine || null });
+    if (error) { console.error("countParts:", error.message, error.code); throw error; }
+    return data ?? 0;
+  },
+
+  async searchParts(q, machine, limit = 50) {
+    const { data, error } = await supabase.rpc("search_parts", {
+      q: q || null, machine: machine || null, lim: limit,
+    });
+    if (error) { console.error("searchParts:", error.message, error.code); throw error; }
     return (data || []).map(p => ({
       id: p.id,
       code: p.code || "",
       name: p.name || "",
-      description: p.description || "",
       category: p.category || "",
-      compatibility: p.compatibility || [],
-      imageBase64: p.image_base64 || "",
+      thumbUrl: p.thumb_url || "",
     }));
   },
-  // Galleria di un singolo ricambio, caricata su richiesta.
-  // Se il ricambio è precedente alla galleria, ricade sulla vecchia
-  // immagine singola: nessun record resta senza foto.
+
+  // Candidati plausibili quando l'AI sbaglia e il tecnico deve correggere.
+  // La somiglianza la calcola il database per trigrammi: regge gli errori di
+  // battitura, e non richiede di avere il catalogo in memoria.
+  async similarParts(id, limit = 5) {
+    const { data, error } = await supabase.rpc("similar_parts", { part_id: id, lim: limit });
+    if (error) { console.error("similarParts:", error.message, error.code); return []; }
+    return (data || []).map(p => ({
+      id: p.id,
+      code: p.code || "",
+      name: p.name || "",
+      category: p.category || "",
+      thumbUrl: p.thumb_url || "",
+    }));
+  },
+
+  // La scheda completa: si carica aprendo un ricambio o dopo una scansione,
+  // mai per un elenco.
+  async getPart(id) {
+    const { data, error } = await supabase
+      .from("parts")
+      .select("id,code,name,description,category,compatibility,thumb_url")
+      .eq("id", id).single();
+    if (error) { console.error("getPart:", error.message, error.code); throw error; }
+    return {
+      id: data.id,
+      code: data.code || "",
+      name: data.name || "",
+      description: data.description || "",
+      category: data.category || "",
+      compatibility: data.compatibility || [],
+      thumbUrl: data.thumb_url || "",
+    };
+  },
+
+  // Controllo dei codici doppi in fase di salvataggio. Una ricerca puntuale
+  // su indice: prima scorreva l'intero catalogo tenuto nel client.
+  async partByCode(code, exceptId) {
+    let query = supabase.from("parts").select("id,code").ilike("code", (code || "").trim());
+    if (exceptId) query = query.neq("id", exceptId);
+    const { data, error } = await query.limit(1);
+    if (error) { console.error("partByCode:", error.message, error.code); return null; }
+    return data?.[0] || null;
+  },
+
+  // Galleria di un singolo ricambio, su richiesta: dopo una scansione o
+  // aprendo il dettaglio. Restituisce coppie { full, thumb }.
   async loadPartImages(id) {
     const { data, error } = await supabase
       .from("parts").select("images,image_base64").eq("id", id).single();
     if (error) { console.error("loadPartImages:", error.message, error.code); throw error; }
-    const arr = Array.isArray(data?.images) ? data.images.filter(Boolean) : [];
-    if (arr.length) return arr;
-    return data?.image_base64 ? [data.image_base64] : [];
+    const imgs = normalizeImages(data?.images);
+    if (imgs.length) return imgs;
+    // Ricambio mai risalvato: vale ancora la vecchia immagine singola.
+    return data?.image_base64 ? [{ full: data.image_base64, thumb: data.image_base64 }] : [];
+  },
+
+  // ── Foto su Storage ───────────────────────────────────────
+  // I file prendono un nome casuale, non l'indice nell'array: così spostare
+  // una foto in copertina non rinomina niente e non costringe a ricaricare.
+  async uploadPhoto(partId, dataUrl, suffix, stamp) {
+    if (!dataUrl) return "";          // versione non generata: si prosegue senza
+    const mark = stamp || Math.random().toString(36).slice(2, 10);
+    const path = `${partId}/${mark}${suffix}.${extOf(dataUrl)}`;
+    const { error } = await supabase.storage.from(PHOTO_BUCKET)
+      .upload(path, dataUrlToBlob(dataUrl), { cacheControl: "31536000", upsert: true });
+    if (error) throw error;
+    return supabase.storage.from(PHOTO_BUCKET).getPublicUrl(path).data.publicUrl;
+  },
+
+  async uploadPhotoPair(partId, image) {
+    const stamp = Math.random().toString(36).slice(2, 10);
+    return {
+      full:  await cloud.uploadPhoto(partId, image.full,  "",   stamp),
+      thumb: await cloud.uploadPhoto(partId, image.thumb, "_t", stamp),
+      ai:    await cloud.uploadPhoto(partId, image.ai,    "_a", stamp),
+    };
+  },
+
+  // Carica le foto nuove, lascia stare quelle già su Storage, e rimuove i
+  // file rimasti orfani. Senza quest'ultimo passaggio ogni modifica a un
+  // ricambio lascerebbe indietro file che nessuno cancellerà mai più.
+  async savePartPhotos(partId, images) {
+    const saved = [];
+    for (const img of images) {
+      if (!isStored(img.full)) {
+        saved.push(await cloud.uploadPhotoPair(partId, img));
+        continue;
+      }
+      // Foto già su Storage: si tiene com'è. Se le manca la versione per
+      // l'AI — perché è stata caricata prima che esistesse — si prova a
+      // generarla adesso dalla piena, così basta riaprire il ricambio e
+      // salvarlo invece di ricaricare la foto a mano.
+      //
+      // Se non riesce (foto irraggiungibile, CORS, browser vecchio) il
+      // salvataggio prosegue lo stesso: quel ricambio viaggerà verso l'AI
+      // col solo testo, come faceva prima. Non vale far fallire un
+      // salvataggio per una versione accessoria.
+      let ai = img.ai || "";
+      if (!ai) {
+        try {
+          const regenerated = await makeThumb(img.full, PHOTO_AI_PX, PHOTO_AI_Q);
+          if (regenerated) ai = await cloud.uploadPhoto(partId, regenerated, "_a");
+        } catch (e) {
+          console.error("foto per l'AI non rigenerata:", e?.message);
+        }
+      }
+      saved.push({ full: img.full, thumb: img.thumb || img.full, ai });
+    }
+    try {
+      const { data: files } = await supabase.storage.from(PHOTO_BUCKET).list(partId);
+      // ⚠️ Tutte e tre le versioni vanno in "keep". Dimenticarne una qui non
+      // dà errore: il file viene caricato e cancellato come orfano un istante
+      // dopo, e il ricambio resta con un indirizzo che non risponde più.
+      const keep = new Set(saved.flatMap(s =>
+        [s.full, s.thumb, s.ai].filter(Boolean).map(u => u.split("/").pop())));
+      const stale = (files || []).filter(f => !keep.has(f.name)).map(f => `${partId}/${f.name}`);
+      if (stale.length) await supabase.storage.from(PHOTO_BUCKET).remove(stale);
+    } catch (e) {
+      // Un orfano costa qualche KB: non vale il fallimento di un salvataggio
+      // che per il resto è andato a buon fine.
+      console.error("pulizia foto:", e?.message);
+    }
+    return saved;
   },
 
   async addPart(part) {
-    const images = (part.images || []).filter(Boolean);
+    const id = `p_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const images = await cloud.savePartPhotos(id, part.images || []);
     const { data, error } = await supabase.from("parts").insert([{
-      id: `p_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      id,
       code: part.code.trim(),
       name: part.name.trim(),
       description: part.description || "",
       category: part.category || "",
       compatibility: part.compatibility || [],
       images,
-      image_base64: part.coverBase64 || "",   // miniatura di copertina
-    }]).select("id,code,name,description,category,compatibility,image_base64,created_at").single();
+      thumb_url: images[0]?.thumb || null,
+      // La copertina in versione media: è l'unica foto che il server manda
+      // all'AI, e sta in una colonna sua perché va letta per migliaia di
+      // ricambi a ogni scansione — scavarla dal jsonb "images" costerebbe.
+      photo_url: images[0]?.ai || null,
+    }]).select("id,code,name,description,category,compatibility,thumb_url,created_at").single();
     if (error) throw error;
-    return { ...data, imageBase64: data.image_base64 || "", compatibility: data.compatibility || [] };
+    return { ...data, thumbUrl: data.thumb_url || "", compatibility: data.compatibility || [] };
   },
+
   async updatePart(id, part) {
-    const images = (part.images || []).filter(Boolean);
+    const images = await cloud.savePartPhotos(id, part.images || []);
     const { data, error } = await supabase.from("parts").update({
       code: part.code.trim(),
       name: part.name.trim(),
@@ -536,30 +810,43 @@ const cloud = {
       category: part.category || "",
       compatibility: part.compatibility || [],
       images,
-      image_base64: part.coverBase64 || "",
-    }).eq("id", id).select("id,code,name,description,category,compatibility,image_base64,created_at").single();
+      thumb_url: images[0]?.thumb || null,
+      photo_url: images[0]?.ai || null,
+      image_base64: null,      // migrato: il vecchio formato non serve più
+    }).eq("id", id).select("id,code,name,description,category,compatibility,thumb_url,created_at").single();
     if (error) throw error;
-    return { ...data, imageBase64: data.image_base64 || "", compatibility: data.compatibility || [] };
+    return { ...data, thumbUrl: data.thumb_url || "", compatibility: data.compatibility || [] };
   },
+
+  // Le foto vanno cancellate PRIMA della riga: se sparisse prima il ricambio,
+  // resterebbero file senza più nessuno che sappia a chi appartenevano.
   async deletePart(id) {
+    try {
+      const { data: files } = await supabase.storage.from(PHOTO_BUCKET).list(id);
+      if (files?.length) {
+        await supabase.storage.from(PHOTO_BUCKET).remove(files.map(f => `${id}/${f.name}`));
+      }
+    } catch (e) {
+      console.error("cancellazione foto:", e?.message);
+    }
     const { error } = await supabase.from("parts").delete().eq("id", id);
     if (error) throw error;
   },
-  // Carica la cronologia in un intervallo di date. Il filtro è applicato dal
-  // database, non dal client: così si possono cercare scansioni vecchie senza
-  // scaricare tutto lo storico.
-  async loadHistory({ from, to, limit = 300 } = {}) {
-    let query = supabase
-      .from("scan_history").select("*")
+  // Carica la finestra di conservazione. Non ci sono più intervalli scelti
+  // dall'utente: oltre HISTORY_RETENTION_DAYS non esiste nulla da cercare,
+  // perché il database ha già cancellato le righe.
+  async loadHistory({ limit = 300 } = {}) {
+    const { data, error } = await supabase
+      .from("scan_history")
+      .select("matched,confidence,image_base64,timestamp,part_name,part_code")
+      .gte("timestamp", retentionCutoffIso())
       .order("timestamp", { ascending: false }).limit(limit);
-    if (from) query = query.gte("timestamp", from);
-    if (to)   query = query.lte("timestamp", to);
-    const { data, error } = await query;
     if (error) { console.error("loadHistory:", error.message, error.code); throw error; }
+    // reasoning non viene scaricato: nessuna schermata lo mostra, e su 300
+    // righe sarebbero decine di KB di testo trasferiti per niente.
     return (data || []).map(h => ({
       matched: h.matched,
       confidence: h.confidence,
-      reasoning: h.reasoning,
       image: h.image_base64 || "",
       timestamp: h.timestamp,
       part: h.part_name ? { name: h.part_name, code: h.part_code } : null,
@@ -576,7 +863,7 @@ const cloud = {
       user_id: userId,
       matched: !!item.matched,
       confidence: item.confidence || 0,
-      reasoning: item.reasoning || "",
+      reasoning: (item.reasoning || "").slice(0, HISTORY_REASONING_MAX),
       image_base64: item.image || "",
       part_name: item.part?.name || null,
       part_code: item.part?.code || null,
@@ -602,128 +889,79 @@ const cloud = {
     if (error) throw error;
   },
 
-  // Aggrega i feedback di tutti i tecnici: conteggi per ricambio e coppie
-  // di confusione ricorrenti. Serve al prompt, non all'interfaccia.
-  async loadFeedbackStats() {
-    const { data, error } = await supabase
-      .from("scan_feedback")
-      .select("predicted_part_id, correct_part_id, is_correct")
-      .order("created_at", { ascending: false })
-      .limit(2000);
-    if (error) {
-      console.error("loadFeedbackStats:", error.message, error.code);
-      return { byPart: {}, confusions: [] };
-    }
-    const byPart = {};
-    const pairs = {};
-    for (const f of data || []) {
-      const pid = f.predicted_part_id;
-      if (pid) {
-        byPart[pid] = byPart[pid] || { ok: 0, ko: 0 };
-        if (f.is_correct) byPart[pid].ok++; else byPart[pid].ko++;
-      }
-      if (!f.is_correct && pid && f.correct_part_id && pid !== f.correct_part_id) {
-        const key = `${pid}>${f.correct_part_id}`;
-        pairs[key] = (pairs[key] || 0) + 1;
-      }
-    }
-    const confusions = Object.entries(pairs)
-      .map(([k, count]) => {
-        const [predicted, actual] = k.split(">");
-        return { predicted, actual, count };
-      })
-      .sort((a, b) => b.count - a.count)
-      .slice(0, 20);
-    return { byPart, confusions };
+  // L'aggregazione dei feedback vive ora sul server (analyze.js): girava sul
+  // telefono di ogni tecnico a ogni avvio dell'app — 2000 righe scaricate e
+  // ricontate da cento dispositivi per produrre lo stesso identico risultato,
+  // che poi veniva rispedito al server da cui erano arrivate.
+
+  // Piano B della potatura automatica: se pg_cron non è attivo sul progetto,
+  // è l'apertura dell'app a innescare la pulizia. Costa una scansione di
+  // indice che di norma non trova nulla, quindi si può chiamare a ogni avvio.
+  // Non blocca niente: un errore qui non deve impedire di lavorare.
+  async purgeOldHistory() {
+    const { error } = await supabase.rpc("purge_old_history");
+    if (error) console.error("purgeOldHistory:", error.message, error.code);
   },
 
-  // Svuota la cronologia dell'utente collegato. Non serve filtrare per utente
-  // qui: la policy RLS limita la DELETE alle sole righe di chi la esegue.
+  // È l'ambito della policy a decidere quante righe spariscono, non un
+  // parametro: un tecnico cancella le proprie, l'admin quelle di tutti.
+  // Stessa chiamata, stesso codice, nessun ruolo da passare dal client —
+  // che è anche il motivo per cui un tecnico non può fingersi admin.
   // Il filtro sul timestamp c'è sempre: PostgREST rifiuta una DELETE nuda.
-  async clearHistory({ from, to } = {}) {
-    let query = supabase.from("scan_history").delete()
-      .gte("timestamp", from || "1970-01-01T00:00:00.000Z");
-    if (to) query = query.lte("timestamp", to);
-    const { error } = await query;
+  async clearHistory() {
+    const { error, count } = await supabase.from("scan_history")
+      .delete({ count: "exact" })
+      .gte("timestamp", "1970-01-01T00:00:00.000Z");
     if (error) throw error;
+    return count ?? 0;
   },
 };
 
-// ── Ricambi simili ───────────────────────────────────────────
-// Quando l'AI sbaglia, proponiamo i candidati più plausibili invece di far
-// scorrere tutto il catalogo. La somiglianza è calcolata sulle parole in
-// comune fra descrizioni, nomi e categoria — quindi su colore, forma e
-// materiale, che è come sono scritte le descrizioni. Nessun modello dietro:
-// è un confronto testuale, deterministico e leggibile.
-const STOPWORDS = new Set([
-  "di","del","della","delle","dei","con","per","in","il","la","le","lo","gli",
-  "una","uno","che","non","più","circa","alla","allo","sul","sulla","dal",
-  "and","the","with","for","mm","cm","tipo","parte","pezzo",
-]);
+// ── Ricerca digitata ─────────────────────────────────────────
+// Ogni tasto premuto sarebbe una richiesta al database: si aspetta che il
+// dito si fermi. 250 ms è la soglia sotto cui la digitazione sembra continua
+// e sopra cui l'attesa si nota.
+//
+// Il calcolo dei ricambi simili viveva qui e contava le parole in comune fra
+// le descrizioni. Ora lo fa il database per trigrammi (similar_parts in
+// server-search.sql): regge gli errori di battitura, e soprattutto non
+// richiede di tenere l'intero catalogo nella memoria del telefono.
+const SEARCH_DEBOUNCE_MS = 250;
+const SCAN_MACHINE_KEY = "werfen_scan_machine";
 
-function tokenize(s) {
-  return String(s || "")
-    .toLowerCase()
-    .replace(/[^a-zà-ù0-9\s]/g, " ")
-    .split(/\s+/)
-    .filter(w => w.length > 2 && !STOPWORDS.has(w));
-}
-
-function partTokens(p) {
-  return new Set([...tokenize(p.name), ...tokenize(p.description), ...tokenize(p.category)]);
+function useDebounced(value, ms = SEARCH_DEBOUNCE_MS) {
+  const [settled, setSettled] = useState(value);
+  useEffect(() => {
+    const id = setTimeout(() => setSettled(value), ms);
+    return () => clearTimeout(id);
+  }, [value, ms]);
+  return settled;
 }
 
-function findSimilarParts(parts, target, limit = 5) {
-  if (!target) return parts.slice(0, limit);
-  const t = partTokens(target);
-  return parts
-    .filter(p => p.id !== target.id)
-    .map(p => {
-      let shared = 0;
-      partTokens(p).forEach(w => { if (t.has(w)) shared++; });
-      const sameCategory =
-        p.category && target.category &&
-        p.category.trim().toLowerCase() === target.category.trim().toLowerCase();
-      return { part: p, score: shared + (sameCategory ? 2 : 0) };
-    })
-    .filter(x => x.score > 0)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, limit)
-    .map(x => x.part);
-}
+// ── Conservazione della cronologia ───────────────────────────
+// Le scansioni più vecchie di HISTORY_RETENTION_DAYS vengono cancellate dal
+// database (funzione purge_old_history in history-retention.sql). Il client
+// non si fida della potatura: filtra comunque sulla stessa finestra, così un
+// cron in ritardo non fa comparire scansioni che l'utente crede sparite.
+//
+// ⚠️ Il numero è replicato in history-retention.sql. Cambiarlo qui soltanto
+//    non allunga la conservazione: il database continua a potare a 7 giorni.
+const HISTORY_RETENTION_DAYS = 7;
 
-// ── Intervalli di date per la cronologia ─────────────────────
-const HISTORY_DEFAULT_DAYS = 7;
+// Miniatura della cronologia: piccola per scelta. Con 100 tecnici che scansionano
+// ogni giorno, la differenza fra 10 KB e 3 KB per riga decide se il database sta
+// dentro il piano gratuito o no. Serve a farsi riconoscere in una lista, non a
+// esaminare il pezzo: per quello c'è la galleria del ricambio.
+const HISTORY_THUMB_PX = 160;
+const HISTORY_THUMB_Q  = 0.5;
 
-const pad2 = (n) => String(n).padStart(2, "0");
-const toDateInput = (d) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
-const fmtDay = (input) => {
-  if (!input) return "";
-  const [y, m, d] = input.split("-");
-  return `${d}/${m}/${y}`;
-};
-function startOfDayIso(input) {
-  const d = new Date(`${input}T00:00:00`);
-  return Number.isNaN(d.getTime()) ? null : d.toISOString();
-}
-function endOfDayIso(input) {
-  const d = new Date(`${input}T23:59:59.999`);
-  return Number.isNaN(d.getTime()) ? null : d.toISOString();
-}
-// Ultimi 7 giorni = oggi più i 6 precedenti, dalla mezzanotte.
-function defaultHistoryRange() {
-  const today = new Date();
-  const from = new Date();
-  from.setDate(from.getDate() - (HISTORY_DEFAULT_DAYS - 1));
-  from.setHours(0, 0, 0, 0);
-  return {
-    preset: "7d",
-    from: from.toISOString(),
-    to: null,                       // aperto fino ad adesso
-    fromInput: toDateInput(from),
-    toInput: toDateInput(today),
-  };
-}
+// Il "perché" dell'AI non viene mostrato in nessuna schermata: si conserva solo
+// come traccia per capire a posteriori un riconoscimento sbagliato. Tagliato,
+// perché il modello a volte ignora il limite di 40 parole del prompt.
+const HISTORY_REASONING_MAX = 300;
+
+const retentionCutoffIso = () =>
+  new Date(Date.now() - HISTORY_RETENTION_DAYS * 24 * HOUR_MS).toISOString();
 
 // ===================== IMAGE HELPERS =====================
 function compressImage(file, maxSize = 1000, quality = 0.8) {
@@ -749,7 +987,9 @@ function compressImage(file, maxSize = 1000, quality = 0.8) {
         ctx.fillRect(0, 0, w, h);
         ctx.drawImage(bitmapOrImg, 0, 0, w, h);
         if (bitmapOrImg.close) bitmapOrImg.close();
-        done(canvas.toDataURL("image/jpeg", quality));
+        // WebP anche qui: alleggerisce sia le foto del catalogo sia la foto
+        // spedita a /api/analyze, che parte da un telefono in officina.
+        done(encodeSmallest(canvas, quality));
       } catch (e) { fail(e); }
     }
 
@@ -773,10 +1013,92 @@ function compressImage(file, maxSize = 1000, quality = 0.8) {
   });
 }
 
+// ── Foto dei ricambi ─────────────────────────────────────────
+// Tre versioni di ogni foto, generate al caricamento. Servono a scopi
+// diversi e non vanno confuse:
+//
+//   miniatura → riconoscere un pezzo in una lista. Deve pesare niente.
+//   media     → è la copia che va all'AI insieme al catalogo. 512 pixel non
+//               è un numero a caso: sotto i 200 il modello sbaglia di più,
+//               e ogni raddoppio del lato quadruplica i token da pagare.
+//   piena     → esaminarlo: filettature, marcature, profilo laterale.
+//               È più definita del vecchio formato 800px, perché è quella
+//               che il tecnico confronta con la foto appena scattata.
+//
+// Il peso complessivo cambia poco. Cambia QUANDO si scarica: la piena solo
+// aprendo quel ricambio, la miniatura solo se compare fra i risultati di
+// una ricerca, la media mai — la scarica Anthropic, non il telefono.
+// All'avvio dell'app non si scarica nessuna delle tre.
+// Righe disegnate nel catalogo. Senza ricerca ne bastano poche: sono lì per
+// far capire che il catalogo non è vuoto, non per essere sfogliate.
+const CATALOG_PREVIEW_ROWS = 25;
+const CATALOG_MAX_ROWS     = 100;
+
+const PHOTO_BUCKET   = "part-photos";
+const PHOTO_FULL_PX  = 1400, PHOTO_FULL_Q  = 0.72;   // ~110 KB
+const PHOTO_AI_PX    = 512,  PHOTO_AI_Q    = 0.6;    // ~25 KB — 361 token per l'AI
+const PHOTO_THUMB_PX = 128,  PHOTO_THUMB_Q = 0.5;    // ~3,5 KB
+
+// Le immagini nascono come data URL (servono per l'anteprima nel form) e
+// vanno caricate come file binari: questa è la conversione fra i due mondi.
+function dataUrlToBlob(dataUrl) {
+  const [meta, b64] = String(dataUrl).split(",");
+  const mime = meta.slice(5).split(";")[0] || "image/jpeg";
+  const bin = atob(b64);
+  const arr = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+  return new Blob([arr], { type: mime });
+}
+
+const extOf = (dataUrl) => (String(dataUrl).startsWith("data:image/webp") ? "webp" : "jpg");
+const isStored = (v) => typeof v === "string" && /^https?:\/\//.test(v);
+
+// Normalizza le generazioni di dati che si sono succedute. I ricambi più
+// vecchi hanno un array di stringhe base64, poi sono arrivate le coppie di
+// URL, ora c'è anche la versione per l'AI. Tutte devono continuare a
+// funzionare finché quel ricambio non viene risalvato.
+//
+// "ai" resta vuoto sui ricambi caricati prima: quelli viaggiano verso il
+// modello col solo testo, come facevano tutti fino a ieri. Non è un guasto
+// da inseguire, è il passato che scade da solo man mano che si risalva.
+function normalizeImages(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw.filter(Boolean).map(img =>
+    typeof img === "string"
+      ? { full: img, thumb: img, ai: "" }                          // vecchio formato
+      : {
+          full:  img.full || "",
+          thumb: img.thumb || img.full || "",
+          ai:    img.ai || "",
+        }
+  ).filter(img => img.full);
+}
+
+// A parità di qualità percepita il WebP pesa circa un terzo in meno del JPEG.
+// Attenzione al tranello: i browser che non lo sanno produrre NON danno errore,
+// restituiscono un PNG — che è più pesante del JPEG di partenza. Per questo si
+// controlla il prefisso di ciò che è tornato davvero, invece di fidarsi.
+function encodeSmallest(canvas, quality) {
+  try {
+    const webp = canvas.toDataURL("image/webp", quality);
+    if (webp.startsWith("data:image/webp")) return webp;
+  } catch { /* niente WebP: si prosegue in JPEG */ }
+  return canvas.toDataURL("image/jpeg", quality);
+}
+
+// Accetta sia un data URL (il caso normale: foto appena scattata) sia un
+// indirizzo su Storage (il caso di recupero: rigenerare la versione per l'AI
+// di un ricambio caricato prima che esistesse).
+//
+// ⚠️ crossOrigin va impostato PRIMA di src, e serve solo al secondo caso:
+//    senza, il canvas viene marcato "sporco" e toDataURL lancia. Sui data URL
+//    non cambia nulla. Se il server non manda gli header CORS l'immagine non
+//    carica e si finisce in onerror — vuoto, non un errore da gestire.
 function makeThumb(dataUrl, maxSize = 200, quality = 0.65) {
   return new Promise((resolve) => {
     try {
       const img = new Image();
+      img.crossOrigin = "anonymous";
       img.onload = () => {
         let w = img.width, h = img.height;
         if (w > maxSize || h > maxSize) {
@@ -789,7 +1111,7 @@ function makeThumb(dataUrl, maxSize = 200, quality = 0.65) {
         ctx.fillStyle = "#FFFFFF";
         ctx.fillRect(0, 0, w, h);
         ctx.drawImage(img, 0, 0, w, h);
-        resolve(c.toDataURL("image/jpeg", quality));
+        resolve(encodeSmallest(c, quality));
       };
       img.onerror = () => resolve("");
       img.src = dataUrl;
@@ -902,7 +1224,9 @@ function Gallery({ images, height = 200 }) {
   return (
     <div style={{ marginBottom: 16 }}>
       <div style={{ position: "relative" }}>
-        <img src={images[i]} alt="" style={{
+        {/* Solo la foto in vista si scarica a piena definizione: aprire un
+            ricambio con 6 foto costa una foto piena, non sei. */}
+        <img src={images[i].full} alt="" loading="lazy" style={{
           width: "100%", height, objectFit: "cover",
           borderRadius: 14, display: "block", background: T.bluePale
         }} />
@@ -917,14 +1241,15 @@ function Gallery({ images, height = 200 }) {
 
       {images.length > 1 && (
         <div className="thumbs" style={{ display: "flex", gap: 6, marginTop: 8, overflowX: "auto", paddingBottom: 2 }}>
-          {images.map((src, n) => (
+          {/* La striscia usa le miniature: sei anteprime costano ~20 KB */}
+          {images.map((img, n) => (
             <button key={n} onClick={() => setIdx(n)} aria-label={`Foto ${n + 1}`} style={{
               flexShrink: 0, width: 54, height: 54, borderRadius: 10,
               overflow: "hidden", padding: 0, background: T.card,
               border: n === i ? `2.5px solid ${T.blue}` : `1px solid ${T.border}`,
               opacity: n === i ? 1 : 0.7,
             }}>
-              <img src={src} alt="" style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} />
+              <img src={img.thumb} alt="" loading="lazy" style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} />
             </button>
           ))}
         </div>
@@ -934,12 +1259,32 @@ function Gallery({ images, height = 200 }) {
 }
 
 // ===================== LOGIN SCREEN (Supabase Auth) =====================
-function LoginScreen({ expired }) {
+function LoginScreen({ expiredReason }) {
   const { t } = useT();
   const [email, setEmail]       = useState("");
   const [password, setPassword] = useState("");
   const [error, setError]       = useState("");
   const [loading, setLoading]   = useState(false);
+  const [mode, setMode]         = useState("login");   // "login" | "forgot"
+  const [sent, setSent]         = useState(false);
+
+  // Il link di recupero riapre l'app: redirectTo deve puntare alla stessa
+  // origine, altrimenti Supabase rifiuta il rimando.
+  //
+  // Nota sulla risposta: si mostra sempre lo stesso messaggio, anche quando
+  // l'email non è registrata. Dire "questo indirizzo non esiste" regalerebbe
+  // a chiunque un modo per scoprire quali email hanno un account.
+  async function sendRecovery() {
+    if (!email.trim()) { setError(t("login.fillBoth")); return; }
+    setLoading(true);
+    setError("");
+    const { error } = await supabase.auth.resetPasswordForEmail(email.trim(), {
+      redirectTo: window.location.origin,
+    });
+    if (error) console.error("resetPassword:", error.message);
+    setSent(true);
+    setLoading(false);
+  }
 
   async function handleLogin() {
     if (!email.trim() || !password) { setError(t("login.fillBoth")); return; }
@@ -996,51 +1341,182 @@ function LoginScreen({ expired }) {
         position: "relative", zIndex: 1
       }}>
         <h3 style={{ color: "white", marginBottom: 18, textAlign: "center", fontSize: 18, fontWeight: 700 }}>
-          {t("login.title")}
+          {mode === "forgot" ? t("login.forgotTitle") : t("login.title")}
         </h3>
 
-        {expired && (
+        {expiredReason && (
           <div style={{
             background: "rgba(232,119,34,0.18)", border: `1px solid ${T.orange}`,
             borderRadius: 12, padding: "10px 12px", marginBottom: 14
           }}>
             <p style={{ color: "#FFD9C2", fontSize: 12.5, lineHeight: 1.5 }}>
-              ⏱️ {t("login.expired", { h: SESSION_MAX_HOURS })}
+              ⏱️ {expiredReason === "idle"
+                    ? t("login.expiredIdle", { h: IDLE_MAX_HOURS })
+                    : t("login.expired",     { h: SESSION_MAX_HOURS })}
             </p>
           </div>
         )}
 
+        {mode === "forgot" ? (
+          <>
+            <p style={{ color: "rgba(255,255,255,0.7)", fontSize: 12.5, lineHeight: 1.55, marginBottom: 14 }}>
+              {t("login.forgotBody")}
+            </p>
+
+            {sent ? (
+              <div style={{
+                background: "rgba(255,255,255,0.12)", border: "1px solid rgba(255,255,255,0.25)",
+                borderRadius: 12, padding: "12px 14px", marginBottom: 14
+              }}>
+                <p style={{ color: "white", fontSize: 12.5, lineHeight: 1.55 }}>{t("login.forgotSent")}</p>
+              </div>
+            ) : (
+              <>
+                <input
+                  type="email" placeholder={t("login.email")} autoComplete="username"
+                  inputMode="email" autoCapitalize="none" autoCorrect="off"
+                  value={email}
+                  onChange={e => { setEmail(e.target.value); setError(""); }}
+                  onKeyDown={e => e.key === "Enter" && sendRecovery()}
+                  style={inputStyle}
+                />
+                {error && <p style={{ color: T.orangeLight, fontSize: 13, marginBottom: 10 }}>⚠️ {error}</p>}
+                <button onClick={sendRecovery} disabled={loading} className="tap-sc" style={{
+                  width: "100%", padding: 15, borderRadius: 14,
+                  background: loading ? "rgba(255,255,255,0.2)" : T.orange,
+                  color: "white", fontSize: 16, fontWeight: 700,
+                  display: "flex", alignItems: "center", justifyContent: "center", gap: 8
+                }}>
+                  {loading ? <><Spinner size={18} color="white" /> {t("login.forgotSending")}</> : t("login.forgotSend")}
+                </button>
+              </>
+            )}
+
+            <button onClick={() => { setMode("login"); setSent(false); setError(""); }} style={{
+              width: "100%", marginTop: 12, padding: 10, background: "transparent",
+              color: "rgba(255,255,255,0.75)", fontSize: 13.5, fontWeight: 600,
+            }}>{t("login.forgotBack")}</button>
+          </>
+        ) : (
+          <>
+            <input
+              type="email" placeholder={t("login.email")} autoComplete="username"
+              inputMode="email" autoCapitalize="none" autoCorrect="off"
+              value={email}
+              onChange={e => { setEmail(e.target.value); setError(""); }}
+              style={inputStyle}
+            />
+            <input
+              type="password" placeholder={t("login.password")} autoComplete="current-password"
+              value={password}
+              onChange={e => { setPassword(e.target.value); setError(""); }}
+              onKeyDown={e => e.key === "Enter" && handleLogin()}
+              style={inputStyle}
+            />
+
+            {error && <p style={{ color: T.orangeLight, fontSize: 13, marginBottom: 10 }}>⚠️ {error}</p>}
+
+            <button onClick={handleLogin} disabled={loading} className="tap-sc" style={{
+              width: "100%", padding: 15, borderRadius: 14,
+              background: loading ? "rgba(255,255,255,0.2)" : T.orange,
+              color: "white", fontSize: 16, fontWeight: 700,
+              display: "flex", alignItems: "center", justifyContent: "center", gap: 8
+            }}>
+              {loading ? <><Spinner size={18} color="white" /> {t("login.loading")}</> : t("login.submit")}
+            </button>
+
+            <button onClick={() => { setMode("forgot"); setError(""); }} style={{
+              width: "100%", marginTop: 12, padding: 10, background: "transparent",
+              color: "rgba(255,255,255,0.75)", fontSize: 13.5, fontWeight: 600,
+            }}>{t("login.forgot")}</button>
+
+            <p style={{ color: "rgba(255,255,255,0.45)", fontSize: 11, textAlign: "center", marginTop: 10, lineHeight: 1.5 }}>
+              {t("login.note")}
+            </p>
+          </>
+        )}
+      </div>
+
+      <Tagline light />
+    </div>
+  );
+}
+
+// ===================== NUOVA PASSWORD (dal link di recupero) =====================
+// Ci si arriva aprendo il link ricevuto per email: supabase-js riconosce il
+// token nell'indirizzo, apre una sessione temporanea ed emette l'evento
+// PASSWORD_RECOVERY. Fino a che la password non è stata cambiata questa
+// schermata copre l'app — altrimenti quella sessione darebbe accesso al
+// catalogo a chiunque abbia intercettato il link.
+function NewPasswordScreen({ onDone }) {
+  const { t } = useT();
+  const [pwd, setPwd]         = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [error, setError]     = useState("");
+  const [saving, setSaving]   = useState(false);
+
+  async function save() {
+    if (pwd.length < 8)   { setError(t("login.newPwdShort")); return; }
+    if (pwd !== confirm)  { setError(t("login.newPwdMismatch")); return; }
+    setSaving(true);
+    setError("");
+    const { error } = await supabase.auth.updateUser({ password: pwd });
+    if (error) { setError(error.message); setSaving(false); return; }
+    // Si esce e si rientra con la password nuova: così la sessione nasce da
+    // un accesso vero e i timer di scadenza ripartono da adesso.
+    await supabase.auth.signOut();
+    onDone();
+  }
+
+  const inputStyle = {
+    width: "100%", padding: "15px 18px", borderRadius: 14, marginBottom: 10,
+    background: "rgba(255,255,255,0.15)",
+    border: `1px solid ${error ? T.orange : "rgba(255,255,255,0.25)"}`,
+    color: "white", fontSize: 16,
+  };
+
+  return (
+    <div className="screen-full" style={{
+      background: T.blue, display: "flex", flexDirection: "column",
+      alignItems: "center", justifyContent: "center", padding: 20
+    }}>
+      <div className="fade-up" style={{
+        width: "100%", maxWidth: 360,
+        background: "rgba(255,255,255,0.10)", backdropFilter: "blur(16px)",
+        WebkitBackdropFilter: "blur(16px)",
+        border: "1px solid rgba(255,255,255,0.18)", borderRadius: 24, padding: 28,
+      }}>
+        <div style={{ fontSize: 34, textAlign: "center", marginBottom: 10 }}>🔐</div>
+        <h3 style={{ color: "white", marginBottom: 8, textAlign: "center", fontSize: 18, fontWeight: 700 }}>
+          {t("login.newPwdTitle")}
+        </h3>
+        <p style={{ color: "rgba(255,255,255,0.7)", fontSize: 12.5, lineHeight: 1.55, marginBottom: 16, textAlign: "center" }}>
+          {t("login.newPwdBody")}
+        </p>
+
         <input
-          type="email" placeholder={t("login.email")} autoComplete="username"
-          inputMode="email" autoCapitalize="none" autoCorrect="off"
-          value={email}
-          onChange={e => { setEmail(e.target.value); setError(""); }}
+          type="password" placeholder={t("login.newPwd")} autoComplete="new-password"
+          value={pwd} onChange={e => { setPwd(e.target.value); setError(""); }}
           style={inputStyle}
         />
         <input
-          type="password" placeholder={t("login.password")} autoComplete="current-password"
-          value={password}
-          onChange={e => { setPassword(e.target.value); setError(""); }}
-          onKeyDown={e => e.key === "Enter" && handleLogin()}
+          type="password" placeholder={t("login.newPwdConfirm")} autoComplete="new-password"
+          value={confirm} onChange={e => { setConfirm(e.target.value); setError(""); }}
+          onKeyDown={e => e.key === "Enter" && save()}
           style={inputStyle}
         />
 
         {error && <p style={{ color: T.orangeLight, fontSize: 13, marginBottom: 10 }}>⚠️ {error}</p>}
 
-        <button onClick={handleLogin} disabled={loading} className="tap-sc" style={{
+        <button onClick={save} disabled={saving} className="tap-sc" style={{
           width: "100%", padding: 15, borderRadius: 14,
-          background: loading ? "rgba(255,255,255,0.2)" : T.orange,
+          background: saving ? "rgba(255,255,255,0.2)" : T.orange,
           color: "white", fontSize: 16, fontWeight: 700,
           display: "flex", alignItems: "center", justifyContent: "center", gap: 8
         }}>
-          {loading ? <><Spinner size={18} color="white" /> {t("login.loading")}</> : t("login.submit")}
+          {saving ? <><Spinner size={18} color="white" /> {t("login.newPwdSaving")}</> : t("login.newPwdSave")}
         </button>
-
-        <p style={{ color: "rgba(255,255,255,0.45)", fontSize: 11, textAlign: "center", marginTop: 14, lineHeight: 1.5 }}>
-          {t("login.note")}
-        </p>
       </div>
-
       <Tagline light />
     </div>
   );
@@ -1121,79 +1597,68 @@ function TabBar({ tabs, active, onChange }) {
 }
 
 // ===================== USER APP =====================
-function UserApp({ parts, reloadParts, loadError, onLogout, userEmail }) {
+function UserApp({ partsCount, sessionUnverified, reloadParts, loadError, onLogout, userEmail }) {
   const [tab, setTab] = useState("scan");
   const [history, setHistory] = useState([]);
-  const [range, setRange] = useState(defaultHistoryRange);
   const [historyLoading, setHistoryLoading] = useState(true);
   const [historyError, setHistoryError] = useState(false);
-  const [feedbackStats, setFeedbackStats] = useState({ byPart: {}, confusions: [] });
   const { t, lang } = useT();
 
-  // I feedback aggregati di tutti i tecnici, caricati una volta e aggiornati
-  // dopo ogni nuova valutazione.
-  useEffect(() => {
-    let alive = true;
-    cloud.loadFeedbackStats()
-      .then(s => { if (alive) setFeedbackStats(s); })
-      .catch(() => {});
-    return () => { alive = false; };
-  }, []);
-
+  // La valutazione si scrive e basta. Non serve più rileggere e riaggregare
+  // tutti i feedback: a usarli è il server, alla scansione successiva.
   async function handleFeedback(payload) {
     await cloud.addFeedback(payload);
-    const fresh = await cloud.loadFeedbackStats().catch(() => null);
-    if (fresh) setFeedbackStats(fresh);
   }
 
-  // Ricarica dal database ogni volta che cambia l'intervallo selezionato.
   useEffect(() => {
     let alive = true;
     setHistoryLoading(true);
     setHistoryError(false);
-    cloud.loadHistory({ from: range.from, to: range.to })
+    // Prima si pota, poi si legge: così l'elenco non mostra per un istante
+    // scansioni che stanno per sparire.
+    cloud.purgeOldHistory()
+      .then(() => cloud.loadHistory())
       .then(h => { if (alive) setHistory(h); })
       .catch(() => { if (alive) setHistoryError(true); })
       .finally(() => { if (alive) setHistoryLoading(false); });
     return () => { alive = false; };
-  }, [range.from, range.to]);
+  }, []);
 
   async function addToHistory(item) {
     setHistory(prev => [item, ...prev]);
-    const thumb = item.image ? await makeThumb(item.image) : "";
+    const thumb = item.image
+      ? await makeThumb(item.image, HISTORY_THUMB_PX, HISTORY_THUMB_Q)
+      : "";
     await cloud.addHistory({ ...item, image: thumb });
   }
 
-  function applyRange(fromInput, toInput) {
-    setRange({
-      preset: "custom",
-      from: startOfDayIso(fromInput),
-      to: endOfDayIso(toInput),
-      fromInput,
-      toInput,
-    });
-  }
-  function resetRange() { setRange(defaultHistoryRange()); }
-
   async function clearHistory() {
-    await cloud.clearHistory();
-    setHistory([]);
+    const n = await cloud.clearHistory();
+    if (n > 0) setHistory([]);
+    return n;
   }
 
   return (
     <div className="app-shell">
       <Header title="WERFEN SCAN" subtitle={userEmail || t("app.subtitle")} onLogout={onLogout} showLang />
       <div className="app-content">
-        {tab === "scan"    && <ScanScreen parts={parts} onAddHistory={addToHistory} reloadParts={reloadParts} loadError={loadError} feedbackStats={feedbackStats} onFeedback={handleFeedback} />}
-        {tab === "catalog" && <CatalogScreen parts={parts} />}
+        {/* Il caso che ha reso difficile diagnosticare il catalogo vuoto: la
+            verifica di sessione non risponde, le policy RLS negano ogni riga,
+            e a schermo sembra semplicemente che non ci siano ricambi. */}
+        {sessionUnverified && partsCount === 0 && (
+          <div style={{
+            margin: 16, background: "#FEF2F2", border: "1px solid #FECACA",
+            borderRadius: 14, padding: "12px 14px", color: T.error,
+            fontSize: 13, lineHeight: 1.5
+          }}>⚠️ {t("error.sessionUnverified")}</div>
+        )}
+        {tab === "scan"    && <ScanScreen partsCount={partsCount} onAddHistory={addToHistory} reloadParts={reloadParts} loadError={loadError} onFeedback={handleFeedback} />}
+        {tab === "catalog" && <CatalogScreen partsCount={partsCount} />}
         {tab === "history" && (
           <HistoryScreen
             history={history}
-            range={range}
             loading={historyLoading}
             error={historyError}
-            onApply={applyRange}
-            onReset={resetRange}
             onClear={clearHistory}
           />
         )}
@@ -1213,13 +1678,33 @@ function UserApp({ parts, reloadParts, loadError, onLogout, userEmail }) {
 }
 
 // ===================== SCAN SCREEN =====================
-function ScanScreen({ parts, onAddHistory, reloadParts, loadError, feedbackStats, onFeedback }) {
+function ScanScreen({ partsCount, onAddHistory, reloadParts, loadError, onFeedback }) {
   const { t, lang } = useT();
   const [image, setImage]         = useState(null);
   const [analyzing, setAnalyzing] = useState(false);
   const [result, setResult]       = useState(null);
   const [error, setError]         = useState("");
   const [imgLoading, setImgLoading] = useState(false);
+  const [machines, setMachines]   = useState([]);
+
+  // Il macchinario scelto resta memorizzato: chi lavora tutto il giorno sulla
+  // stessa macchina lo seleziona una volta e non ci pensa più.
+  const [machine, setMachineState] = useState(() => {
+    try { return localStorage.getItem(SCAN_MACHINE_KEY) || ""; } catch { return ""; }
+  });
+  function setMachine(m) {
+    setMachineState(m);
+    try {
+      if (m) localStorage.setItem(SCAN_MACHINE_KEY, m);
+      else   localStorage.removeItem(SCAN_MACHINE_KEY);
+    } catch { /* ignore */ }
+  }
+
+  useEffect(() => {
+    let alive = true;
+    cloud.listMachines().then(m => { if (alive) setMachines(m); });
+    return () => { alive = false; };
+  }, []);
 
   async function handleFile(e) {
     const input = e.target;
@@ -1244,7 +1729,7 @@ function ScanScreen({ parts, onAddHistory, reloadParts, loadError, feedbackStats
 
   async function analyze() {
     if (!image) return;
-    if (parts.length === 0) {
+    if (partsCount === 0) {
       setError(t("scan.dbEmpty"));
       return;
     }
@@ -1261,32 +1746,10 @@ function ScanScreen({ parts, onAddHistory, reloadParts, loadError, feedbackStats
       const [meta, base64] = image.split(",");
       const mediaType = meta.split(";")[0].split(":")[1];
 
-      // Ai dati di ogni ricambio affianchiamo il bilancio dei feedback
-      // ricevuti: è così che le segnalazioni dei tecnici influenzano le
-      // scansioni successive.
-      const byPart = feedbackStats?.byPart || {};
-      const partsCtx = parts.map(p => {
-        const s = byPart[p.id];
-        return {
-          id: p.id, code: p.code, name: p.name,
-          description: p.description,
-          category: p.category || "",
-          compatibility: p.compatibility || [],
-          ...(s ? { confirmed_by_technicians: s.ok, reported_wrong: s.ko } : {}),
-        };
-      });
-
-      // Coppie di confusione ricorrenti, tradotte in codici leggibili
-      const labelOf = (id) => {
-        const p = parts.find(x => x.id === id);
-        return p ? `${p.code} (${p.name})` : id;
-      };
-      const confusions = (feedbackStats?.confusions || []).map(c => ({
-        wrongly_identified_as: labelOf(c.predicted),
-        actually_was: labelOf(c.actual),
-        times: c.count,
-      }));
-
+      // Si spedisce solo la foto. Catalogo e valutazioni dei tecnici li legge
+      // il server dal database: rispedirglieli da qui significava caricare
+      // decine di KB su rete mobile per riportargli dati che aveva già.
+      //
       // 🔑 Nessuna chiave qui: la aggiunge il server in /api/analyze
       const res = await fetch("/api/analyze", {
         method: "POST",
@@ -1296,8 +1759,7 @@ function ScanScreen({ parts, onAddHistory, reloadParts, loadError, feedbackStats
         },
         body: JSON.stringify({
           image: { media_type: mediaType, data: base64 },
-          parts: partsCtx,
-          confusions,
+          machine,  // vuoto = tutto il catalogo, entro il tetto del prompt
           lang,     // il server chiede all'AI di rispondere in questa lingua
         }),
       });
@@ -1305,13 +1767,19 @@ function ScanScreen({ parts, onAddHistory, reloadParts, loadError, feedbackStats
       const payload = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(payload.error || `HTTP ${res.status}`);
 
-      const matchedPart = payload.matched ? parts.find(p => p.id === payload.id) : null;
+      // Il server risponde con l'id del ricambio: la scheda si chiede adesso,
+      // una riga sola. Prima si cercava in un catalogo tenuto tutto in memoria.
+      const matchedPart = payload.matched && payload.id
+        ? await cloud.getPart(payload.id).catch(() => null)
+        : null;
 
       const finalResult = {
         matched: !!payload.matched && !!matchedPart,
         confidence: Number(payload.confidence) || 0,
         reasoning: payload.reasoning || "",
         part: matchedPart || null,
+        partial: payload.partial || null,   // il confronto ha coperto tutto?
+        photosPartial: payload.photosPartial || null,   // ...e con quante foto?
         timestamp: new Date().toISOString(),
         image,
       };
@@ -1328,7 +1796,7 @@ function ScanScreen({ parts, onAddHistory, reloadParts, loadError, feedbackStats
   function reset() { setImage(null); setResult(null); setError(""); }
 
   if (result) return (
-    <ResultCard result={result} parts={parts} onReset={reset} onFeedback={onFeedback} />
+    <ResultCard result={result} onReset={reset} onFeedback={onFeedback} />
   );
 
   return (
@@ -1344,6 +1812,37 @@ function ScanScreen({ parts, onAddHistory, reloadParts, loadError, feedbackStats
             background: T.card, color: T.error, fontSize: 13, fontWeight: 700,
             border: "1px solid #FECACA"
           }}>{t("common.retry")}</button>
+        </div>
+      )}
+
+      {/* Restringere al macchinario è ciò che rende sostenibile un catalogo
+          da migliaia di pezzi: il confronto passa da tutto il magazzino alle
+          poche decine di ricambi di quella macchina. */}
+      {machines.length > 0 && (
+        <div style={{
+          background: T.card, border: `1px solid ${T.border}`, borderRadius: 14,
+          padding: "12px 14px", marginBottom: 12
+        }}>
+          <label style={{ display: "block", fontSize: 12, fontWeight: 700, color: T.textMid, marginBottom: 6 }}>
+            🗂️ {t("scan.machine")}
+          </label>
+          <select
+            value={machine} onChange={e => setMachine(e.target.value)} disabled={analyzing}
+            style={{
+              width: "100%", padding: "11px 12px", borderRadius: 12,
+              border: `1.5px solid ${machine ? T.blue : T.border}`,
+              background: T.bg, fontSize: 15, color: T.text,
+            }}>
+            <option value="">{t("scan.machineAll")}</option>
+            {machines.map(m => (
+              <option key={m.machine} value={m.machine}>{m.machine} ({m.parts})</option>
+            ))}
+          </select>
+          {!machine && (
+            <p style={{ color: T.textLight, fontSize: 11.5, marginTop: 7, lineHeight: 1.5 }}>
+              {t("scan.machineHint")}
+            </p>
+          )}
         </div>
       )}
 
@@ -1434,7 +1933,7 @@ function ScanScreen({ parts, onAddHistory, reloadParts, loadError, feedbackStats
         </div>
       )}
 
-      {parts.length > 0 && (
+      {partsCount > 0 && (
         <div style={{
           marginTop: 20, background: T.card, borderRadius: 14,
           padding: "12px 16px", display: "flex", alignItems: "center",
@@ -1446,7 +1945,7 @@ function ScanScreen({ parts, onAddHistory, reloadParts, loadError, feedbackStats
             display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18
           }}>📦</div>
           <div>
-            <p style={{ color: T.text, fontWeight: 700, fontSize: 15 }}>{t("scan.partsCount", { n: parts.length })}</p>
+            <p style={{ color: T.text, fontWeight: 700, fontSize: 15 }}>{t("scan.partsCount", { n: partsCount })}</p>
             <p style={{ color: T.textLight, fontSize: 12 }}>{t("scan.ready")}</p>
           </div>
         </div>
@@ -1456,58 +1955,147 @@ function ScanScreen({ parts, onAddHistory, reloadParts, loadError, feedbackStats
 }
 
 // ===================== CATALOG =====================
-function CatalogScreen({ parts }) {
+function CatalogScreen({ partsCount }) {
   const { t } = useT();
   const [search, setSearch] = useState("");
   const [selected, setSelected] = useState(null);
+  const [machine, setMachine] = useState(null);
+  const [machines, setMachines] = useState(null);   // null = non ancora caricati
+  const [results, setResults] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [failed, setFailed]   = useState(false);
 
-  const q = search.toLowerCase();
-  const filtered = parts.filter(p =>
-    p.name?.toLowerCase().includes(q) ||
-    p.code?.toLowerCase().includes(q) ||
-    p.category?.toLowerCase().includes(q) ||
-    p.description?.toLowerCase().includes(q)
-  );
+  const q = useDebounced(search.trim());
+  const searching = q.length > 0;
+  // Le foto si scaricano solo dopo un gesto esplicito: aprire la cartella di
+  // un macchinario, oppure cercare. La schermata iniziale è solo testo.
+  const browsing = searching || !!machine;
+
+  // Livello 1: le cartelle. Solo nomi e conteggi, nessuna immagine.
+  useEffect(() => {
+    let alive = true;
+    cloud.listMachines().then(m => { if (alive) setMachines(m); });
+    return () => { alive = false; };
+  }, []);
+
+  // Livello 2: i ricambi, del macchinario aperto o della ricerca.
+  useEffect(() => {
+    if (!browsing) { setResults([]); return; }
+    let alive = true;
+    setLoading(true);
+    setFailed(false);
+    cloud.searchParts(q, machine, CATALOG_MAX_ROWS)
+      .then(r => { if (alive) setResults(r); })
+      .catch(() => { if (alive) { setResults([]); setFailed(true); } })
+      .finally(() => { if (alive) setLoading(false); });
+    return () => { alive = false; };
+  }, [q, machine, browsing]);
 
   if (selected) return <PartDetail part={selected} onBack={() => setSelected(null)} />;
+
+  const visible = results;
+  const atLimit = results.length >= CATALOG_MAX_ROWS;
 
   return (
     <div style={{ padding: 16 }}>
       <h2 style={{ fontSize: 22, fontWeight: 800, color: T.text, marginBottom: 16, letterSpacing: "-0.4px" }}>
         {t("cat.title")}
       </h2>
+
+      {machine && (
+        <button onClick={() => { setMachine(null); setSearch(""); }} className="tap-sc" style={{
+          background: T.bluePale, border: `1px solid ${T.blue}33`, color: T.blue,
+          borderRadius: 12, padding: "8px 14px", fontSize: 14, fontWeight: 600,
+          marginBottom: 12, display: "flex", alignItems: "center", gap: 8
+        }}>← 🗂️ {machine}</button>
+      )}
+
       <div style={{ position: "relative", marginBottom: 16 }}>
         <span style={{ position: "absolute", left: 14, top: "50%", transform: "translateY(-50%)", fontSize: 16, color: T.textLight }}>🔍</span>
         <input
           value={search} onChange={e => setSearch(e.target.value)}
-          placeholder={t("cat.search")}
+          placeholder={machine ? t("cat.searchIn", { m: machine }) : t("cat.search")}
           style={{
             width: "100%", padding: "13px 16px 13px 42px", borderRadius: 14,
             border: `1.5px solid ${T.border}`, background: T.card, fontSize: 15, color: T.text
           }}
         />
       </div>
-      {parts.length === 0 ? (
-        <div style={{ textAlign: "center", padding: "60px 24px" }}>
-          <div style={{ fontSize: 48, marginBottom: 12 }}>📦</div>
-          <p style={{ color: T.text, fontWeight: 700, fontSize: 16 }}>{t("cat.empty")}</p>
-          <p style={{ color: T.textLight, fontSize: 14, marginTop: 6 }}>{t("cat.emptyHint")}</p>
+
+      {/* Livello 1 — le cartelle. Nessuna immagine: solo nomi e conteggi. */}
+      {!browsing ? (
+        machines === null ? (
+          <div style={{ display: "flex", justifyContent: "center", padding: "48px 0" }}><Spinner size={30} /></div>
+        ) : machines.length === 0 ? (
+          // Due situazioni diverse che si assomigliano: non c'è proprio
+          // nulla a catalogo, oppure i ricambi ci sono ma nessuno dichiara
+          // un macchinario. Il rimedio non è lo stesso, quindi nemmeno il
+          // messaggio.
+          <div style={{ textAlign: "center", padding: "40px 0" }}>
+            <div style={{ fontSize: 40, marginBottom: 10 }}>{partsCount === 0 ? "📦" : "🗂️"}</div>
+            <p style={{ color: T.text, fontWeight: 700 }}>
+              {partsCount === 0 ? t("cat.empty") : t("cat.noMachines")}
+            </p>
+            <p style={{ color: T.textLight, fontSize: 14, marginTop: 6, lineHeight: 1.5 }}>
+              {partsCount === 0 ? t("cat.emptyHint") : t("cat.noMachinesHint")}
+            </p>
+          </div>
+        ) : (
+          <>
+            <p style={{ color: T.textLight, fontSize: 12.5, marginBottom: 12, lineHeight: 1.5 }}>
+              {t("cat.pickMachine")}
+            </p>
+            {machines.map((m, i) => (
+              <div key={m.machine} onClick={() => setMachine(m.machine)} className="fade-in tap-sc" style={{
+                background: T.card, borderRadius: 16, marginBottom: 10,
+                border: `1px solid ${T.border}`, padding: 14, cursor: "pointer",
+                display: "flex", gap: 12, alignItems: "center",
+                boxShadow: T.shadow, animationDelay: `${i * 0.03}s`
+              }}>
+                <div style={{
+                  width: 44, height: 44, borderRadius: 12, flexShrink: 0, background: T.orangePale,
+                  display: "flex", alignItems: "center", justifyContent: "center", fontSize: 22
+                }}>🗂️</div>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontWeight: 700, color: T.text, fontSize: 15.5 }}>{m.machine}</div>
+                  <div style={{ color: T.textLight, fontSize: 12.5, marginTop: 2 }}>
+                    {t("cat.machineParts", { n: m.parts })}
+                  </div>
+                </div>
+                <span style={{ color: T.textLight, fontSize: 18 }}>›</span>
+              </div>
+            ))}
+          </>
+        )
+      ) : loading ? (
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 12, padding: "48px 0" }}>
+          <Spinner size={30} />
         </div>
-      ) : filtered.length === 0 ? (
+      ) : failed ? (
+        <div style={{
+          background: "#FEF2F2", border: "1px solid #FECACA", borderRadius: 14,
+          padding: "12px 14px", color: T.error, fontSize: 13, lineHeight: 1.5
+        }}>⚠️ {t("error.dbUnreachable")}</div>
+      ) : results.length === 0 ? (
         <div style={{ textAlign: "center", padding: "40px 0" }}>
           <div style={{ fontSize: 40, marginBottom: 10 }}>🔍</div>
-          <p style={{ color: T.text, fontWeight: 700 }}>{t("cat.noResults", { q: search })}</p>
+          <p style={{ color: T.text, fontWeight: 700 }}>
+            {searching ? t("cat.noResults", { q: search }) : t("cat.emptyMachine")}
+          </p>
         </div>
       ) : (
-        filtered.map((part, i) => (
+        <>
+        {visible.map((part, i) => (
           <div key={part.id} onClick={() => setSelected(part)} className="fade-in tap-sc" style={{
             background: T.card, borderRadius: 16, marginBottom: 10,
             border: `1px solid ${T.border}`, padding: 14,
             display: "flex", gap: 12, alignItems: "center",
             boxShadow: T.shadow, animationDelay: `${i * 0.03}s`, cursor: "pointer"
           }}>
-            {part.imageBase64 ? (
-              <img src={part.imageBase64} alt="" style={{ width: 64, height: 64, borderRadius: 12, objectFit: "cover", flexShrink: 0 }} />
+            {/* loading="lazy": il browser scarica la miniatura solo quando la
+                riga entra davvero nello schermo, non perché è nell'elenco. */}
+            {part.thumbUrl ? (
+              <img src={part.thumbUrl} alt="" loading="lazy" decoding="async" style={{ width: 64, height: 64, borderRadius: 12, objectFit: "cover", flexShrink: 0, background: T.bluePale }} />
             ) : (
               <div style={{ width: 64, height: 64, borderRadius: 12, flexShrink: 0, background: T.bluePale, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 26 }}>🔩</div>
             )}
@@ -1524,24 +2112,36 @@ function CatalogScreen({ parts }) {
             </div>
             <span style={{ color: T.textLight, fontSize: 18 }}>›</span>
           </div>
-        ))
+        ))}
+        {atLimit && (
+          <p style={{ textAlign: "center", color: T.textLight, fontSize: 13, padding: "14px 8px", lineHeight: 1.5 }}>
+            {t("cat.tooMany", { n: CATALOG_MAX_ROWS })}
+          </p>
+        )}
+        </>
       )}
     </div>
   );
 }
 
-function PartDetail({ part, onBack }) {
+function PartDetail({ part: light, onBack }) {
   const { t } = useT();
-  const [images, setImages] = useState(part.imageBase64 ? [part.imageBase64] : []);
+  const [images, setImages] = useState([]);
+  // La riga che arriva dall'elenco è leggera: codice, nome, categoria. La
+  // descrizione e le compatibilità si chiedono solo ora, insieme alle foto —
+  // sono il grosso del peso, e servono a un ricambio alla volta.
+  const [part, setPart] = useState(light);
 
-  // La galleria si scarica solo qui, non nella lista del catalogo
   useEffect(() => {
     let alive = true;
-    cloud.loadPartImages(part.id)
+    cloud.getPart(light.id)
+      .then(full => { if (alive) setPart(full); })
+      .catch(() => {});
+    cloud.loadPartImages(light.id)
       .then(imgs => { if (alive && imgs.length) setImages(imgs); })
       .catch(() => {});
     return () => { alive = false; };
-  }, [part.id]);
+  }, [light.id]);
 
   return (
     <div className="fade-up" style={{ padding: 16 }}>
@@ -1587,14 +2187,18 @@ function PartDetail({ part, onBack }) {
 }
 
 // ===================== RESULT CARD =====================
-function ResultCard({ result, parts = [], onReset, onFeedback }) {
+function ResultCard({ result, onReset, onFeedback }) {
   const { t } = useT();
   const { matched, part, confidence, reasoning } = result;
   const pct = Math.max(0, Math.min(100, Number(confidence) || 0));
 
   // Galleria del pezzo riconosciuto: è qui che serve di più, perché il
   // tecnico confronta la foto appena scattata con le angolazioni di riferimento.
-  const [gallery, setGallery] = useState(part?.imageBase64 ? [part.imageBase64] : []);
+  // Parte dalla miniatura già in memoria — compare subito, sfocata — e viene
+  // sostituita dalla galleria a piena definizione appena arriva.
+  const [gallery, setGallery] = useState(
+    part?.thumbUrl ? [{ full: part.thumbUrl, thumb: part.thumbUrl }] : []
+  );
   useEffect(() => {
     if (!part?.id) return;
     let alive = true;
@@ -1610,14 +2214,28 @@ function ResultCard({ result, parts = [], onReset, onFeedback }) {
   const [fbError, setFbError] = useState("");
   const [search, setSearch] = useState("");
 
-  const similar = findSimilarParts(parts, part, 5);
-  const sq = search.trim().toLowerCase();
-  const searchResults = sq
-    ? parts.filter(p =>
-        (p.name || "").toLowerCase().includes(sq) ||
-        (p.code || "").toLowerCase().includes(sq)
-      ).slice(0, 6)
-    : [];
+  // Candidati plausibili: li calcola il database per somiglianza. Si chiedono
+  // solo quando il tecnico dice "sbagliato", non a ogni scansione riuscita.
+  const [similar, setSimilar] = useState([]);
+  useEffect(() => {
+    if (phase !== "wrong" || !part?.id || similar.length) return;
+    let alive = true;
+    cloud.similarParts(part.id, 5).then(r => { if (alive) setSimilar(r); });
+    return () => { alive = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phase, part?.id]);
+
+  // Ricerca libera fra i ricambi, per quando i simili non bastano.
+  const sq = useDebounced(search.trim());
+  const [searchResults, setSearchResults] = useState([]);
+  useEffect(() => {
+    if (!sq) { setSearchResults([]); return; }
+    let alive = true;
+    cloud.searchParts(sq, null, 6)
+      .then(r => { if (alive) setSearchResults(r); })
+      .catch(() => { if (alive) setSearchResults([]); });
+    return () => { alive = false; };
+  }, [sq]);
 
   async function send(isCorrect, correctPartId) {
     setSaving(true); setFbError("");
@@ -1645,8 +2263,8 @@ function ResultCard({ result, parts = [], onReset, onFeedback }) {
 
   const PickButton = ({ p }) => (
     <button key={p.id} onClick={() => send(false, p.id)} disabled={saving} style={pickStyle}>
-      {p.imageBase64
-        ? <img src={p.imageBase64} alt="" style={{ width: 36, height: 36, borderRadius: 8, objectFit: "cover", flexShrink: 0 }} />
+      {p.thumbUrl
+        ? <img src={p.thumbUrl} alt="" loading="lazy" style={{ width: 36, height: 36, borderRadius: 8, objectFit: "cover", flexShrink: 0 }} />
         : <div style={{ width: 36, height: 36, borderRadius: 8, flexShrink: 0, background: T.bluePale, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 17 }}>🔩</div>}
       <span style={{ flex: 1, minWidth: 0 }}>
         <span className="wrap-anywhere" style={{ display: "block", fontFamily: "monospace", color: T.blue, fontSize: 11, fontWeight: 600 }}>{p.code}</span>
@@ -1678,6 +2296,40 @@ function ResultCard({ result, parts = [], onReset, onFeedback }) {
           <div style={{ height: "100%", width: `${pct}%`, background: T.orange, transition: "width 0.8s ease" }} />
         </div>
         <div style={{ padding: 20 }}>
+          {/* Un "non trovato" su un confronto parziale non vuol dire che il
+              pezzo non sia a catalogo: va detto, o il tecnico ci crede. */}
+          {result.partial && (
+            <div style={{
+              background: T.orangePale, border: `1px solid ${T.orange}`,
+              borderRadius: 12, padding: "12px 14px", marginBottom: 16
+            }}>
+              <p style={{ color: "#92400E", fontSize: 13, fontWeight: 700, marginBottom: 3 }}>
+                ⚠️ {t("scan.partialTitle")}
+              </p>
+              <p style={{ color: "#92400E", fontSize: 12.5, lineHeight: 1.5 }}>
+                {t("scan.partialBody", { n: result.partial.compared })}
+              </p>
+            </div>
+          )}
+          {/* Taglio diverso, avviso diverso: qui il catalogo è stato letto
+              tutto, ma su una parte dei ricambi il confronto è avvenuto solo
+              sulla descrizione, senza foto di riferimento. */}
+          {result.photosPartial && (
+            <div style={{
+              background: T.orangePale, border: `1px solid ${T.orange}`,
+              borderRadius: 12, padding: "12px 14px", marginBottom: 16
+            }}>
+              <p style={{ color: "#92400E", fontSize: 13, fontWeight: 700, marginBottom: 3 }}>
+                ⚠️ {t("scan.photosPartialTitle")}
+              </p>
+              <p style={{ color: "#92400E", fontSize: 12.5, lineHeight: 1.5 }}>
+                {t("scan.photosPartialBody", {
+                  n: result.photosPartial.sent,
+                  tot: result.photosPartial.total,
+                })}
+              </p>
+            </div>
+          )}
           {matched && part ? (
             <>
               <Gallery images={gallery} height={190} />
@@ -1807,24 +2459,18 @@ function ResultCard({ result, parts = [], onReset, onFeedback }) {
 }
 
 // ===================== HISTORY =====================
-function HistoryScreen({ history, range, loading, error, onApply, onReset, onClear }) {
+function HistoryScreen({ history, loading, error, onClear }) {
   const { t, lang } = useT();
   const [open, setOpen]                 = useState(false);
-  const [fromInput, setFromInput]       = useState(range.fromInput);
-  const [toInput, setToInput]           = useState(range.toInput);
   const [text, setText]                 = useState("");
   const [confirmClear, setConfirmClear] = useState(false);
   const [clearing, setClearing]         = useState(false);
   const [clearError, setClearError]     = useState("");
+  const [clearNote, setClearNote]       = useState("");
 
-  // Riallinea i campi quando l'intervallo cambia da fuori (es. "Ultimi 7 giorni")
-  useEffect(() => {
-    setFromInput(range.fromInput);
-    setToInput(range.toInput);
-  }, [range.fromInput, range.toInput]);
-
-  // Il filtro testuale lavora sui risultati già scaricati per l'intervallo:
-  // le date filtrano sul database, il testo affina in locale.
+  // Il filtro lavora in locale sulle righe già scaricate. Non serve un filtro
+  // sul database: la finestra di conservazione è di pochi giorni, quindi qui
+  // dentro non ci sono mai più di poche centinaia di scansioni.
   const q = text.trim().toLowerCase();
   const shown = q
     ? history.filter(h =>
@@ -1832,20 +2478,19 @@ function HistoryScreen({ history, range, loading, error, onApply, onReset, onCle
         (h.part?.code || "").toLowerCase().includes(q))
     : history;
 
-  const periodLabel = range.preset === "7d"
-    ? t("hist.last", { n: HISTORY_DEFAULT_DAYS })
-    : t("hist.range", { a: fmtDay(range.fromInput), b: fmtDay(range.toInput) });
-
-  const dateStyle = {
+  const inputStyle = {
     width: "100%", padding: "11px 12px", borderRadius: 12,
     border: `1.5px solid ${T.border}`, background: T.bg, fontSize: 15, color: T.text,
   };
   const smallLabel = { display: "block", fontSize: 12, fontWeight: 600, color: T.textMid, marginBottom: 5 };
 
   async function doClear() {
-    setClearing(true); setClearError("");
+    setClearing(true); setClearError(""); setClearNote("");
     try {
-      await onClear();
+      const n = await onClear();
+      // Zero righe cancellate senza errore è il sintomo della policy di DELETE
+      // mancante: va detto, altrimenti l'utente crede di aver svuotato tutto.
+      setClearNote(n > 0 ? t("hist.cleared", { n }) : t("hist.clearedNone"));
       setConfirmClear(false);
       setOpen(false);
     } catch (e) {
@@ -1873,7 +2518,9 @@ function HistoryScreen({ history, range, loading, error, onApply, onReset, onCle
             {t("hist.title")}
             <span style={{ marginLeft: 8, background: T.bluePale, color: T.blue, fontSize: 13, borderRadius: 8, padding: "2px 8px", fontWeight: 700, verticalAlign: "middle" }}>{shown.length}</span>
           </h2>
-          <p style={{ color: T.textLight, fontSize: 12, marginTop: 3 }}>{periodLabel}</p>
+          <p style={{ color: T.textLight, fontSize: 12, marginTop: 3 }}>
+            {t("hist.last", { n: HISTORY_RETENTION_DAYS })}
+          </p>
         </div>
         <button onClick={() => setOpen(o => !o)} className="tap-sc" aria-label="Filtri cronologia"
           style={{
@@ -1889,38 +2536,17 @@ function HistoryScreen({ history, range, loading, error, onApply, onReset, onCle
           background: T.card, border: `1px solid ${T.border}`, borderRadius: 16,
           padding: 14, marginBottom: 14, boxShadow: T.shadow
         }}>
-          <div style={{ display: "flex", gap: 10, marginBottom: 12 }}>
-            <div style={{ flex: 1, minWidth: 0 }}>
-              <label style={smallLabel}>{t("hist.from")}</label>
-              <input type="date" value={fromInput} max={toInput}
-                onChange={e => setFromInput(e.target.value)} style={dateStyle} />
-            </div>
-            <div style={{ flex: 1, minWidth: 0 }}>
-              <label style={smallLabel}>{t("hist.to")}</label>
-              <input type="date" value={toInput} min={fromInput}
-                onChange={e => setToInput(e.target.value)} style={dateStyle} />
-            </div>
-          </div>
-
           <label style={smallLabel}>{t("hist.part")}</label>
           <input value={text} onChange={e => setText(e.target.value)}
             placeholder={t("hist.filterPart")}
-            style={{ ...dateStyle, marginBottom: 12 }} />
+            style={{ ...inputStyle, marginBottom: 12 }} />
 
-          <div style={{ display: "flex", gap: 8 }}>
-            <button onClick={onReset} style={{
-              flex: 1, padding: 12, borderRadius: 12,
-              background: T.bg, color: T.textMid, fontSize: 14, fontWeight: 600,
-              border: `1px solid ${T.border}`
-            }}>{t("hist.last", { n: HISTORY_DEFAULT_DAYS })}</button>
-            <button onClick={() => onApply(fromInput, toInput)} className="tap-sc" style={{
-              flex: 1, padding: 12, borderRadius: 12,
-              background: T.blue, color: "white", fontSize: 14, fontWeight: 700
-            }}>{t("hist.apply")}</button>
-          </div>
+          <p style={{ color: T.textLight, fontSize: 12, lineHeight: 1.5, marginBottom: 12 }}>
+            ⏳ {t("hist.autoDelete", { n: HISTORY_RETENTION_DAYS })}
+          </p>
 
           <button onClick={() => setConfirmClear(true)} disabled={clearing} style={{
-            width: "100%", marginTop: 14, padding: 11, borderRadius: 12,
+            width: "100%", padding: 11, borderRadius: 12,
             background: "#FEF2F2", color: T.error, fontSize: 13.5, fontWeight: 700,
             border: "1px solid #FECACA",
             display: "flex", alignItems: "center", justifyContent: "center", gap: 8
@@ -1937,6 +2563,13 @@ function HistoryScreen({ history, range, loading, error, onApply, onReset, onCle
         }}>⚠️ {clearError || t("hist.loadFailed")}</div>
       )}
 
+      {clearNote && (
+        <div style={{
+          background: "#F0FDF4", border: "1px solid #86EFAC", borderRadius: 14,
+          padding: "12px 14px", marginBottom: 12, color: T.success, fontSize: 13, lineHeight: 1.5
+        }}>{clearNote}</div>
+      )}
+
       {loading ? (
         <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 12, padding: "48px 0" }}>
           <Spinner size={30} />
@@ -1946,14 +2579,10 @@ function HistoryScreen({ history, range, loading, error, onApply, onReset, onCle
         <div style={{ textAlign: "center", padding: "56px 24px" }}>
           <div style={{ fontSize: 52, marginBottom: 14 }}>🕐</div>
           <p style={{ color: T.text, fontWeight: 700, fontSize: 17 }}>
-            {q ? t("hist.noResults") : t("hist.noneInPeriod")}
+            {q ? t("hist.noResults") : t("hist.noneInPeriod", { n: HISTORY_RETENTION_DAYS })}
           </p>
           <p style={{ color: T.textLight, fontSize: 14, marginTop: 6, lineHeight: 1.5 }}>
-            {q
-              ? t("hist.noMatchText", { q: text })
-              : range.preset === "7d"
-                ? t("hist.hintFilter")
-                : t("hist.hintWiden")}
+            {q ? t("hist.noMatchText", { q: text }) : t("hist.hintScan")}
           </p>
         </div>
       ) : (
@@ -1995,32 +2624,36 @@ function HistoryScreen({ history, range, loading, error, onApply, onReset, onCle
 }
 
 // ===================== ADMIN APP =====================
-function AdminApp({ parts, onAddPart, onUpdatePart, onDeletePart, reloadParts, loadError, onLogout, userEmail }) {
+function AdminApp({ partsCount, onAddPart, onUpdatePart, onDeletePart, reloadParts, loadError, onLogout, userEmail }) {
   const [tab, setTab] = useState("parts");
   const [editingPart, setEditingPart] = useState(null);
 
+  // Cambiando questo numero la lista rilancia la sua ricerca: è il modo di
+  // farla aggiornare senza tenere il catalogo in uno stato condiviso.
+  const [listVersion, setListVersion] = useState(0);
+  const refreshList = () => setListVersion(v => v + 1);
+
   function handleEdit(part)  { setEditingPart(part); setTab("add"); }
   function handleAddNew()    { setEditingPart(null); setTab("add"); }
-  function handleDone()      { setEditingPart(null); setTab("parts"); reloadParts(); }
+  function handleDone()      { setEditingPart(null); setTab("parts"); reloadParts(); refreshList(); }
 
   return (
     <div className="app-shell">
       <Header title="WERFEN SCAN Admin" subtitle="Area amministratore" onLogout={onLogout} />
       <div className="app-content">
-        {tab === "parts" && <PartsListScreen parts={parts} onEdit={handleEdit} onAdd={handleAddNew} onDeletePart={onDeletePart} reloadParts={reloadParts} loadError={loadError} />}
+        {tab === "parts" && <PartsListScreen partsCount={partsCount} version={listVersion} onRefresh={refreshList} onEdit={handleEdit} onAdd={handleAddNew} onDeletePart={onDeletePart} loadError={loadError} />}
         {/* La key forza il remount passando da Edit a New Part: senza,
             il form resterebbe precompilato col ricambio in modifica. */}
         {tab === "add" && (
           <AddEditPartScreen
             key={editingPart?.id || "new"}
-            parts={parts}
             editingPart={editingPart}
             onAddPart={onAddPart}
             onUpdatePart={onUpdatePart}
             onDone={handleDone}
           />
         )}
-        {tab === "settings" && <SettingsScreen partsCount={parts.length} userEmail={userEmail} />}
+        {tab === "settings" && <SettingsScreen partsCount={partsCount} userEmail={userEmail} />}
       </div>
       <TabBar
         tabs={[
@@ -2040,22 +2673,43 @@ function AdminApp({ parts, onAddPart, onUpdatePart, onDeletePart, reloadParts, l
 }
 
 // ===================== PARTS LIST =====================
-function PartsListScreen({ parts, onEdit, onAdd, onDeletePart, reloadParts, loadError }) {
+function PartsListScreen({ partsCount, version, onRefresh, onEdit, onAdd, onDeletePart, loadError }) {
   const [search, setSearch] = useState("");
   const [confirmDelete, setConfirmDelete] = useState(null);
   const [refreshing, setRefreshing] = useState(false);
   const [actionError, setActionError] = useState("");
+  const [filtered, setFiltered] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [machine, setMachine] = useState("");
+  const [machines, setMachines] = useState([]);
 
-  const q = search.toLowerCase();
-  const filtered = parts.filter(p =>
-    p.name?.toLowerCase().includes(q) ||
-    p.code?.toLowerCase().includes(q) ||
-    p.category?.toLowerCase().includes(q)
-  );
+  // Stessa ricerca lato server e stesse regole sulle immagini della schermata
+  // tecnico: l'area amministratore non è esente dal risparmio, ci si passa
+  // anzi più tempo. "version" cambia dopo ogni salvataggio o eliminazione e
+  // fa ripartire la query.
+  const q = useDebounced(search.trim());
+  const searching = q.length > 0;
+  const browsing = searching || !!machine;
+
+  useEffect(() => {
+    let alive = true;
+    cloud.listMachines().then(m => { if (alive) setMachines(m); });
+    return () => { alive = false; };
+  }, [version]);
+
+  useEffect(() => {
+    let alive = true;
+    setLoading(true);
+    cloud.searchParts(q, machine, browsing ? CATALOG_MAX_ROWS : CATALOG_PREVIEW_ROWS)
+      .then(r => { if (alive) setFiltered(r); })
+      .catch(() => { if (alive) setFiltered([]); })
+      .finally(() => { if (alive) setLoading(false); });
+    return () => { alive = false; };
+  }, [q, machine, browsing, version]);
 
   async function deletePart(id) {
     setActionError("");
-    try { await onDeletePart(id); }
+    try { await onDeletePart(id); onRefresh(); }
     catch (e) {
       console.error(e);
       setActionError(`Impossibile eliminare: ${e.message || "controlla la connessione"}. Se hai attivato RLS, le scritture sono consentite solo all'account admin.`);
@@ -2065,7 +2719,7 @@ function PartsListScreen({ parts, onEdit, onAdd, onDeletePart, reloadParts, load
 
   async function refresh() {
     setRefreshing(true);
-    await reloadParts();
+    onRefresh();
     setRefreshing(false);
   }
 
@@ -2093,7 +2747,7 @@ function PartsListScreen({ parts, onEdit, onAdd, onDeletePart, reloadParts, load
       }}>
         <div>
           <div style={{ color: "rgba(255,255,255,0.7)", fontSize: 12, fontWeight: 600, textTransform: "uppercase", letterSpacing: 1 }}>Database condiviso ☁️</div>
-          <div style={{ color: "white", fontSize: 28, fontWeight: 800, marginTop: 2 }}>{parts.length}</div>
+          <div style={{ color: "white", fontSize: 28, fontWeight: 800, marginTop: 2 }}>{partsCount}</div>
           <div style={{ color: "rgba(255,255,255,0.6)", fontSize: 13 }}>ricambi registrati</div>
         </div>
         <button onClick={onAdd} className="tap-sc" style={{
@@ -2111,6 +2765,21 @@ function PartsListScreen({ parts, onEdit, onAdd, onDeletePart, reloadParts, load
         {refreshing ? <><Spinner size={16} /> Aggiornamento...</> : "↻ Ricarica dal cloud"}
       </button>
 
+      {machines.length > 0 && (
+        <select
+          value={machine} onChange={e => setMachine(e.target.value)}
+          style={{
+            width: "100%", padding: "12px 14px", borderRadius: 14, marginBottom: 10,
+            border: `1.5px solid ${machine ? T.blue : T.border}`,
+            background: T.card, fontSize: 15, color: T.text,
+          }}>
+          <option value="">🗂️ Tutti i macchinari</option>
+          {machines.map(m => (
+            <option key={m.machine} value={m.machine}>{m.machine} ({m.parts})</option>
+          ))}
+        </select>
+      )}
+
       <div style={{ position: "relative", marginBottom: 16 }}>
         <span style={{ position: "absolute", left: 14, top: "50%", transform: "translateY(-50%)", fontSize: 16, color: T.textLight }}>🔍</span>
         <input
@@ -2120,12 +2789,22 @@ function PartsListScreen({ parts, onEdit, onAdd, onDeletePart, reloadParts, load
         />
       </div>
 
-      {filtered.length === 0 ? (
+      {!browsing && filtered.length > 0 && (
+        <p style={{ color: T.textLight, fontSize: 12.5, marginBottom: 12, lineHeight: 1.5 }}>
+          Solo i più recenti, senza foto. Cerca o scegli un macchinario per vedere le immagini.
+        </p>
+      )}
+
+      {loading ? (
+        <div style={{ display: "flex", justifyContent: "center", padding: "48px 0" }}>
+          <Spinner size={30} />
+        </div>
+      ) : filtered.length === 0 ? (
         <div style={{ textAlign: "center", padding: "40px 16px" }}>
           <div style={{ fontSize: 40, marginBottom: 10 }}>📦</div>
-          <p style={{ color: T.text, fontWeight: 700 }}>{parts.length === 0 ? "Database vuoto" : "Nessun risultato"}</p>
-          <p style={{ color: T.textLight, fontSize: 14, marginTop: 4 }}>{parts.length === 0 ? "Aggiungi il primo ricambio" : "Prova un altro termine"}</p>
-          {parts.length === 0 && (
+          <p style={{ color: T.text, fontWeight: 700 }}>{partsCount === 0 ? "Database vuoto" : "Nessun risultato"}</p>
+          <p style={{ color: T.textLight, fontSize: 14, marginTop: 4 }}>{partsCount === 0 ? "Aggiungi il primo ricambio" : "Prova un altro termine"}</p>
+          {partsCount === 0 && (
             <button onClick={onAdd} className="tap-sc" style={{
               marginTop: 18, padding: "12px 24px", borderRadius: 14,
               background: T.orange,
@@ -2134,6 +2813,8 @@ function PartsListScreen({ parts, onEdit, onAdd, onDeletePart, reloadParts, load
           )}
         </div>
       ) : (
+        // Stessa regola del catalogo tecnico: le foto compaiono solo fra i
+        // risultati di una ricerca. Il numero di righe lo limita già il server.
         filtered.map((part, i) => (
           <div key={part.id} className="fade-in" style={{
             background: T.card, borderRadius: 16, marginBottom: 10,
@@ -2141,8 +2822,8 @@ function PartsListScreen({ parts, onEdit, onAdd, onDeletePart, reloadParts, load
             boxShadow: T.shadow, animationDelay: `${i * 0.03}s`
           }}>
             <div style={{ display: "flex", gap: 12, padding: 14 }}>
-              {part.imageBase64 ? (
-                <img src={part.imageBase64} alt="" style={{ width: 68, height: 68, borderRadius: 12, objectFit: "cover", flexShrink: 0 }} />
+              {browsing && part.thumbUrl ? (
+                <img src={part.thumbUrl} alt="" loading="lazy" decoding="async" style={{ width: 68, height: 68, borderRadius: 12, objectFit: "cover", flexShrink: 0, background: T.bluePale }} />
               ) : (
                 <div style={{ width: 68, height: 68, borderRadius: 12, flexShrink: 0, background: T.bluePale, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 28 }}>🔩</div>
               )}
@@ -2172,7 +2853,7 @@ function PartsListScreen({ parts, onEdit, onAdd, onDeletePart, reloadParts, load
 }
 
 // ===================== ADD / EDIT PART =====================
-function AddEditPartScreen({ parts, editingPart, onAddPart, onUpdatePart, onDone }) {
+function AddEditPartScreen({ editingPart, onAddPart, onUpdatePart, onDone }) {
   const isEdit = !!editingPart;
   const [form, setForm] = useState(editingPart
     ? { ...editingPart, images: [] }
@@ -2210,8 +2891,14 @@ function AddEditPartScreen({ parts, editingPart, onAddPart, onUpdatePart, onDone
     setImgLoading(true);
     setErrors(prev => ({ ...prev, image: "" }));
     try {
-      const compressed = await compressImage(file, 800, 0.78);
-      setForm(f => ({ ...f, images: [...(f.images || []), compressed] }));
+      // Le tre versioni nascono qui, sul telefono di chi carica: al server
+      // arrivano già pronte, non c'è nessuna elaborazione lato cloud.
+      // Si ridimensiona sempre partendo dalla piena, non dall'originale:
+      // una sola decodifica del file scattato, tre riduzioni sulla stessa.
+      const full  = await compressImage(file, PHOTO_FULL_PX, PHOTO_FULL_Q);
+      const ai    = await makeThumb(full, PHOTO_AI_PX, PHOTO_AI_Q);
+      const thumb = await makeThumb(full, PHOTO_THUMB_PX, PHOTO_THUMB_Q);
+      setForm(f => ({ ...f, images: [...(f.images || []), { full, thumb, ai }] }));
     } catch (err) {
       console.error("compressImage:", err);
       setErrors(prev => ({ ...prev, image: "Impossibile caricare l'immagine. Riprova." }));
@@ -2241,27 +2928,27 @@ function AddEditPartScreen({ parts, editingPart, onAddPart, onUpdatePart, onDone
     setCompatInput("");
   }
 
-  function validate() {
+  // Il controllo dei doppioni interroga il database invece di scorrere un
+  // catalogo tenuto in memoria: è una ricerca su indice, e soprattutto vede
+  // anche i ricambi aggiunti da un altro dispositivo un minuto fa.
+  async function validate() {
     const e = {};
     if (!form.code.trim()) e.code = "Il codice è obbligatorio";
     if (!form.name.trim()) e.name = "Il nome è obbligatorio";
-    const dup = parts.find(p =>
-      p.code?.toLowerCase() === form.code.trim().toLowerCase() && p.id !== editingPart?.id
-    );
-    if (dup) e.code = "Questo codice esiste già nel database";
+    if (!e.code) {
+      const dup = await cloud.partByCode(form.code, editingPart?.id);
+      if (dup) e.code = "Questo codice esiste già nel database";
+    }
     return e;
   }
 
   async function save() {
-    const errs = validate();
-    if (Object.keys(errs).length) { setErrors(errs); return; }
     setSaving(true);
+    const errs = await validate();
+    if (Object.keys(errs).length) { setErrors(errs); setSaving(false); return; }
+    // Le miniature esistono già: la copertina è semplicemente quella della
+    // prima foto. Il caricamento su Storage avviene dentro add/updatePart.
     const cleaned = { ...form, code: form.code.trim(), name: form.name.trim() };
-    // La copertina è una miniatura della prima foto: è l'unica immagine che
-    // viaggia con la lista dei ricambi, quindi va tenuta leggera.
-    cleaned.coverBase64 = form.images?.[0]
-      ? await makeThumb(form.images[0], 400, 0.75)
-      : "";
     try {
       if (isEdit) await onUpdatePart(editingPart.id, cleaned);
       else        await onAddPart(cleaned);
@@ -2301,13 +2988,15 @@ function AddEditPartScreen({ parts, editingPart, onAddPart, onUpdatePart, onDone
         </div>
       ) : (
         <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 8, marginBottom: 10 }}>
-          {(form.images || []).map((src, i) => (
+          {(form.images || []).map((img, i) => (
             <div key={i} style={{
               position: "relative", borderRadius: 12, overflow: "hidden",
               border: `1.5px solid ${i === 0 ? T.blue : T.border}`,
               aspectRatio: "1 / 1", background: T.bg
             }}>
-              <img src={src} alt="" style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} />
+              {/* L'anteprima usa la miniatura: nel form basta riconoscere
+                  quale foto è quale, non esaminarla. */}
+              <img src={img.thumb} alt="" loading="lazy" style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} />
               {i === 0 && (
                 <span style={{
                   position: "absolute", left: 4, top: 4, background: T.blue, color: "white",
@@ -2459,6 +3148,27 @@ function SettingsScreen({ partsCount, userEmail }) {
   const [confirmPwd, setConfirmPwd] = useState("");
   const [feedback, setFeedback] = useState({ msg: "", type: "" });
   const [saving, setSaving] = useState(false);
+  const [confirmPurge, setConfirmPurge] = useState(false);
+  const [purging, setPurging] = useState(false);
+  const [purgeMsg, setPurgeMsg] = useState({ msg: "", type: "" });
+
+  // Da admin la stessa chiamata cancella le scansioni di tutti: è la policy
+  // "history_delete_admin" a decidere l'ambito, non un parametro del client.
+  async function purgeHistory() {
+    setPurging(true); setPurgeMsg({ msg: "", type: "" });
+    try {
+      const n = await cloud.clearHistory();
+      setPurgeMsg(n > 0
+        ? { msg: `✅ ${n} scansioni eliminate da tutti i tecnici.`, type: "success" }
+        : { msg: "Non c'era nulla da eliminare.", type: "success" });
+    } catch (e) {
+      console.error("purgeHistory:", e);
+      setPurgeMsg({ msg: `Eliminazione non riuscita: ${e.message || ""}`, type: "error" });
+    } finally {
+      setPurging(false);
+      setConfirmPurge(false);
+    }
+  }
 
   async function changePassword() {
     if (!newPwd || !confirmPwd) { setFeedback({ msg: "Compila entrambi i campi", type: "error" }); return; }
@@ -2476,6 +3186,14 @@ function SettingsScreen({ partsCount, userEmail }) {
 
   return (
     <div style={{ padding: 16 }}>
+      {confirmPurge && (
+        <ConfirmDialog
+          message={`Eliminare la cronologia delle scansioni di TUTTI i tecnici? L'operazione è irreversibile. Le scansioni si cancellano comunque da sole dopo ${HISTORY_RETENTION_DAYS} giorni: usa questo comando solo se serve liberare spazio subito.`}
+          onConfirm={purgeHistory}
+          onCancel={() => setConfirmPurge(false)}
+        />
+      )}
+
       <div style={{
         background: T.blue,
         borderRadius: 20, padding: "24px 20px", marginBottom: 16,
@@ -2544,6 +3262,32 @@ function SettingsScreen({ partsCount, userEmail }) {
           display: "flex", alignItems: "center", justifyContent: "center", gap: 8
         }}>
           {saving ? <><Spinner size={18} color="white" /> Aggiornamento...</> : "🔐 Aggiorna password"}
+        </button>
+      </div>
+
+      {/* Cronologia */}
+      <div style={{ background: T.card, borderRadius: 20, padding: 20, border: `1px solid ${T.border}`, boxShadow: T.shadow, marginBottom: 16 }}>
+        <h3 style={{ fontWeight: 800, color: T.text, marginBottom: 6, fontSize: 17 }}>🕐 Cronologia scansioni</h3>
+        <p style={{ color: T.textMid, fontSize: 13, lineHeight: 1.6, marginBottom: 14 }}>
+          Le scansioni si cancellano da sole dopo <strong>{HISTORY_RETENTION_DAYS} giorni</strong>: il
+          database non cresce e non serve fare manutenzione. Questo comando le elimina
+          subito, per tutti i tecnici — serve solo se devi liberare spazio immediatamente.
+        </p>
+        {purgeMsg.msg && (
+          <div style={{
+            padding: "12px 14px", borderRadius: 12, marginBottom: 14, fontSize: 14,
+            background: purgeMsg.type === "success" ? "#F0FDF4" : "#FEF2F2",
+            color: purgeMsg.type === "success" ? T.success : T.error,
+            border: `1px solid ${purgeMsg.type === "success" ? "#86EFAC" : "#FECACA"}`
+          }}>{purgeMsg.msg}</div>
+        )}
+        <button onClick={() => setConfirmPurge(true)} disabled={purging} style={{
+          width: "100%", padding: 13, borderRadius: 12,
+          background: "#FEF2F2", color: T.error, fontSize: 14, fontWeight: 700,
+          border: "1px solid #FECACA",
+          display: "flex", alignItems: "center", justifyContent: "center", gap: 8
+        }}>
+          {purging ? <><Spinner size={16} color={T.error} /> Eliminazione...</> : "🗑️ Svuota la cronologia di tutti"}
         </button>
       </div>
 
@@ -2645,10 +3389,12 @@ function LoadingScreen({ labelKey = "loading.app" }) {
 export default function App() {
   const [session, setSession]         = useState(null);
   const [authChecked, setAuthChecked] = useState(false);
-  const [parts, setParts]             = useState([]);
+  const [partsCount, setPartsCount]   = useState(0);
+  const [sessionUnverified, setSessionUnverified] = useState(false);
+  const [recovering, setRecovering] = useState(false);
   const [partsLoading, setPartsLoading] = useState(false);
   const [loadError, setLoadError]     = useState("");
-  const [expiredNotice, setExpiredNotice] = useState(false);
+  const [expiredReason, setExpiredReason] = useState(null);   // "age" | "idle" | null
   const [lang, setLangState] = useState(readCachedLang);
 
   // Appena la sessione è nota, adotta la lingua salvata sull'account:
@@ -2679,6 +3425,14 @@ export default function App() {
     }
   }
 
+  // Chiude la sessione spiegandone il motivo. Unico punto da cui si esce
+  // per scadenza, chiamato sia dai timer locali sia dal verdetto del server.
+  async function expireSession(reason) {
+    setExpiredReason(reason === "idle" ? "idle" : "age");
+    forgetLoginTime();
+    await supabase.auth.signOut();
+  }
+
   // Sessione Supabase: persiste in localStorage, quindi il login
   // resta valido tra le aperture dell'app sullo stesso dispositivo.
   useEffect(() => {
@@ -2690,47 +3444,88 @@ export default function App() {
       setAuthChecked(true);
     });
     const { data: sub } = supabase.auth.onAuthStateChange((event, s) => {
-      if (event === "SIGNED_IN")  { rememberLoginTime(); setExpiredNotice(false); }
+      // Arrivo dal link di recupero: la sessione esiste ma non vale come
+      // accesso finché la password non è stata reimpostata.
+      if (event === "PASSWORD_RECOVERY") { setRecovering(true); return; }
+      if (event === "SIGNED_IN")  { rememberLoginTime(); setExpiredReason(null); }
       if (event === "SIGNED_OUT") { forgetLoginTime(); }
       setSession(s ?? null);
     });
     return () => { alive = false; sub.subscription.unsubscribe(); };
   }, []);
 
-  // Scadenza della sessione dopo SESSION_MAX_HOURS.
-  // Controlla all'avvio, ogni minuto, e ogni volta che l'app torna in primo
-  // piano — il caso tipico è il telefono riaperto il giorno dopo, dove
-  // nessun timer sarebbe rimasto in esecuzione.
+  // Chiusura automatica della sessione: SESSION_MAX_HOURS dal login oppure
+  // IDLE_MAX_HOURS senza interazioni. Il controllo gira all'avvio, ogni
+  // minuto, a ogni ritorno in primo piano e a ogni tocco dell'utente.
+  // I due eventi di risveglio coprono il caso tipico — telefono riaperto il
+  // giorno dopo — dove nessun timer sarebbe rimasto in esecuzione.
+  //
+  // In parallelo, ogni SERVER_TOUCH_MS la stessa domanda viene girata al
+  // database: se lui dice che la sessione è scaduta vince lui, anche quando
+  // l'orologio locale è d'accordo sul contrario.
   useEffect(() => {
     if (!session) return;
     let done = false;
+    let lastServerTouch = 0;
+    const SERVER_TOUCH_MS = 5 * 60 * 1000;
 
-    const check = async () => {
-      if (done || !sessionExpired(session)) return;
+    const expire = (reason) => {
+      if (done) return;
       done = true;
-      setExpiredNotice(true);
-      forgetLoginTime();
-      await supabase.auth.signOut();
+      expireSession(reason);
+    };
+
+    const check = () => {
+      const reason = expiryReason(session);
+      if (reason) expire(reason);
+    };
+
+    const serverCheck = async (force = false) => {
+      if (done) return;
+      const now = Date.now();
+      if (!force && now - lastServerTouch < SERVER_TOUCH_MS) return;
+      lastServerTouch = now;
+      const state = await cloud.touchSession();
+      if (state !== "ok") expire(state);
+    };
+
+    // Interazione reale: touchActivity verifica prima se il tempo era già
+    // scaduto e solo dopo rinnova il timestamp.
+    const onActivity = () => {
+      if (done) return;
+      if (touchActivity(session)) expire("idle");
+      else serverCheck();
     };
 
     check();
-    const id = setInterval(check, 60_000);
-    const onWake = () => { if (!document.hidden) check(); };
+    const id = setInterval(() => { check(); serverCheck(); }, 60_000);
+
+    const onWake = () => { if (!document.hidden) { check(); serverCheck(true); } };
     document.addEventListener("visibilitychange", onWake);
     window.addEventListener("focus", onWake);
+
+    // capture: l'evento si intercetta anche se un handler lo ferma prima.
+    // passive: nessun preventDefault, così lo scroll non rallenta.
+    const ACTIVITY = ["pointerdown", "keydown", "wheel", "touchstart"];
+    const opts = { capture: true, passive: true };
+    ACTIVITY.forEach(ev => window.addEventListener(ev, onActivity, opts));
+
     return () => {
       done = true;
       clearInterval(id);
       document.removeEventListener("visibilitychange", onWake);
       window.removeEventListener("focus", onWake);
+      ACTIVITY.forEach(ev => window.removeEventListener(ev, onActivity, opts));
     };
   }, [session]);
 
+  // All'avvio non si carica più il catalogo: solo quanti ricambi esistono.
+  // Serve a due cose — impedire una scansione contro un database vuoto e
+  // mostrare il totale nelle impostazioni — e costa una manciata di byte.
   async function reloadParts() {
     if (!cloudReady) return;
     try {
-      const p = await cloud.loadParts();
-      setParts(p);
+      setPartsCount(await cloud.countParts());
       setLoadError("");
     } catch (e) {
       console.error("reloadParts:", e.message, e.code);
@@ -2738,29 +3533,42 @@ export default function App() {
     }
   }
 
-  // I ricambi si caricano solo a sessione attiva (RLS richiede autenticazione)
+  // La sessione va registrata sul server PRIMA di leggere qualunque cosa:
+  // finché touch_session() non l'ha vista, le policy RLS non restituiscono
+  // righe e il catalogo sembrerebbe vuoto senza spiegazione.
   useEffect(() => {
-    if (!cloudReady || !session) { setParts([]); return; }
+    if (!cloudReady || !session) { setPartsCount(0); return; }
     setPartsLoading(true);
-    reloadParts().finally(() => setPartsLoading(false));
+    cloud.touchSession()
+      .then(state => {
+        // "unavailable" non chiude la sessione: si prosegue. Ma viene
+        // ricordato, perché se poi il catalogo risulta vuoto la causa
+        // probabile è questa e non un database davvero senza ricambi.
+        setSessionUnverified(state === "unavailable");
+        return state === "ok" || state === "unavailable"
+          ? reloadParts()
+          : expireSession(state);
+      })
+      .finally(() => setPartsLoading(false));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session?.user?.id]);
 
+  // Le liste non vivono più qui: ognuna ricarica la propria ricerca dopo una
+  // modifica. Qui resta solo il totale da tenere allineato.
   async function handleAddPart(partData) {
-    const newPart = await cloud.addPart(partData);
-    setParts(prev => [newPart, ...prev]);
+    await cloud.addPart(partData);
+    setPartsCount(n => n + 1);
   }
   async function handleUpdatePart(id, partData) {
-    const updated = await cloud.updatePart(id, partData);
-    setParts(prev => prev.map(p => (p.id === id ? updated : p)));
+    await cloud.updatePart(id, partData);
   }
   async function handleDeletePart(id) {
     await cloud.deletePart(id);
-    setParts(prev => prev.filter(p => p.id !== id));
+    setPartsCount(n => Math.max(0, n - 1));
   }
   async function handleLogout() {
     await supabase.auth.signOut();
-    setParts([]);
+    setPartsCount(0);
   }
 
   const email = session?.user?.email || "";
@@ -2768,11 +3576,14 @@ export default function App() {
   let screen;
   if (!cloudReady)        screen = <SetupScreen />;
   else if (!authChecked)  screen = <LoadingScreen />;
-  else if (!session)      screen = <LoginScreen expired={expiredNotice} />;
+  // Prima di tutto il resto: chi arriva dal link di recupero non entra
+  // nell'app finché non ha scelto la password nuova.
+  else if (recovering)    screen = <NewPasswordScreen onDone={() => setRecovering(false)} />;
+  else if (!session)      screen = <LoginScreen expiredReason={expiredReason} />;
   else if (partsLoading)  screen = <LoadingScreen labelKey="loading.parts" />;
   else if (isAdminEmail(email)) screen = (
     <AdminApp
-      parts={parts}
+      partsCount={partsCount}
       onAddPart={handleAddPart}
       onUpdatePart={handleUpdatePart}
       onDeletePart={handleDeletePart}
@@ -2784,7 +3595,8 @@ export default function App() {
   );
   else screen = (
     <UserApp
-      parts={parts}
+      partsCount={partsCount}
+      sessionUnverified={sessionUnverified}
       reloadParts={reloadParts}
       loadError={loadError}
       onLogout={handleLogout}
