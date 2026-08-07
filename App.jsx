@@ -652,10 +652,14 @@ const cloud = {
   // I figli diretti di una cartella: solo nomi e conteggi, nessuna immagine.
   // Il conteggio comprende tutto il sottoalbero, quindi una cartella che
   // dice 8 può mostrarne 2 sfusi più 6 divisi in sottocartelle.
-  async listFolders(machine, prefix) {
+  // includeEmpty distingue i due mestieri: il tecnico non deve vedere
+  // cartelle vuote (in officina sono vicoli ciechi), l'amministratore sì —
+  // altrimenti una cartella appena creata sparirebbe un istante dopo.
+  async listFolders(machine, prefix, includeEmpty = false) {
     const { data, error } = await supabase.rpc("list_folders", {
       machine: machine || null,
       prefix: prefix || null,
+      include_empty: !!includeEmpty,
     });
     if (error) { console.error("listFolders:", error.message, error.code); return []; }
     return (data || []).map(f => ({
@@ -663,6 +667,36 @@ const cloud = {
       parts: f.parts,
       hasChildren: !!f.has_children,
     }));
+  },
+
+  // Creare e cancellare cartelle tocca solo l'elenco di quelle fatte a mano:
+  // i ricambi non si spostano e non si perdono. Cancellare una cartella che
+  // contiene ancora qualcosa non la fa sparire — continua a esistere perché
+  // c'è un ricambio che la nomina. È una rete di sicurezza voluta.
+  async createFolder(path) {
+    const clean = normalizeFolder(path);
+    if (!clean) throw new Error("Il nome della cartella non può essere vuoto.");
+    const { error } = await supabase.from("part_folders").upsert({ path: clean });
+    if (error) { console.error("createFolder:", error.message, error.code); throw error; }
+    return clean;
+  },
+
+  async deleteFolder(path) {
+    const clean = normalizeFolder(path);
+    if (!clean) return;
+    // Due chiamate invece di una "or" sola: un nome di cartella può contenere
+    // una virgola, e la virgola è il separatore della sintassi "or" di
+    // PostgREST — un percorso come "Valvole, guarnizioni" la manderebbe in
+    // pezzi in modo silenzioso.
+    //
+    // Anche i rami sotto: cancellare "Idraulica" senza togliere
+    // "Idraulica/Valvole" lascerebbe un figlio orfano che ricrea il genitore.
+    const del = async (query) => {
+      const { error } = await query;
+      if (error) { console.error("deleteFolder:", error.message, error.code); throw error; }
+    };
+    await del(supabase.from("part_folders").delete().eq("path", clean));
+    await del(supabase.from("part_folders").delete().like("path", `${clean}/%`));
   },
 
   // I percorsi già in uso, per suggerirli mentre l'admin scrive. Evita che
@@ -676,9 +710,12 @@ const cloud = {
   // ⚠️ "folder" è il terzo parametro, non il limite: la firma è cambiata
   //    quando sono arrivate le cartelle. Una chiamata vecchia a tre argomenti
   //    passerebbe il limite come percorso e non troverebbe niente.
-  async searchParts(q, machine, folder, limit = 50) {
+  // rootOnly: solo i ricambi che non stanno in nessuna cartella. È la
+  // schermata d'ingresso dell'amministratore — quelli da sistemare.
+  async searchParts(q, machine, folder, limit = 50, rootOnly = false) {
     const { data, error } = await supabase.rpc("search_parts", {
-      q: q || null, machine: machine || null, folder: folder || null, lim: limit,
+      q: q || null, machine: machine || null, folder: folder || null,
+      lim: limit, root_only: !!rootOnly,
     });
     if (error) { console.error("searchParts:", error.message, error.code); throw error; }
     return (data || []).map(p => ({
@@ -1255,6 +1292,72 @@ function ConfirmDialog({ message, onConfirm, onCancel }) {
             flex: 1, padding: 12, borderRadius: 12,
             background: T.error, color: "white", fontSize: 15, fontWeight: 700,
           }}>{t("common.delete")}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ===================== DIALOGO CON CAMPO =====================
+// Come ConfirmDialog, ma c'è qualcosa da scrivere.
+//
+// window.prompt non è un'alternativa: su un telefono è una finestra di
+// sistema che diversi browser incorporati bloccano senza dire niente, non si
+// può etichettare, e non c'è modo di mostrare come verrà salvato il valore.
+function PromptDialog({ title, hint, placeholder, confirmLabel, onConfirm, onCancel }) {
+  const [value, setValue] = useState("");
+  const clean = normalizeFolder(value);
+
+  return (
+    <div style={{
+      position: "fixed", inset: 0, background: "rgba(4,2,107,0.45)",
+      display: "flex", alignItems: "center", justifyContent: "center",
+      zIndex: 9999, padding: 24, animation: "fadeIn 0.2s ease"
+    }}>
+      <div style={{
+        background: T.card, borderRadius: 20, padding: 24,
+        maxWidth: 360, width: "100%", boxShadow: T.shadowLg,
+        animation: "fadeUp 0.2s ease"
+      }}>
+        <p style={{ color: T.text, fontSize: 16, fontWeight: 700, marginBottom: hint ? 6 : 16 }}>
+          {title}
+        </p>
+        {hint && (
+          <p style={{ color: T.textLight, fontSize: 12.5, lineHeight: 1.5, marginBottom: 14 }}>{hint}</p>
+        )}
+        <input
+          autoFocus
+          value={value}
+          onChange={e => setValue(e.target.value)}
+          onKeyDown={e => { if (e.key === "Enter" && clean) onConfirm(clean); }}
+          placeholder={placeholder}
+          style={{
+            width: "100%", padding: "12px 14px", borderRadius: 12,
+            border: `1.5px solid ${T.border}`, background: T.bg,
+            fontSize: 15, color: T.text, marginBottom: 6
+          }}
+        />
+        {/* Si mostra come verrà salvata davvero: barre doppie e spazi ai bordi
+            spariscono, e vederlo qui evita di scoprirlo nell'albero. */}
+        <div style={{ minHeight: 18, marginBottom: 12 }}>
+          {clean && clean !== value.trim() && (
+            <span style={{ color: T.blue, fontSize: 11.5 }}>
+              Verrà creata come: <strong>{clean}</strong>
+            </span>
+          )}
+        </div>
+        <div style={{ display: "flex", gap: 10 }}>
+          <button onClick={onCancel} style={{
+            flex: 1, padding: 12, borderRadius: 12,
+            background: T.bg, color: T.textMid, fontSize: 15, fontWeight: 600,
+            border: `1px solid ${T.border}`
+          }}>Annulla</button>
+          <button onClick={() => clean && onConfirm(clean)} disabled={!clean} style={{
+            flex: 1, padding: 12, borderRadius: 12,
+            background: clean ? T.blue : T.border,
+            color: "white", fontSize: 15, fontWeight: 700,
+            cursor: clean ? "pointer" : "default"
+          }}>{confirmLabel}</button>
         </div>
       </div>
     </div>
@@ -2103,8 +2206,9 @@ function CatalogScreen({ partsCount }) {
     return () => { alive = false; };
   }, [machine, folderPath, browsing, searching]);
 
-  // Livello 3: i ricambi. Sfogliando sono quelli che stanno esattamente qui;
-  // cercando sono quelli di tutto il sottoalbero (lo decide search_parts).
+  // Livello 3: i ricambi di qui e di tutte le sottocartelle. Le cartelle
+  // restringono, non nascondono: scendendo l'elenco si accorcia, ma non
+  // esiste un livello che mostri solo nomi di cartelle e nessuna fotografia.
   useEffect(() => {
     if (!browsing) { setResults([]); return; }
     let alive = true;
@@ -2218,8 +2322,8 @@ function CatalogScreen({ partsCount }) {
         </div>
       ) : (
         <>
-        {/* Prima le cartelle, poi i ricambi sfusi di questo livello: è
-            l'ordine di qualunque gestore di file, e non va spiegato. */}
+        {/* Prima le cartelle — le scorciatoie per restringere — poi i ricambi
+            di tutto quello che sta sotto, foto comprese. */}
         {!searching && folders.map((f, i) => (
           <div key={f.folder} onClick={() => setPath([...path, f.folder])} className="fade-in tap-sc" style={{
             background: T.card, borderRadius: 16, marginBottom: 10,
@@ -2799,9 +2903,14 @@ function AdminApp({ partsCount, onAddPart, onUpdatePart, onDeletePart, reloadPar
   const [listVersion, setListVersion] = useState(0);
   const refreshList = () => setListVersion(v => v + 1);
 
+  // La cartella da cui è partito "+ Aggiungi": chi crea una cartella, ci
+  // entra e aggiunge un pezzo si aspetta che il pezzo finisca lì, non che
+  // debba riscrivere il percorso a mano nel form.
+  const [newPartFolder, setNewPartFolder] = useState("");
+
   function handleEdit(part)  { setEditingPart(part); setTab("add"); }
-  function handleAddNew()    { setEditingPart(null); setTab("add"); }
-  function handleDone()      { setEditingPart(null); setTab("parts"); reloadParts(); refreshList(); }
+  function handleAddNew(folder = "") { setEditingPart(null); setNewPartFolder(folder); setTab("add"); }
+  function handleDone()      { setEditingPart(null); setNewPartFolder(""); setTab("parts"); reloadParts(); refreshList(); }
 
   return (
     <div className="app-shell">
@@ -2812,8 +2921,9 @@ function AdminApp({ partsCount, onAddPart, onUpdatePart, onDeletePart, reloadPar
             il form resterebbe precompilato col ricambio in modifica. */}
         {tab === "add" && (
           <AddEditPartScreen
-            key={editingPart?.id || "new"}
+            key={editingPart?.id || `new:${newPartFolder}`}
             editingPart={editingPart}
+            defaultFolder={newPartFolder}
             onAddPart={onAddPart}
             onUpdatePart={onUpdatePart}
             onDone={handleDone}
@@ -2850,6 +2960,9 @@ function PartsListScreen({ partsCount, version, onRefresh, onEdit, onAdd, onDele
   const [machines, setMachines] = useState([]);
   const [path, setPath] = useState([]);
   const [folders, setFolders] = useState([]);
+  const [newFolder, setNewFolder] = useState(false);       // dialogo di creazione aperto
+  const [confirmFolder, setConfirmFolder] = useState(null); // cartella in attesa di conferma
+  const [folderVersion, setFolderVersion] = useState(0);    // ricarica l'albero dopo una modifica
 
   // Stessa ricerca lato server e stesse regole sulle immagini della schermata
   // tecnico: l'area amministratore non è esente dal risparmio, ci si passa
@@ -2870,25 +2983,54 @@ function PartsListScreen({ partsCount, version, onRefresh, onEdit, onAdd, onDele
 
   useEffect(() => { setPath([]); }, [machine]);
 
-  // Le cartelle di questo livello. A differenza del tecnico, qui si vedono
-  // anche senza aver scelto un macchinario: l'amministratore riordina il
-  // catalogo, e non sempre lo fa una macchina alla volta.
+  // Le cartelle di questo livello, comprese quelle vuote: è la differenza
+  // fra chi consulta il catalogo e chi lo costruisce. Si vedono anche senza
+  // aver scelto un macchinario — riordinare non si fa una macchina alla volta.
   useEffect(() => {
     if (searching) { setFolders([]); return; }
     let alive = true;
-    cloud.listFolders(machine, folderPath).then(f => { if (alive) setFolders(f); });
+    cloud.listFolders(machine, folderPath, true).then(f => { if (alive) setFolders(f); });
     return () => { alive = false; };
-  }, [machine, folderPath, searching, version]);
+  }, [machine, folderPath, searching, version, folderVersion]);
+
+  // Fuori da ogni cartella si mostrano solo i ricambi che non ne hanno una:
+  // quelli da sistemare. È anche ciò che tiene la schermata d'ingresso senza
+  // immagini — caricare le miniature dell'intero catalogo per poi scendere
+  // subito in una cartella sarebbe traffico buttato.
+  const rootOnly = !searching && path.length === 0;
 
   useEffect(() => {
     let alive = true;
     setLoading(true);
-    cloud.searchParts(q, machine, folderPath, browsing ? CATALOG_MAX_ROWS : CATALOG_PREVIEW_ROWS)
+    cloud.searchParts(q, machine, folderPath, browsing ? CATALOG_MAX_ROWS : CATALOG_PREVIEW_ROWS, rootOnly)
       .then(r => { if (alive) setFiltered(r); })
       .catch(() => { if (alive) setFiltered([]); })
       .finally(() => { if (alive) setLoading(false); });
     return () => { alive = false; };
-  }, [q, machine, folderPath, browsing, version]);
+  }, [q, machine, folderPath, browsing, rootOnly, version]);
+
+  // ── Creare e togliere cartelle ─────────────────────────────
+  async function addFolder(name) {
+    setNewFolder(false);
+    setActionError("");
+    try {
+      await cloud.createFolder([...path, name].join("/"));
+      setFolderVersion(v => v + 1);
+    } catch (e) {
+      setActionError(`Impossibile creare la cartella: ${e.message || "controlla la connessione"}. La creazione è consentita solo all'account amministratore.`);
+    }
+  }
+
+  async function removeFolder(name) {
+    setConfirmFolder(null);
+    setActionError("");
+    try {
+      await cloud.deleteFolder([...path, name].join("/"));
+      setFolderVersion(v => v + 1);
+    } catch (e) {
+      setActionError(`Impossibile eliminare la cartella: ${e.message || "controlla la connessione"}.`);
+    }
+  }
 
   async function deletePart(id) {
     setActionError("");
@@ -2916,6 +3058,25 @@ function PartsListScreen({ partsCount, version, onRefresh, onEdit, onAdd, onDele
         />
       )}
 
+      {newFolder && (
+        <PromptDialog
+          title={path.length ? `Nuova cartella dentro "${path[path.length - 1]}"` : "Nuova cartella"}
+          hint={'Solo il nome, non il percorso: la posizione è quella in cui ti trovi. Puoi comunque scrivere "Valvole/Sicurezza" per creare due livelli in un colpo.'}
+          placeholder="es. Valvole"
+          confirmLabel="Crea"
+          onConfirm={addFolder}
+          onCancel={() => setNewFolder(false)}
+        />
+      )}
+
+      {confirmFolder && (
+        <ConfirmDialog
+          message={`Eliminare la cartella "${confirmFolder}"? Nessun ricambio viene toccato: la cartella è vuota, sparisce solo dall'elenco.`}
+          onConfirm={() => removeFolder(confirmFolder)}
+          onCancel={() => setConfirmFolder(null)}
+        />
+      )}
+
       {(loadError || actionError) && (
         <div style={{
           background: "#FEF2F2", border: "1px solid #FECACA", borderRadius: 14,
@@ -2933,7 +3094,9 @@ function PartsListScreen({ partsCount, version, onRefresh, onEdit, onAdd, onDele
           <div style={{ color: "white", fontSize: 28, fontWeight: 800, marginTop: 2 }}>{partsCount}</div>
           <div style={{ color: "rgba(255,255,255,0.6)", fontSize: 13 }}>ricambi registrati</div>
         </div>
-        <button onClick={onAdd} className="tap-sc" style={{
+        {/* Il ricambio nasce nella cartella in cui ti trovi: se hai appena
+            creato "Idraulica/Valvole" e ci sei dentro, non devi riscriverla. */}
+        <button onClick={() => onAdd(folderPath)} className="tap-sc" style={{
           padding: "12px 20px", borderRadius: 14,
           background: T.orange,
           color: "white", fontSize: 15, fontWeight: 700
@@ -2982,15 +3145,28 @@ function PartsListScreen({ partsCount, version, onRefresh, onEdit, onAdd, onDele
         />
       )}
 
-      {!browsing && filtered.length > 0 && (
-        <p style={{ color: T.textLight, fontSize: 12.5, marginBottom: 12, lineHeight: 1.5 }}>
-          Solo i più recenti, senza foto. Apri una cartella, cerca o scegli un macchinario per vedere le immagini.
+      {rootOnly && filtered.length > 0 && (
+        <p style={{ color: T.textLight, fontSize: 12.5, marginTop: 4, marginBottom: 12, lineHeight: 1.5 }}>
+          🔩 Qui sotto i ricambi <strong>non ancora assegnati a una cartella</strong>
+          {!browsing && ` (i ${CATALOG_PREVIEW_ROWS} più recenti)`}. Aprine uno e compila
+          il campo "Cartella" per metterlo a posto.
         </p>
       )}
 
       {/* Le cartelle stanno fuori dal ramo di caricamento dei ricambi: sono
           due interrogazioni diverse, e far sparire l'albero mentre si carica
           l'elenco farebbe lampeggiare la schermata a ogni tocco. */}
+      {!searching && (
+        <button onClick={() => setNewFolder(true)} className="tap-sc" style={{
+          width: "100%", padding: 12, borderRadius: 14, marginBottom: 10,
+          background: T.card, color: T.blue, fontSize: 14.5, fontWeight: 700,
+          border: `1.5px dashed ${T.blue}66`,
+          display: "flex", alignItems: "center", justifyContent: "center", gap: 8
+        }}>
+          📁 + Nuova cartella{path.length ? ` in "${path[path.length - 1]}"` : ""}
+        </button>
+      )}
+
       {!searching && folders.map((f, i) => (
         <div key={f.folder} onClick={() => setPath([...path, f.folder])} className="fade-in tap-sc" style={{
           background: T.card, borderRadius: 16, marginBottom: 10,
@@ -3005,9 +3181,25 @@ function PartsListScreen({ partsCount, version, onRefresh, onEdit, onAdd, onDele
           <div style={{ flex: 1, minWidth: 0 }}>
             <div style={{ fontWeight: 700, color: T.text, fontSize: 15.5 }}>{f.folder}</div>
             <div style={{ color: T.textLight, fontSize: 12.5, marginTop: 2 }}>
-              {f.parts} ricambi in tutto{f.hasChildren ? " · contiene altre cartelle" : ""}
+              {f.parts === 0
+                ? "vuota"
+                : `${f.parts} ricambi in tutto`}{f.hasChildren ? " · contiene altre cartelle" : ""}
             </div>
           </div>
+          {/* Si può togliere solo una cartella vuota. Una che contiene
+              ricambi non sparirebbe comunque — continuerebbe a esistere
+              perché c'è un pezzo che la nomina — e offrire un pulsante che
+              non fa niente è peggio che non offrirlo. */}
+          {f.parts === 0 && !f.hasChildren && (
+            <button
+              onClick={(e) => { e.stopPropagation(); setConfirmFolder(f.folder); }}
+              aria-label={`Elimina la cartella ${f.folder}`}
+              style={{
+                width: 30, height: 30, borderRadius: 9, flexShrink: 0,
+                background: "#FEF2F2", color: T.error, fontSize: 15, fontWeight: 700,
+                border: "1px solid #FECACA", lineHeight: 1, padding: 0
+              }}>×</button>
+          )}
           <span style={{ color: T.textLight, fontSize: 18 }}>›</span>
         </div>
       ))}
@@ -3028,7 +3220,10 @@ function PartsListScreen({ partsCount, version, onRefresh, onEdit, onAdd, onDele
               : "Prova un altro termine"}
           </p>
           {partsCount === 0 && (
-            <button onClick={onAdd} className="tap-sc" style={{
+            // onClick={onAdd} passerebbe l'evento del click come cartella, e
+            // il primo ricambio nascerebbe dentro "[object Object]".
+            // Le parentesi qui non sono uno stile.
+            <button onClick={() => onAdd("")} className="tap-sc" style={{
               marginTop: 18, padding: "12px 24px", borderRadius: 14,
               background: T.orange,
               color: "white", fontSize: 15, fontWeight: 700
@@ -3036,8 +3231,13 @@ function PartsListScreen({ partsCount, version, onRefresh, onEdit, onAdd, onDele
           )}
         </div>
       ) : (
-        // Stessa regola del catalogo tecnico: le foto compaiono solo fra i
-        // risultati di una ricerca. Il numero di righe lo limita già il server.
+        // La miniatura si vede sempre, a ogni livello. La regola precedente
+        // — foto solo fra i risultati di una ricerca — veniva dall'epoca in
+        // cui le immagini stavano in base64 dentro il database e ogni riga
+        // dell'elenco se le trascinava dietro. Oggi thumb_url è un indirizzo,
+        // pesa 3,5 KB e con loading="lazy" si scarica solo per le righe che
+        // entrano davvero nello schermo: nasconderla non fa più risparmiare
+        // niente, e un catalogo di ricambi senza fotografie non si sfoglia.
         filtered.map((part, i) => (
           <div key={part.id} className="fade-in" style={{
             background: T.card, borderRadius: 16, marginBottom: 10,
@@ -3045,7 +3245,7 @@ function PartsListScreen({ partsCount, version, onRefresh, onEdit, onAdd, onDele
             boxShadow: T.shadow, animationDelay: `${i * 0.03}s`
           }}>
             <div style={{ display: "flex", gap: 12, padding: 14 }}>
-              {browsing && part.thumbUrl ? (
+              {part.thumbUrl ? (
                 <img src={part.thumbUrl} alt="" loading="lazy" decoding="async" style={{ width: 68, height: 68, borderRadius: 12, objectFit: "cover", flexShrink: 0, background: T.bluePale }} />
               ) : (
                 <div style={{ width: 68, height: 68, borderRadius: 12, flexShrink: 0, background: T.bluePale, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 28 }}>🔩</div>
@@ -3076,11 +3276,11 @@ function PartsListScreen({ partsCount, version, onRefresh, onEdit, onAdd, onDele
 }
 
 // ===================== ADD / EDIT PART =====================
-function AddEditPartScreen({ editingPart, onAddPart, onUpdatePart, onDone }) {
+function AddEditPartScreen({ editingPart, defaultFolder = "", onAddPart, onUpdatePart, onDone }) {
   const isEdit = !!editingPart;
   const [form, setForm] = useState(editingPart
     ? { folder: "", ...editingPart, images: [] }
-    : { code: "", name: "", description: "", category: "", folder: "", compatibility: [], images: [] }
+    : { code: "", name: "", description: "", category: "", folder: normalizeFolder(defaultFolder), compatibility: [], images: [] }
   );
   const [galleryLoading, setGalleryLoading] = useState(!!editingPart);
   // I percorsi già in uso, suggeriti mentre si scrive. Se la chiamata
