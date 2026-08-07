@@ -230,6 +230,10 @@ const STRINGS = {
     "cat.tooMany": "Mostrati i primi {n}. Restringi la ricerca per vedere gli altri.",
     "cat.pickMachine": "Scegli il macchinario su cui stai lavorando. Le foto si caricano solo da qui in poi.",
     "cat.machineParts": "{n} ricambi",
+    "cat.root": "Catalogo",
+    "cat.folderParts": "{n} ricambi in tutto",
+    "cat.hasSubfolders": "contiene altre cartelle",
+    "cat.emptyFolder": "Cartella vuota",
     "cat.searchIn": "Cerca in {m}...",
     "cat.noMachines": "Nessun macchinario",
     "cat.noMachinesHint": "I ricambi non hanno il campo compatibilità compilato. Chiedi all'amministratore di aggiungerlo, oppure cerca direttamente per codice.",
@@ -350,6 +354,10 @@ const STRINGS = {
     "cat.tooMany": "Showing the first {n}. Narrow your search to see the others.",
     "cat.pickMachine": "Pick the machine you are working on. Photos only load from here on.",
     "cat.machineParts": "{n} parts",
+    "cat.root": "Catalogue",
+    "cat.folderParts": "{n} parts in total",
+    "cat.hasSubfolders": "contains more folders",
+    "cat.emptyFolder": "Empty folder",
     "cat.searchIn": "Search in {m}...",
     "cat.noMachines": "No machines",
     "cat.noMachinesHint": "Parts have no compatibility field filled in. Ask the administrator to add it, or search by code directly.",
@@ -641,9 +649,36 @@ const cloud = {
     return data ?? 0;
   },
 
-  async searchParts(q, machine, limit = 50) {
+  // I figli diretti di una cartella: solo nomi e conteggi, nessuna immagine.
+  // Il conteggio comprende tutto il sottoalbero, quindi una cartella che
+  // dice 8 può mostrarne 2 sfusi più 6 divisi in sottocartelle.
+  async listFolders(machine, prefix) {
+    const { data, error } = await supabase.rpc("list_folders", {
+      machine: machine || null,
+      prefix: prefix || null,
+    });
+    if (error) { console.error("listFolders:", error.message, error.code); return []; }
+    return (data || []).map(f => ({
+      folder: f.folder,
+      parts: f.parts,
+      hasChildren: !!f.has_children,
+    }));
+  },
+
+  // I percorsi già in uso, per suggerirli mentre l'admin scrive. Evita che
+  // "Idraulica" e "idraulica" diventino due cartelle diverse.
+  async listAllFolders() {
+    const { data, error } = await supabase.rpc("list_all_folders");
+    if (error) { console.error("listAllFolders:", error.message, error.code); return []; }
+    return (data || []).map(f => f.folder).filter(Boolean);
+  },
+
+  // ⚠️ "folder" è il terzo parametro, non il limite: la firma è cambiata
+  //    quando sono arrivate le cartelle. Una chiamata vecchia a tre argomenti
+  //    passerebbe il limite come percorso e non troverebbe niente.
+  async searchParts(q, machine, folder, limit = 50) {
     const { data, error } = await supabase.rpc("search_parts", {
-      q: q || null, machine: machine || null, lim: limit,
+      q: q || null, machine: machine || null, folder: folder || null, lim: limit,
     });
     if (error) { console.error("searchParts:", error.message, error.code); throw error; }
     return (data || []).map(p => ({
@@ -651,6 +686,7 @@ const cloud = {
       code: p.code || "",
       name: p.name || "",
       category: p.category || "",
+      folder: p.folder || "",
       thumbUrl: p.thumb_url || "",
     }));
   },
@@ -673,10 +709,18 @@ const cloud = {
   // La scheda completa: si carica aprendo un ricambio o dopo una scansione,
   // mai per un elenco.
   async getPart(id) {
-    const { data, error } = await supabase
-      .from("parts")
-      .select("id,code,name,description,category,compatibility,thumb_url")
-      .eq("id", id).single();
+    // La colonna "folder" arriva con folders.sql. Questa è la scheda che si
+    // apre subito dopo una scansione riuscita: se il codice fosse in
+    // produzione prima dell'SQL, senza il ripiego il tecnico vedrebbe
+    // "nessuna corrispondenza" su un riconoscimento andato a buon fine.
+    const COLS = "id,code,name,description,category,compatibility,thumb_url";
+    let { data, error } = await supabase
+      .from("parts").select(`${COLS},folder`).eq("id", id).single();
+    if (error) {
+      console.error("getPart senza folder:", error.message, error.code);
+      ({ data, error } = await supabase
+        .from("parts").select(COLS).eq("id", id).single());
+    }
     if (error) { console.error("getPart:", error.message, error.code); throw error; }
     return {
       id: data.id,
@@ -684,6 +728,7 @@ const cloud = {
       name: data.name || "",
       description: data.description || "",
       category: data.category || "",
+      folder: data.folder || "",     // assente finché folders.sql non è applicato
       compatibility: data.compatibility || [],
       thumbUrl: data.thumb_url || "",
     };
@@ -789,6 +834,7 @@ const cloud = {
       name: part.name.trim(),
       description: part.description || "",
       category: part.category || "",
+      folder: normalizeFolder(part.folder),
       compatibility: part.compatibility || [],
       images,
       thumb_url: images[0]?.thumb || null,
@@ -796,7 +842,7 @@ const cloud = {
       // all'AI, e sta in una colonna sua perché va letta per migliaia di
       // ricambi a ogni scansione — scavarla dal jsonb "images" costerebbe.
       photo_url: images[0]?.ai || null,
-    }]).select("id,code,name,description,category,compatibility,thumb_url,created_at").single();
+    }]).select("id,code,name,description,category,folder,compatibility,thumb_url,created_at").single();
     if (error) throw error;
     return { ...data, thumbUrl: data.thumb_url || "", compatibility: data.compatibility || [] };
   },
@@ -808,12 +854,13 @@ const cloud = {
       name: part.name.trim(),
       description: part.description || "",
       category: part.category || "",
+      folder: normalizeFolder(part.folder),
       compatibility: part.compatibility || [],
       images,
       thumb_url: images[0]?.thumb || null,
       photo_url: images[0]?.ai || null,
       image_base64: null,      // migrato: il vecchio formato non serve più
-    }).eq("id", id).select("id,code,name,description,category,compatibility,thumb_url,created_at").single();
+    }).eq("id", id).select("id,code,name,description,category,folder,compatibility,thumb_url,created_at").single();
     if (error) throw error;
     return { ...data, thumbUrl: data.thumb_url || "", compatibility: data.compatibility || [] };
   },
@@ -1052,6 +1099,31 @@ function dataUrlToBlob(dataUrl) {
 
 const extOf = (dataUrl) => (String(dataUrl).startsWith("data:image/webp") ? "webp" : "jpg");
 const isStored = (v) => typeof v === "string" && /^https?:\/\//.test(v);
+
+// ── Percorsi delle cartelle ──────────────────────────────────
+// "  /Idraulica// Valvole/ " → "Idraulica/Valvole"
+//
+// Le barre di troppo e gli spazi ai bordi sono l'errore di battitura più
+// probabile in un campo di testo libero, e nell'albero non sarebbero un
+// dettaglio estetico: "Idraulica" e "Idraulica/" diventerebbero due cartelle
+// distinte, con gli stessi ricambi divisi fra le due senza che si capisca
+// perché. Si normalizza in scrittura, una volta sola.
+//
+// Vuoto è una posizione legittima: il ricambio sta nella radice del suo
+// macchinario. Viene salvato come stringa vuota e non come null — è ciò che
+// impedisce all'SQL di riempimento iniziale di rimetterlo in una cartella se
+// venisse rieseguito per sbaglio.
+const MAX_FOLDER_CHARS = 200;
+const normalizeFolder = (v) =>
+  String(v ?? "")
+    .split("/")
+    .map(s => s.trim())
+    .filter(Boolean)
+    .join("/")
+    .slice(0, MAX_FOLDER_CHARS);
+
+// I singoli livelli di un percorso, per le briciole di pane.
+const folderSegments = (path) => (normalizeFolder(path) ? normalizeFolder(path).split("/") : []);
 
 // Normalizza le generazioni di dati che si sono succedute. I ricambi più
 // vecchi hanno un array di stringhe base64, poi sono arrivate le coppie di
@@ -1954,6 +2026,42 @@ function ScanScreen({ partsCount, onAddHistory, reloadParts, loadError, onFeedba
   );
 }
 
+// ===================== BRICIOLE DI PANE =====================
+// Dove sono e come risalire. Ogni pezzo è toccabile: tornare su di tre
+// livelli non deve costare tre tocchi su un tasto "indietro" — su un telefono
+// tenuto con una mano sola quella differenza si sente.
+//
+// La usano sia il tecnico sia l'amministratore: la navigazione è la stessa,
+// cambia solo cosa si può fare una volta arrivati.
+function FolderBreadcrumb({ machine, path, onMachine, onPath, rootLabel }) {
+  const steps = [
+    { key: "root", label: rootLabel, go: () => { onMachine(null); onPath([]); } },
+    ...(machine ? [{ key: "machine", label: `🗂️ ${machine}`, go: () => onPath([]) }] : []),
+    ...path.map((seg, i) => ({ key: `s${i}`, label: seg, go: () => onPath(path.slice(0, i + 1)) })),
+  ];
+
+  return (
+    <div style={{ display: "flex", flexWrap: "wrap", gap: 4, alignItems: "center", marginBottom: 12 }}>
+      {steps.map((s, i) => {
+        const last = i === steps.length - 1;
+        return (
+          <span key={s.key} style={{ display: "inline-flex", alignItems: "center", gap: 4, minWidth: 0 }}>
+            {i > 0 && <span style={{ color: T.textLight, fontSize: 13 }}>›</span>}
+            <button onClick={s.go} className="tap-sc" style={{
+              background: last ? T.blue : T.bluePale,
+              color: last ? "white" : T.blue,
+              border: `1px solid ${T.blue}33`,
+              borderRadius: 10, padding: "6px 10px",
+              fontSize: 13, fontWeight: 600,
+              maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+            }}>{s.label}</button>
+          </span>
+        );
+      })}
+    </div>
+  );
+}
+
 // ===================== CATALOG =====================
 function CatalogScreen({ partsCount }) {
   const { t } = useT();
@@ -1961,6 +2069,8 @@ function CatalogScreen({ partsCount }) {
   const [selected, setSelected] = useState(null);
   const [machine, setMachine] = useState(null);
   const [machines, setMachines] = useState(null);   // null = non ancora caricati
+  const [path, setPath] = useState([]);             // cartella aperta, un segmento per livello
+  const [folders, setFolders] = useState([]);
   const [results, setResults] = useState([]);
   const [loading, setLoading] = useState(false);
   const [failed, setFailed]   = useState(false);
@@ -1970,31 +2080,50 @@ function CatalogScreen({ partsCount }) {
   // Le foto si scaricano solo dopo un gesto esplicito: aprire la cartella di
   // un macchinario, oppure cercare. La schermata iniziale è solo testo.
   const browsing = searching || !!machine;
+  const folderPath = path.join("/");
 
-  // Livello 1: le cartelle. Solo nomi e conteggi, nessuna immagine.
+  // Livello 1: i macchinari. Solo nomi e conteggi, nessuna immagine.
   useEffect(() => {
     let alive = true;
     cloud.listMachines().then(m => { if (alive) setMachines(m); });
     return () => { alive = false; };
   }, []);
 
-  // Livello 2: i ricambi, del macchinario aperto o della ricerca.
+  // Cambiare macchinario riparte dalla radice: restare a metà dell'albero
+  // precedente mostrerebbe una cartella che in questo macchinario non esiste.
+  useEffect(() => { setPath([]); }, [machine]);
+
+  // Livello 2: le sottocartelle di dove ci si trova. Durante una ricerca non
+  // si mostrano: i risultati arrivano da tutto il sottoalbero, e disegnare
+  // sopra di loro delle cartelle da aprire suggerirebbe il contrario.
+  useEffect(() => {
+    if (!browsing || searching) { setFolders([]); return; }
+    let alive = true;
+    cloud.listFolders(machine, folderPath).then(f => { if (alive) setFolders(f); });
+    return () => { alive = false; };
+  }, [machine, folderPath, browsing, searching]);
+
+  // Livello 3: i ricambi. Sfogliando sono quelli che stanno esattamente qui;
+  // cercando sono quelli di tutto il sottoalbero (lo decide search_parts).
   useEffect(() => {
     if (!browsing) { setResults([]); return; }
     let alive = true;
     setLoading(true);
     setFailed(false);
-    cloud.searchParts(q, machine, CATALOG_MAX_ROWS)
+    cloud.searchParts(q, machine, folderPath, CATALOG_MAX_ROWS)
       .then(r => { if (alive) setResults(r); })
       .catch(() => { if (alive) { setResults([]); setFailed(true); } })
       .finally(() => { if (alive) setLoading(false); });
     return () => { alive = false; };
-  }, [q, machine, browsing]);
+  }, [q, machine, folderPath, browsing]);
 
   if (selected) return <PartDetail part={selected} onBack={() => setSelected(null)} />;
 
   const visible = results;
   const atLimit = results.length >= CATALOG_MAX_ROWS;
+  // Un livello vuoto è diverso da una ricerca senza risultati: qui non c'è
+  // né una cartella da aprire né un ricambio da vedere.
+  const nothingHere = folders.length === 0 && results.length === 0;
 
   return (
     <div style={{ padding: 16 }}>
@@ -2003,11 +2132,13 @@ function CatalogScreen({ partsCount }) {
       </h2>
 
       {machine && (
-        <button onClick={() => { setMachine(null); setSearch(""); }} className="tap-sc" style={{
-          background: T.bluePale, border: `1px solid ${T.blue}33`, color: T.blue,
-          borderRadius: 12, padding: "8px 14px", fontSize: 14, fontWeight: 600,
-          marginBottom: 12, display: "flex", alignItems: "center", gap: 8
-        }}>← 🗂️ {machine}</button>
+        <FolderBreadcrumb
+          machine={machine}
+          path={path}
+          rootLabel={`← ${t("cat.root")}`}
+          onMachine={(m) => { setMachine(m); setSearch(""); }}
+          onPath={setPath}
+        />
       )}
 
       <div style={{ position: "relative", marginBottom: 16 }}>
@@ -2076,15 +2207,40 @@ function CatalogScreen({ partsCount }) {
           background: "#FEF2F2", border: "1px solid #FECACA", borderRadius: 14,
           padding: "12px 14px", color: T.error, fontSize: 13, lineHeight: 1.5
         }}>⚠️ {t("error.dbUnreachable")}</div>
-      ) : results.length === 0 ? (
+      ) : nothingHere ? (
         <div style={{ textAlign: "center", padding: "40px 0" }}>
           <div style={{ fontSize: 40, marginBottom: 10 }}>🔍</div>
           <p style={{ color: T.text, fontWeight: 700 }}>
-            {searching ? t("cat.noResults", { q: search }) : t("cat.emptyMachine")}
+            {searching ? t("cat.noResults", { q: search })
+              : path.length ? t("cat.emptyFolder")
+              : t("cat.emptyMachine")}
           </p>
         </div>
       ) : (
         <>
+        {/* Prima le cartelle, poi i ricambi sfusi di questo livello: è
+            l'ordine di qualunque gestore di file, e non va spiegato. */}
+        {!searching && folders.map((f, i) => (
+          <div key={f.folder} onClick={() => setPath([...path, f.folder])} className="fade-in tap-sc" style={{
+            background: T.card, borderRadius: 16, marginBottom: 10,
+            border: `1px solid ${T.border}`, padding: 14, cursor: "pointer",
+            display: "flex", gap: 12, alignItems: "center",
+            boxShadow: T.shadow, animationDelay: `${i * 0.03}s`
+          }}>
+            <div style={{
+              width: 44, height: 44, borderRadius: 12, flexShrink: 0, background: T.orangePale,
+              display: "flex", alignItems: "center", justifyContent: "center", fontSize: 22
+            }}>📁</div>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontWeight: 700, color: T.text, fontSize: 15.5 }}>{f.folder}</div>
+              <div style={{ color: T.textLight, fontSize: 12.5, marginTop: 2 }}>
+                {t("cat.folderParts", { n: f.parts })}
+                {f.hasChildren ? ` · ${t("cat.hasSubfolders")}` : ""}
+              </div>
+            </div>
+            <span style={{ color: T.textLight, fontSize: 18 }}>›</span>
+          </div>
+        ))}
         {visible.map((part, i) => (
           <div key={part.id} onClick={() => setSelected(part)} className="fade-in tap-sc" style={{
             background: T.card, borderRadius: 16, marginBottom: 10,
@@ -2167,6 +2323,16 @@ function PartDetail({ part: light, onBack }) {
                 <span style={{ color: T.orange, fontSize: 13, fontWeight: 600 }}>{part.category}</span>
               </div>
             )}
+            {/* Dove sta il pezzo nel catalogo. Serve a chi ci è arrivato da una
+                ricerca o da una scansione, e quindi non ha attraversato l'albero. */}
+            {part.folder && (
+              <div style={{ display: "inline-flex", alignItems: "center", gap: 6, background: T.bg, border: `1px solid ${T.border}`, borderRadius: 10, padding: "8px 12px" }}>
+                <span style={{ fontSize: 13 }}>📁</span>
+                <span style={{ color: T.textMid, fontSize: 13, fontWeight: 600 }}>
+                  {folderSegments(part.folder).join(" › ")}
+                </span>
+              </div>
+            )}
           </div>
           <h2 style={{ fontSize: 22, fontWeight: 800, color: T.text, marginBottom: 10, lineHeight: 1.2 }}>{part.name}</h2>
           {part.description && <p style={{ fontSize: 15, color: T.textMid, lineHeight: 1.6, marginBottom: 18 }}>{part.description}</p>}
@@ -2231,7 +2397,7 @@ function ResultCard({ result, onReset, onFeedback }) {
   useEffect(() => {
     if (!sq) { setSearchResults([]); return; }
     let alive = true;
-    cloud.searchParts(sq, null, 6)
+    cloud.searchParts(sq, null, null, 6)   // nessun macchinario, nessuna cartella
       .then(r => { if (alive) setSearchResults(r); })
       .catch(() => { if (alive) setSearchResults([]); });
     return () => { alive = false; };
@@ -2682,6 +2848,8 @@ function PartsListScreen({ partsCount, version, onRefresh, onEdit, onAdd, onDele
   const [loading, setLoading] = useState(true);
   const [machine, setMachine] = useState("");
   const [machines, setMachines] = useState([]);
+  const [path, setPath] = useState([]);
+  const [folders, setFolders] = useState([]);
 
   // Stessa ricerca lato server e stesse regole sulle immagini della schermata
   // tecnico: l'area amministratore non è esente dal risparmio, ci si passa
@@ -2689,7 +2857,10 @@ function PartsListScreen({ partsCount, version, onRefresh, onEdit, onAdd, onDele
   // fa ripartire la query.
   const q = useDebounced(search.trim());
   const searching = q.length > 0;
-  const browsing = searching || !!machine;
+  const folderPath = path.join("/");
+  // Anche una cartella aperta conta come navigazione: senza, entrando in una
+  // cartella dalla radice si vedrebbero solo le prime righe senza foto.
+  const browsing = searching || !!machine || path.length > 0;
 
   useEffect(() => {
     let alive = true;
@@ -2697,15 +2868,27 @@ function PartsListScreen({ partsCount, version, onRefresh, onEdit, onAdd, onDele
     return () => { alive = false; };
   }, [version]);
 
+  useEffect(() => { setPath([]); }, [machine]);
+
+  // Le cartelle di questo livello. A differenza del tecnico, qui si vedono
+  // anche senza aver scelto un macchinario: l'amministratore riordina il
+  // catalogo, e non sempre lo fa una macchina alla volta.
+  useEffect(() => {
+    if (searching) { setFolders([]); return; }
+    let alive = true;
+    cloud.listFolders(machine, folderPath).then(f => { if (alive) setFolders(f); });
+    return () => { alive = false; };
+  }, [machine, folderPath, searching, version]);
+
   useEffect(() => {
     let alive = true;
     setLoading(true);
-    cloud.searchParts(q, machine, browsing ? CATALOG_MAX_ROWS : CATALOG_PREVIEW_ROWS)
+    cloud.searchParts(q, machine, folderPath, browsing ? CATALOG_MAX_ROWS : CATALOG_PREVIEW_ROWS)
       .then(r => { if (alive) setFiltered(r); })
       .catch(() => { if (alive) setFiltered([]); })
       .finally(() => { if (alive) setLoading(false); });
     return () => { alive = false; };
-  }, [q, machine, browsing, version]);
+  }, [q, machine, folderPath, browsing, version]);
 
   async function deletePart(id) {
     setActionError("");
@@ -2789,21 +2972,61 @@ function PartsListScreen({ partsCount, version, onRefresh, onEdit, onAdd, onDele
         />
       </div>
 
+      {(machine || path.length > 0) && (
+        <FolderBreadcrumb
+          machine={machine}
+          path={path}
+          rootLabel="← Tutto"
+          onMachine={(m) => setMachine(m || "")}
+          onPath={setPath}
+        />
+      )}
+
       {!browsing && filtered.length > 0 && (
         <p style={{ color: T.textLight, fontSize: 12.5, marginBottom: 12, lineHeight: 1.5 }}>
-          Solo i più recenti, senza foto. Cerca o scegli un macchinario per vedere le immagini.
+          Solo i più recenti, senza foto. Apri una cartella, cerca o scegli un macchinario per vedere le immagini.
         </p>
       )}
+
+      {/* Le cartelle stanno fuori dal ramo di caricamento dei ricambi: sono
+          due interrogazioni diverse, e far sparire l'albero mentre si carica
+          l'elenco farebbe lampeggiare la schermata a ogni tocco. */}
+      {!searching && folders.map((f, i) => (
+        <div key={f.folder} onClick={() => setPath([...path, f.folder])} className="fade-in tap-sc" style={{
+          background: T.card, borderRadius: 16, marginBottom: 10,
+          border: `1px solid ${T.border}`, padding: 14, cursor: "pointer",
+          display: "flex", gap: 12, alignItems: "center",
+          boxShadow: T.shadow, animationDelay: `${i * 0.03}s`
+        }}>
+          <div style={{
+            width: 44, height: 44, borderRadius: 12, flexShrink: 0, background: T.orangePale,
+            display: "flex", alignItems: "center", justifyContent: "center", fontSize: 22
+          }}>📁</div>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontWeight: 700, color: T.text, fontSize: 15.5 }}>{f.folder}</div>
+            <div style={{ color: T.textLight, fontSize: 12.5, marginTop: 2 }}>
+              {f.parts} ricambi in tutto{f.hasChildren ? " · contiene altre cartelle" : ""}
+            </div>
+          </div>
+          <span style={{ color: T.textLight, fontSize: 18 }}>›</span>
+        </div>
+      ))}
 
       {loading ? (
         <div style={{ display: "flex", justifyContent: "center", padding: "48px 0" }}>
           <Spinner size={30} />
         </div>
-      ) : filtered.length === 0 ? (
+      ) : filtered.length === 0 && folders.length === 0 ? (
         <div style={{ textAlign: "center", padding: "40px 16px" }}>
           <div style={{ fontSize: 40, marginBottom: 10 }}>📦</div>
-          <p style={{ color: T.text, fontWeight: 700 }}>{partsCount === 0 ? "Database vuoto" : "Nessun risultato"}</p>
-          <p style={{ color: T.textLight, fontSize: 14, marginTop: 4 }}>{partsCount === 0 ? "Aggiungi il primo ricambio" : "Prova un altro termine"}</p>
+          <p style={{ color: T.text, fontWeight: 700 }}>
+            {partsCount === 0 ? "Database vuoto" : (!searching && path.length) ? "Cartella vuota" : "Nessun risultato"}
+          </p>
+          <p style={{ color: T.textLight, fontSize: 14, marginTop: 4 }}>
+            {partsCount === 0 ? "Aggiungi il primo ricambio"
+              : (!searching && path.length) ? "Nessun ricambio è assegnato a questa cartella"
+              : "Prova un altro termine"}
+          </p>
           {partsCount === 0 && (
             <button onClick={onAdd} className="tap-sc" style={{
               marginTop: 18, padding: "12px 24px", borderRadius: 14,
@@ -2856,10 +3079,18 @@ function PartsListScreen({ partsCount, version, onRefresh, onEdit, onAdd, onDele
 function AddEditPartScreen({ editingPart, onAddPart, onUpdatePart, onDone }) {
   const isEdit = !!editingPart;
   const [form, setForm] = useState(editingPart
-    ? { ...editingPart, images: [] }
-    : { code: "", name: "", description: "", category: "", compatibility: [], images: [] }
+    ? { folder: "", ...editingPart, images: [] }
+    : { code: "", name: "", description: "", category: "", folder: "", compatibility: [], images: [] }
   );
   const [galleryLoading, setGalleryLoading] = useState(!!editingPart);
+  // I percorsi già in uso, suggeriti mentre si scrive. Se la chiamata
+  // fallisce si resta senza suggerimenti: il campo è testo libero comunque.
+  const [folderHints, setFolderHints] = useState([]);
+  useEffect(() => {
+    let alive = true;
+    cloud.listAllFolders().then(f => { if (alive) setFolderHints(f); });
+    return () => { alive = false; };
+  }, []);
 
   // In modifica la galleria non arriva con la lista: va richiesta a parte.
   useEffect(() => {
@@ -3070,6 +3301,36 @@ function AddEditPartScreen({ editingPart, onAddPart, onUpdatePart, onDone }) {
         />
       </div>
 
+      {/* Categoria e cartella dicono due cose diverse e non vanno fuse:
+          la categoria è CHE COSA è il pezzo e resta scritta sulla scheda,
+          la cartella è DOVE sta nel catalogo. All'inizio coincidono, perché
+          l'SQL ha riempito la seconda con la prima. */}
+      <div style={{ marginBottom: 14 }}>
+        <label style={{ display: "block", fontSize: 13, fontWeight: 600, color: T.textMid, marginBottom: 6 }}>Cartella nel catalogo</label>
+        <input
+          value={form.folder || ""}
+          onChange={e => field("folder", e.target.value)}
+          list="folder-suggestions"
+          placeholder="es. Idraulica/Valvole/Sicurezza"
+          style={inp("folder")}
+        />
+        <datalist id="folder-suggestions">
+          {folderHints.map(f => <option key={f} value={f} />)}
+        </datalist>
+        <p style={{ color: T.textLight, fontSize: 11, marginTop: 6, lineHeight: 1.5 }}>
+          Usa la <strong>/</strong> per le sottocartelle. Lasciala vuota e il ricambio
+          resta in cima al macchinario. Le cartelle non si creano da nessuna parte:
+          esistono finché un ricambio le nomina.
+        </p>
+        {/* Si mostra come verrà salvata davvero: barre doppie e spazi ai bordi
+            spariscono, e vederlo subito evita di scoprirlo nell'albero. */}
+        {normalizeFolder(form.folder) !== (form.folder || "").trim() && (
+          <p style={{ color: T.blue, fontSize: 11.5, marginTop: 4 }}>
+            Verrà salvata come: <strong>{normalizeFolder(form.folder) || "(nessuna cartella)"}</strong>
+          </p>
+        )}
+      </div>
+
       <div style={{ marginBottom: 16 }}>
         <label style={{ display: "block", fontSize: 13, fontWeight: 600, color: T.textMid, marginBottom: 6 }}>Descrizione tecnica</label>
         <textarea value={form.description} onChange={e => field("description", e.target.value)}
@@ -3078,7 +3339,9 @@ function AddEditPartScreen({ editingPart, onAddPart, onUpdatePart, onDone }) {
           style={{ ...inp("description"), lineHeight: 1.5, paddingTop: 12 }}
         />
         <p style={{ color: T.textLight, fontSize: 11, marginTop: 6, lineHeight: 1.5 }}>
-          💡 L'AI confronta la foto scattata con <strong>questa descrizione</strong>, non con la foto qui sopra.
+          💡 L'AI confronta la foto scattata con <strong>questa descrizione</strong> e con la
+          foto di copertina qui sopra. La descrizione pesa di più: la foto è uno scatto solo,
+          con la sua luce, mentre il tecnico fotografa in officina.
           Descrivi forma, colore, materiale, dimensioni indicative e marcature visibili.
         </p>
       </div>
