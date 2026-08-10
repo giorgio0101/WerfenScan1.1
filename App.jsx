@@ -2206,20 +2206,29 @@ function CatalogScreen({ partsCount }) {
     return () => { alive = false; };
   }, [machine, folderPath, browsing, searching]);
 
-  // Livello 3: i ricambi di qui e di tutte le sottocartelle. Le cartelle
-  // restringono, non nascondono: scendendo l'elenco si accorcia, ma non
-  // esiste un livello che mostri solo nomi di cartelle e nessuna fotografia.
+  // Livello 3: i ricambi che stanno ESATTAMENTE qui. Quelli delle
+  // sottocartelle si vedono entrandoci — si scende finché non si arriva ai
+  // pezzi, e ogni schermata mostra una cosa sola: o dove andare, o cosa c'è.
+  //
+  // Cercando è diverso: search_parts allarga a tutto il sottoalbero, perché
+  // scrivere una parola dentro una cartella e non trovare ciò che sta due
+  // livelli sotto sarebbe la cosa più frustrante possibile.
+  //
+  // Appena entrati in un macchinario la cartella è vuota: lì "esattamente
+  // qui" vuol dire i ricambi che non stanno in nessuna cartella.
+  const rootOnly = !searching && path.length === 0;
+
   useEffect(() => {
     if (!browsing) { setResults([]); return; }
     let alive = true;
     setLoading(true);
     setFailed(false);
-    cloud.searchParts(q, machine, folderPath, CATALOG_MAX_ROWS)
+    cloud.searchParts(q, machine, folderPath, CATALOG_MAX_ROWS, rootOnly)
       .then(r => { if (alive) setResults(r); })
       .catch(() => { if (alive) { setResults([]); setFailed(true); } })
       .finally(() => { if (alive) setLoading(false); });
     return () => { alive = false; };
-  }, [q, machine, folderPath, browsing]);
+  }, [q, machine, folderPath, browsing, rootOnly]);
 
   if (selected) return <PartDetail part={selected} onBack={() => setSelected(null)} />;
 
@@ -2322,8 +2331,9 @@ function CatalogScreen({ partsCount }) {
         </div>
       ) : (
         <>
-        {/* Prima le cartelle — le scorciatoie per restringere — poi i ricambi
-            di tutto quello che sta sotto, foto comprese. */}
+        {/* Prima dove si può scendere, poi cosa c'è a questo livello. Nella
+            maggior parte delle schermate una delle due parti è vuota, ed è
+            giusto così: o si sceglie una strada, o si guardano i pezzi. */}
         {!searching && folders.map((f, i) => (
           <div key={f.folder} onClick={() => setPath([...path, f.folder])} className="fade-in tap-sc" style={{
             background: T.card, borderRadius: 16, marginBottom: 10,
@@ -2993,7 +3003,8 @@ function PartsListScreen({ partsCount, version, onRefresh, onEdit, onAdd, onDele
     return () => { alive = false; };
   }, [machine, folderPath, searching, version, folderVersion]);
 
-  // Fuori da ogni cartella si mostrano solo i ricambi che non ne hanno una:
+  // Ogni livello mostra solo ciò che sta esattamente lì, come per il tecnico.
+  // Alla radice questo vuol dire i ricambi che non hanno nessuna cartella:
   // quelli da sistemare. È anche ciò che tiene la schermata d'ingresso senza
   // immagini — caricare le miniature dell'intero catalogo per poi scendere
   // subito in una cartella sarebbe traffico buttato.
