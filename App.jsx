@@ -699,6 +699,16 @@ const cloud = {
     return data ?? 0;
   },
 
+  // Spostare un singolo ricambio è solo un cambio di campo: non passa da
+  // rename_folder, che riscrive interi rami. Le policy su "parts" fanno da
+  // guardia — un tecnico che ci provasse aggiornerebbe zero righe.
+  async movePart(id, folder) {
+    const { error } = await supabase.from("parts")
+      .update({ folder: normalizeFolder(folder) })
+      .eq("id", id);
+    if (error) { console.error("movePart:", error.message, error.code); throw error; }
+  },
+
   async deleteFolder(path) {
     const segments = folderSegments(path);
     if (!segments.length) return 0;
@@ -1366,6 +1376,100 @@ function PromptDialog({ title, hint, placeholder, confirmLabel, onConfirm, onCan
             color: "white", fontSize: 15, fontWeight: 700,
             cursor: clean ? "pointer" : "default"
           }}>{confirmLabel}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ===================== SCEGLI UNA CARTELLA =====================
+// Si naviga come il catalogo, un livello alla volta, e si conferma dove si
+// è arrivati. Un elenco piatto di tutti i percorsi sarebbe stato più veloce
+// da scrivere e inservibile: con un albero vero diventa un muro di righe
+// quasi identiche, e su un telefono non si legge.
+//
+// excludePath serve a spostare una CARTELLA: non la si può mettere dentro
+// se stessa. Il ramo escluso sparisce dall'elenco, quindi non c'è modo di
+// entrarci e trovarsi in un vicolo cieco con un pulsante disattivato.
+function FolderPickerDialog({ title, hint, rootLabel, excludePath = "", onPick, onCancel }) {
+  const [path, setPath] = useState([]);
+  const [folders, setFolders] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const here = path.join("/");
+  const excluded = normalizeFolder(excludePath);
+
+  useEffect(() => {
+    let alive = true;
+    setLoading(true);
+    cloud.listFolders(null, here, true)
+      .then(f => { if (alive) setFolders(f); })
+      .finally(() => { if (alive) setLoading(false); });
+    return () => { alive = false; };
+  }, [here]);
+
+  const visible = folders.filter(f => {
+    if (!excluded) return true;
+    const full = here ? `${here}/${f.folder}` : f.folder;
+    return full !== excluded && !full.startsWith(`${excluded}/`);
+  });
+
+  return (
+    <div style={{
+      position: "fixed", inset: 0, background: "rgba(4,2,107,0.45)",
+      display: "flex", alignItems: "center", justifyContent: "center",
+      zIndex: 9999, padding: 20, animation: "fadeIn 0.2s ease"
+    }}>
+      <div style={{
+        background: T.card, borderRadius: 20, padding: 20,
+        maxWidth: 380, width: "100%", maxHeight: "80vh",
+        display: "flex", flexDirection: "column",
+        boxShadow: T.shadowLg, animation: "fadeUp 0.2s ease"
+      }}>
+        <p style={{ color: T.text, fontSize: 16, fontWeight: 700, marginBottom: 4 }}>{title}</p>
+        {hint && <p style={{ color: T.textLight, fontSize: 12.5, lineHeight: 1.5, marginBottom: 12 }}>{hint}</p>}
+
+        <FolderBreadcrumb
+          machine={null}
+          path={path}
+          rootLabel={rootLabel}
+          onMachine={() => setPath([])}
+          onPath={setPath}
+        />
+
+        <div style={{ flex: 1, overflowY: "auto", marginBottom: 14, minHeight: 80 }}>
+          {loading ? (
+            <div style={{ display: "flex", justifyContent: "center", padding: "24px 0" }}><Spinner size={24} /></div>
+          ) : visible.length === 0 ? (
+            <p style={{ color: T.textLight, fontSize: 13, textAlign: "center", padding: "24px 0" }}>
+              Nessuna sottocartella qui dentro.
+            </p>
+          ) : visible.map(f => (
+            <div key={f.folder} onClick={() => setPath([...path, f.folder])} className="tap-sc" style={{
+              display: "flex", alignItems: "center", gap: 10, cursor: "pointer",
+              padding: "11px 12px", borderRadius: 12, marginBottom: 6,
+              background: T.bg, border: `1px solid ${T.border}`
+            }}>
+              <span style={{ fontSize: 18 }}>📁</span>
+              <span style={{ flex: 1, minWidth: 0, color: T.text, fontSize: 14.5, fontWeight: 600 }}>{f.folder}</span>
+              <span style={{ color: T.textLight, fontSize: 12 }}>{f.parts || ""}</span>
+              <span style={{ color: T.textLight, fontSize: 16 }}>›</span>
+            </div>
+          ))}
+        </div>
+
+        <div style={{ display: "flex", gap: 10 }}>
+          <button onClick={onCancel} style={{
+            flex: 1, padding: 12, borderRadius: 12,
+            background: T.bg, color: T.textMid, fontSize: 15, fontWeight: 600,
+            border: `1px solid ${T.border}`
+          }}>Annulla</button>
+          <button onClick={() => onPick(here)} className="tap-sc" style={{
+            flex: 2, padding: 12, borderRadius: 12,
+            background: T.blue, color: "white", fontSize: 15, fontWeight: 700,
+            overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap"
+          }}>
+            {here ? `Metti in "${path[path.length - 1]}"` : "Metti al primo livello"}
+          </button>
         </div>
       </div>
     </div>
@@ -2980,6 +3084,9 @@ function PartsListScreen({ partsCount, version, onRefresh, onEdit, onAdd, onDele
   const [folders, setFolders] = useState([]);
   const [newFolder, setNewFolder] = useState(false);       // dialogo di creazione aperto
   const [confirmFolder, setConfirmFolder] = useState(null); // cartella in attesa di conferma
+  const [movingFolder, setMovingFolder] = useState(null);   // cartella da spostare altrove
+  const [partMenu, setPartMenu] = useState(null);           // ricambio col menu ⋯ aperto
+  const [movingPart, setMovingPart] = useState(null);       // ricambio da spostare
   const [folderVersion, setFolderVersion] = useState(0);    // ricarica l'albero dopo una modifica
 
   // Stessa ricerca lato server e stesse regole sulle immagini della schermata
@@ -3037,6 +3144,40 @@ function PartsListScreen({ partsCount, version, onRefresh, onEdit, onAdd, onDele
       setFolderVersion(v => v + 1);
     } catch (e) {
       setActionError(`Impossibile creare la cartella: ${e.message || "controlla la connessione"}. La creazione è consentita solo all'account amministratore.`);
+    }
+  }
+
+  // Spostare una cartella: la destinazione scelta diventa il suo nuovo
+  // genitore, il nome resta. "Idraulica/Valvole" messa in "Fluidi" diventa
+  // "Fluidi/Valvole", e tutto quello che c'era dentro la segue.
+  async function moveFolder(destination) {
+    const f = movingFolder;
+    setMovingFolder(null);
+    setActionError("");
+    if (!f) return;
+    const from = [...path, f.folder].join("/");
+    const to   = destination ? `${destination}/${f.folder}` : f.folder;
+    if (from === to) return;
+    try {
+      await cloud.renameFolder(from, to);
+      setFolderVersion(v => v + 1);
+      onRefresh();
+    } catch (e) {
+      setActionError(`Impossibile spostare la cartella: ${e.message || "controlla la connessione"}.`);
+    }
+  }
+
+  async function movePartTo(destination) {
+    const p = movingPart;
+    setMovingPart(null);
+    setActionError("");
+    if (!p) return;
+    try {
+      await cloud.movePart(p.id, destination);
+      setFolderVersion(v => v + 1);
+      onRefresh();
+    } catch (e) {
+      setActionError(`Impossibile spostare il ricambio: ${e.message || "controlla la connessione"}. L'operazione è consentita solo all'account amministratore.`);
     }
   }
 
@@ -3104,6 +3245,68 @@ function PartsListScreen({ partsCount, version, onRefresh, onEdit, onAdd, onDele
           }
           onConfirm={() => removeFolder(confirmFolder)}
           onCancel={() => setConfirmFolder(null)}
+        />
+      )}
+
+      {movingFolder && (
+        <FolderPickerDialog
+          title={`Sposta "${movingFolder.folder}"`}
+          hint={"Scegli la cartella che la conterrà. Quello che c'è dentro la segue, ricambi e sottocartelle."}
+          rootLabel="🏠 Primo livello"
+          excludePath={[...path, movingFolder.folder].join("/")}
+          onPick={moveFolder}
+          onCancel={() => setMovingFolder(null)}
+        />
+      )}
+
+      {/* Il menu ⋯ del ricambio. Oggi ha una voce sola, ed è il posto giusto
+          dove metterne altre: fuori dal form di modifica, che serve a
+          cambiare cosa È il pezzo, non dove sta. */}
+      {partMenu && (
+        <div
+          onClick={() => setPartMenu(null)}
+          style={{
+            position: "fixed", inset: 0, background: "rgba(4,2,107,0.45)",
+            display: "flex", alignItems: "center", justifyContent: "center",
+            zIndex: 9999, padding: 24, animation: "fadeIn 0.2s ease"
+          }}>
+          <div onClick={e => e.stopPropagation()} style={{
+            background: T.card, borderRadius: 20, padding: 20,
+            maxWidth: 340, width: "100%", boxShadow: T.shadowLg,
+            animation: "fadeUp 0.2s ease"
+          }}>
+            <p className="wrap-anywhere" style={{ color: T.text, fontSize: 15.5, fontWeight: 700 }}>
+              {partMenu.name}
+            </p>
+            <p style={{ color: T.textLight, fontSize: 12.5, marginTop: 4, marginBottom: 16, lineHeight: 1.5 }}>
+              {partMenu.folder
+                ? <>Ora in: <strong>{folderSegments(partMenu.folder).join(" › ")}</strong></>
+                : "Ora non è in nessuna cartella"}
+            </p>
+            <button
+              onClick={() => { setMovingPart(partMenu); setPartMenu(null); }}
+              className="tap-sc"
+              style={{
+                width: "100%", padding: 13, borderRadius: 12, marginBottom: 10,
+                background: T.bluePale, color: T.blue, fontSize: 15, fontWeight: 700,
+                border: `1px solid ${T.blue}33`, textAlign: "left", paddingLeft: 16
+              }}>📁 Sposta in…</button>
+            <button onClick={() => setPartMenu(null)} style={{
+              width: "100%", padding: 12, borderRadius: 12,
+              background: T.bg, color: T.textMid, fontSize: 15, fontWeight: 600,
+              border: `1px solid ${T.border}`
+            }}>Annulla</button>
+          </div>
+        </div>
+      )}
+
+      {movingPart && (
+        <FolderPickerDialog
+          title={`Sposta "${movingPart.name}"`}
+          hint="Scegli dove metterlo. Puoi scendere nelle sottocartelle prima di confermare."
+          rootLabel="🏠 Nessuna cartella"
+          onPick={movePartTo}
+          onCancel={() => setMovingPart(null)}
         />
       )}
 
@@ -3216,19 +3419,26 @@ function PartsListScreen({ partsCount, version, onRefresh, onEdit, onAdd, onDele
                 : `${f.parts} ricambi in tutto`}{f.hasChildren ? " · contiene altre cartelle" : ""}
             </div>
           </div>
-          {/* Si può togliere qualunque cartella, piena o vuota. Il contenuto
-              non si perde: sale di un livello. Limitarlo alle cartelle vuote
-              voleva dire non poter più disfare niente. */}
-          {(
-            <button
-              onClick={(e) => { e.stopPropagation(); setConfirmFolder(f); }}
-              aria-label={`Elimina la cartella ${f.folder}`}
-              style={{
-                width: 30, height: 30, borderRadius: 9, flexShrink: 0,
-                background: "#FEF2F2", color: T.error, fontSize: 15, fontWeight: 700,
-                border: "1px solid #FECACA", lineHeight: 1, padding: 0
-              }}>×</button>
-          )}
+          {/* Spostare ed eliminare valgono per qualunque cartella, piena o
+              vuota: il contenuto non si perde mai, cambia solo posto.
+              Limitarlo alle cartelle vuote voleva dire non poter disfare
+              niente. stopPropagation, o il tocco aprirebbe la cartella. */}
+          <button
+            onClick={(e) => { e.stopPropagation(); setMovingFolder(f); }}
+            aria-label={`Sposta la cartella ${f.folder}`}
+            style={{
+              width: 30, height: 30, borderRadius: 9, flexShrink: 0,
+              background: T.bluePale, color: T.blue, fontSize: 14, fontWeight: 700,
+              border: `1px solid ${T.blue}33`, lineHeight: 1, padding: 0
+            }}>⇄</button>
+          <button
+            onClick={(e) => { e.stopPropagation(); setConfirmFolder(f); }}
+            aria-label={`Elimina la cartella ${f.folder}`}
+            style={{
+              width: 30, height: 30, borderRadius: 9, flexShrink: 0,
+              background: "#FEF2F2", color: T.error, fontSize: 15, fontWeight: 700,
+              border: "1px solid #FECACA", lineHeight: 1, padding: 0
+            }}>×</button>
           <span style={{ color: T.textLight, fontSize: 18 }}>›</span>
         </div>
       ))}
@@ -3295,7 +3505,15 @@ function PartsListScreen({ partsCount, version, onRefresh, onEdit, onAdd, onDele
             </div>
             <div style={{ display: "flex", borderTop: `1px solid ${T.border}` }}>
               <button onClick={() => onEdit(part)} style={{ flex: 1, padding: 11, background: "transparent", color: T.blue, fontSize: 14, fontWeight: 600, borderRight: `1px solid ${T.border}` }}>✏️ Modifica</button>
-              <button onClick={() => setConfirmDelete(part.id)} style={{ flex: 1, padding: 11, background: "transparent", color: T.error, fontSize: 14, fontWeight: 600 }}>🗑️ Elimina</button>
+              <button onClick={() => setConfirmDelete(part.id)} style={{ flex: 1, padding: 11, background: "transparent", color: T.error, fontSize: 14, fontWeight: 600, borderRight: `1px solid ${T.border}` }}>🗑️ Elimina</button>
+              {/* Dove sta un pezzo non è una sua proprietà da riscrivere in un
+                  form insieme al codice e alla descrizione: è un'azione. Per
+                  questo sta qui e non dentro "Modifica". */}
+              <button
+                onClick={() => setPartMenu(part)}
+                aria-label={`Altre azioni per ${part.name}`}
+                style={{ flex: "0 0 58px", padding: 11, background: "transparent", color: T.textMid, fontSize: 17, fontWeight: 700 }}
+              >⋯</button>
             </div>
           </div>
         ))
