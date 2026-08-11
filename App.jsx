@@ -681,22 +681,30 @@ const cloud = {
     return clean;
   },
 
+  // Spostare ed eliminare sono lo stesso gesto: eliminare vuol dire
+  // spostare nella cartella genitore. Restituisce quanti ricambi si sono
+  // mossi — nessuno viene mai cancellato.
+  //
+  // Il lavoro lo fa il database in una transazione sola: farlo da qui
+  // significherebbe tre chiamate che possono fallire a metà, lasciando i
+  // ricambi in una cartella che non esiste più.
+  async renameFolder(fromPath, toPath) {
+    const from = normalizeFolder(fromPath);
+    if (!from) throw new Error("Percorso di partenza mancante.");
+    const { data, error } = await supabase.rpc("rename_folder", {
+      from_path: from,
+      to_path: normalizeFolder(toPath),
+    });
+    if (error) { console.error("renameFolder:", error.message, error.code); throw error; }
+    return data ?? 0;
+  },
+
   async deleteFolder(path) {
-    const clean = normalizeFolder(path);
-    if (!clean) return;
-    // Due chiamate invece di una "or" sola: un nome di cartella può contenere
-    // una virgola, e la virgola è il separatore della sintassi "or" di
-    // PostgREST — un percorso come "Valvole, guarnizioni" la manderebbe in
-    // pezzi in modo silenzioso.
-    //
-    // Anche i rami sotto: cancellare "Idraulica" senza togliere
-    // "Idraulica/Valvole" lascerebbe un figlio orfano che ricrea il genitore.
-    const del = async (query) => {
-      const { error } = await query;
-      if (error) { console.error("deleteFolder:", error.message, error.code); throw error; }
-    };
-    await del(supabase.from("part_folders").delete().eq("path", clean));
-    await del(supabase.from("part_folders").delete().like("path", `${clean}/%`));
+    const segments = folderSegments(path);
+    if (!segments.length) return 0;
+    // Il genitore: togliendo "Idraulica/Valvole" i pezzi restano in
+    // "Idraulica". Togliendo "Idraulica" finiscono senza cartella.
+    return cloud.renameFolder(segments.join("/"), segments.slice(0, -1).join("/"));
   },
 
   // I percorsi già in uso, per suggerirli mentre l'admin scrive. Evita che
@@ -3032,14 +3040,17 @@ function PartsListScreen({ partsCount, version, onRefresh, onEdit, onAdd, onDele
     }
   }
 
-  async function removeFolder(name) {
+  async function removeFolder(f) {
     setConfirmFolder(null);
     setActionError("");
     try {
-      await cloud.deleteFolder([...path, name].join("/"));
+      await cloud.deleteFolder([...path, f.folder].join("/"));
       setFolderVersion(v => v + 1);
+      // I ricambi hanno cambiato cartella: senza questo la lista resterebbe
+      // a mostrare lo stato di un istante fa.
+      onRefresh();
     } catch (e) {
-      setActionError(`Impossibile eliminare la cartella: ${e.message || "controlla la connessione"}.`);
+      setActionError(`Impossibile eliminare la cartella: ${e.message || "controlla la connessione"}. L'operazione è consentita solo all'account amministratore.`);
     }
   }
 
@@ -3080,9 +3091,17 @@ function PartsListScreen({ partsCount, version, onRefresh, onEdit, onAdd, onDele
         />
       )}
 
+      {/* Il messaggio dice esattamente dove finiscono i ricambi. "Elimina"
+          su una cartella piena è il gesto che spaventa di più: se non si
+          legge cosa succede al contenuto, non lo si tocca mai. */}
       {confirmFolder && (
         <ConfirmDialog
-          message={`Eliminare la cartella "${confirmFolder}"? Nessun ricambio viene toccato: la cartella è vuota, sparisce solo dall'elenco.`}
+          message={
+            confirmFolder.parts === 0
+              ? `Eliminare la cartella "${confirmFolder.folder}"? È vuota: sparisce solo dall'elenco, nessun ricambio viene toccato.`
+              : `Eliminare la cartella "${confirmFolder.folder}"? I suoi ${confirmFolder.parts} ricambi NON vengono cancellati: passano a ${path.length ? `"${path[path.length - 1]}"` : "nessuna cartella"}` +
+                (confirmFolder.hasChildren ? ", e le sottocartelle salgono di un livello." : ".")
+          }
           onConfirm={() => removeFolder(confirmFolder)}
           onCancel={() => setConfirmFolder(null)}
         />
@@ -3197,13 +3216,12 @@ function PartsListScreen({ partsCount, version, onRefresh, onEdit, onAdd, onDele
                 : `${f.parts} ricambi in tutto`}{f.hasChildren ? " · contiene altre cartelle" : ""}
             </div>
           </div>
-          {/* Si può togliere solo una cartella vuota. Una che contiene
-              ricambi non sparirebbe comunque — continuerebbe a esistere
-              perché c'è un pezzo che la nomina — e offrire un pulsante che
-              non fa niente è peggio che non offrirlo. */}
-          {f.parts === 0 && !f.hasChildren && (
+          {/* Si può togliere qualunque cartella, piena o vuota. Il contenuto
+              non si perde: sale di un livello. Limitarlo alle cartelle vuote
+              voleva dire non poter più disfare niente. */}
+          {(
             <button
-              onClick={(e) => { e.stopPropagation(); setConfirmFolder(f.folder); }}
+              onClick={(e) => { e.stopPropagation(); setConfirmFolder(f); }}
               aria-label={`Elimina la cartella ${f.folder}`}
               style={{
                 width: 30, height: 30, borderRadius: 9, flexShrink: 0,
