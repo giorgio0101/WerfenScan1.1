@@ -1,4 +1,4 @@
-import { useState, useEffect, createContext, useContext } from "react";
+import { useState, useEffect, useRef, createContext, useContext } from "react";
 import { createClient } from "@supabase/supabase-js";
 
 // ════════════════════════════════════════════════════════════
@@ -231,7 +231,8 @@ const STRINGS = {
     "cat.pickMachine": "Scegli il macchinario su cui stai lavorando. Le foto si caricano solo da qui in poi.",
     "cat.machineParts": "{n} ricambi",
     "cat.root": "Catalogo",
-    "cat.folderParts": "{n} ricambi in tutto",
+    "cat.folderParts": "{n} ricambi",
+    "cat.folderSplit": "{d} qui · {n} in tutto",
     "cat.hasSubfolders": "contiene altre cartelle",
     "cat.emptyFolder": "Cartella vuota",
     "cat.searchIn": "Cerca in {m}...",
@@ -355,7 +356,8 @@ const STRINGS = {
     "cat.pickMachine": "Pick the machine you are working on. Photos only load from here on.",
     "cat.machineParts": "{n} parts",
     "cat.root": "Catalogue",
-    "cat.folderParts": "{n} parts in total",
+    "cat.folderParts": "{n} parts",
+    "cat.folderSplit": "{d} here · {n} in total",
     "cat.hasSubfolders": "contains more folders",
     "cat.emptyFolder": "Empty folder",
     "cat.searchIn": "Search in {m}...",
@@ -655,16 +657,20 @@ const cloud = {
   // includeEmpty distingue i due mestieri: il tecnico non deve vedere
   // cartelle vuote (in officina sono vicoli ciechi), l'amministratore sì —
   // altrimenti una cartella appena creata sparirebbe un istante dopo.
-  async listFolders(machine, prefix, includeEmpty = false) {
+  async listFolders(machine, parentPath, includeEmpty = false) {
     const { data, error } = await supabase.rpc("list_folders", {
       machine: machine || null,
-      prefix: prefix || null,
+      parent_path: parentPath || null,
       include_empty: !!includeEmpty,
     });
     if (error) { console.error("listFolders:", error.message, error.code); return []; }
     return (data || []).map(f => ({
       folder: f.folder,
-      parts: f.parts,
+      // "direct" è quel che si vedrà aprendo la cartella, "parts" tutto il
+      // ramo. Mostrarne uno solo faceva sembrare i numeri sbagliati: la
+      // cartella dichiarava 8 e aperta ne mostrava 2.
+      parts: f.parts ?? 0,
+      direct: f.direct_parts ?? 0,
       hasChildren: !!f.has_children,
     }));
   },
@@ -673,12 +679,15 @@ const cloud = {
   // i ricambi non si spostano e non si perdono. Cancellare una cartella che
   // contiene ancora qualcosa non la fa sparire — continua a esistere perché
   // c'è un ricambio che la nomina. È una rete di sicurezza voluta.
+  // Tutte e tre passano dal database e non scrivono sulla tabella da qui.
+  // Il motivo è che ognuna tocca due tabelle, e soprattutto che le funzioni
+  // CONTROLLANO di aver fatto qualcosa: senza, un account senza permessi
+  // preme il pulsante, le policy filtrano le righe in silenzio e l'app
+  // mostra "riuscito" su un'operazione che non è avvenuta.
   async createFolder(path) {
-    const clean = normalizeFolder(path);
-    if (!clean) throw new Error("Il nome della cartella non può essere vuoto.");
-    const { error } = await supabase.from("part_folders").upsert({ path: clean });
+    const { data, error } = await supabase.rpc("create_folder", { new_path: path || "" });
     if (error) { console.error("createFolder:", error.message, error.code); throw error; }
-    return clean;
+    return data;
   },
 
   // Spostare ed eliminare sono lo stesso gesto: eliminare vuol dire
@@ -709,12 +718,18 @@ const cloud = {
     if (error) { console.error("movePart:", error.message, error.code); throw error; }
   },
 
+  // Eliminare APPIATTISCE il ramo nel genitore: i ricambi della cartella e
+  // di tutte le sue sottocartelle finiscono lì, le sottocartelle spariscono.
+  //
+  // ⚠️ Prima le sottocartelle venivano PROMOSSE di un livello: eliminando
+  //    "Idraulica" ricompariva "Valvole" al primo livello, e l'elenco poteva
+  //    allungarsi dopo un'eliminazione. Da fuori sembrava che le cartelle
+  //    non si eliminassero mai. Per spostare un ramo conservandone la forma
+  //    c'è renameFolder — quello è "sposta", questo è "elimina".
   async deleteFolder(path) {
-    const segments = folderSegments(path);
-    if (!segments.length) return 0;
-    // Il genitore: togliendo "Idraulica/Valvole" i pezzi restano in
-    // "Idraulica". Togliendo "Idraulica" finiscono senza cartella.
-    return cloud.renameFolder(segments.join("/"), segments.slice(0, -1).join("/"));
+    const { data, error } = await supabase.rpc("delete_folder", { target: path || "" });
+    if (error) { console.error("deleteFolder:", error.message, error.code); throw error; }
+    return data ?? 0;
   },
 
   // I percorsi già in uso, per suggerirli mentre l'admin scrive. Evita che
@@ -730,9 +745,14 @@ const cloud = {
   //    passerebbe il limite come percorso e non troverebbe niente.
   // rootOnly: solo i ricambi che non stanno in nessuna cartella. È la
   // schermata d'ingresso dell'amministratore — quelli da sistemare.
+  // ⚠️ La chiave è "folder_path", non "folder". Chiamarla "folder" faceva
+  //    collidere il nome col nome della colonna dentro la funzione SQL, e
+  //    PostgreSQL dà la precedenza alla colonna: il filtro diventava
+  //    "p.folder = p.folder", sempre vero, e OGNI cartella mostrava l'intero
+  //    catalogo. Non rinominarla.
   async searchParts(q, machine, folder, limit = 50, rootOnly = false) {
     const { data, error } = await supabase.rpc("search_parts", {
-      q: q || null, machine: machine || null, folder: folder || null,
+      q: q || null, machine: machine || null, folder_path: folder || null,
       lim: limit, root_only: !!rootOnly,
     });
     if (error) { console.error("searchParts:", error.message, error.code); throw error; }
@@ -2111,7 +2131,7 @@ function ScanScreen({ partsCount, onAddHistory, reloadParts, loadError, onFeedba
           padding: "12px 14px", marginBottom: 12
         }}>
           <label style={{ display: "block", fontSize: 12, fontWeight: 700, color: T.textMid, marginBottom: 6 }}>
-            🗂️ {t("scan.machine")}
+            ⚙️ {t("scan.machine")}
           </label>
           <select
             value={machine} onChange={e => setMachine(e.target.value)} disabled={analyzing}
@@ -2251,7 +2271,7 @@ function ScanScreen({ partsCount, onAddHistory, reloadParts, loadError, onFeedba
 function FolderBreadcrumb({ machine, path, onMachine, onPath, rootLabel }) {
   const steps = [
     { key: "root", label: rootLabel, go: () => { onMachine(null); onPath([]); } },
-    ...(machine ? [{ key: "machine", label: `🗂️ ${machine}`, go: () => onPath([]) }] : []),
+    ...(machine ? [{ key: "machine", label: `⚙️ ${machine}`, go: () => onPath([]) }] : []),
     ...path.map((seg, i) => ({ key: `s${i}`, label: seg, go: () => onPath(path.slice(0, i + 1)) })),
   ];
 
@@ -2306,7 +2326,9 @@ function CatalogScreen({ partsCount }) {
 
   // Cambiare macchinario riparte dalla radice: restare a metà dell'albero
   // precedente mostrerebbe una cartella che in questo macchinario non esiste.
-  useEffect(() => { setPath([]); }, [machine]);
+  // L'azzeramento sta negli handler (scheda macchinario e briciole di pane),
+  // non in un effetto: da un effetto ci sarebbe un render intermedio con
+  // macchinario nuovo e cartella vecchia, e due giri di richieste.
 
   // Livello 2: le sottocartelle di dove ci si trova. Durante una ricerca non
   // si mostrano: i risultati arrivano da tutto il sottoalbero, e disegnare
@@ -2361,7 +2383,7 @@ function CatalogScreen({ partsCount }) {
           machine={machine}
           path={path}
           rootLabel={`← ${t("cat.root")}`}
-          onMachine={(m) => { setMachine(m); setSearch(""); }}
+          onMachine={(m) => { setMachine(m); setPath([]); setSearch(""); }}
           onPath={setPath}
         />
       )}
@@ -2388,7 +2410,7 @@ function CatalogScreen({ partsCount }) {
           // un macchinario. Il rimedio non è lo stesso, quindi nemmeno il
           // messaggio.
           <div style={{ textAlign: "center", padding: "40px 0" }}>
-            <div style={{ fontSize: 40, marginBottom: 10 }}>{partsCount === 0 ? "📦" : "🗂️"}</div>
+            <div style={{ fontSize: 40, marginBottom: 10 }}>{partsCount === 0 ? "📦" : "⚙️"}</div>
             <p style={{ color: T.text, fontWeight: 700 }}>
               {partsCount === 0 ? t("cat.empty") : t("cat.noMachines")}
             </p>
@@ -2402,7 +2424,7 @@ function CatalogScreen({ partsCount }) {
               {t("cat.pickMachine")}
             </p>
             {machines.map((m, i) => (
-              <div key={m.machine} onClick={() => setMachine(m.machine)} className="fade-in tap-sc" style={{
+              <div key={m.machine} onClick={() => { setMachine(m.machine); setPath([]); }} className="fade-in tap-sc" style={{
                 background: T.card, borderRadius: 16, marginBottom: 10,
                 border: `1px solid ${T.border}`, padding: 14, cursor: "pointer",
                 display: "flex", gap: 12, alignItems: "center",
@@ -2411,7 +2433,7 @@ function CatalogScreen({ partsCount }) {
                 <div style={{
                   width: 44, height: 44, borderRadius: 12, flexShrink: 0, background: T.orangePale,
                   display: "flex", alignItems: "center", justifyContent: "center", fontSize: 22
-                }}>🗂️</div>
+                }}>⚙️</div>
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <div style={{ fontWeight: 700, color: T.text, fontSize: 15.5 }}>{m.machine}</div>
                   <div style={{ color: T.textLight, fontSize: 12.5, marginTop: 2 }}>
@@ -2459,8 +2481,14 @@ function CatalogScreen({ partsCount }) {
             }}>📁</div>
             <div style={{ flex: 1, minWidth: 0 }}>
               <div style={{ fontWeight: 700, color: T.text, fontSize: 15.5 }}>{f.folder}</div>
+              {/* Due numeri quando differiscono: "qui" è quel che si vedrà
+                  aprendo la cartella, "in tutto" comprende le sottocartelle.
+                  Mostrarne uno solo faceva sembrare il conteggio sbagliato —
+                  la cartella dichiarava 8 e aperta ne mostrava 2. */}
               <div style={{ color: T.textLight, fontSize: 12.5, marginTop: 2 }}>
-                {t("cat.folderParts", { n: f.parts })}
+                {f.direct === f.parts
+                  ? t("cat.folderParts", { n: f.parts })
+                  : t("cat.folderSplit", { d: f.direct, n: f.parts })}
                 {f.hasChildren ? ` · ${t("cat.hasSubfolders")}` : ""}
               </div>
             </div>
@@ -3023,7 +3051,11 @@ function AdminApp({ partsCount, onAddPart, onUpdatePart, onDeletePart, reloadPar
   // Cambiando questo numero la lista rilancia la sua ricerca: è il modo di
   // farla aggiornare senza tenere il catalogo in uno stato condiviso.
   const [listVersion, setListVersion] = useState(0);
-  const refreshList = () => setListVersion(v => v + 1);
+  // Rilancia la ricerca della lista E rilegge il totale dal server. Prima
+  // rifaceva solo la prima: il numerone "ricambi registrati" veniva tenuto
+  // con l'aritmetica locale (+1 / −1) e restava sbagliato dopo una modifica
+  // fatta da un altro dispositivo, senza che nessun pulsante lo correggesse.
+  const refreshList = () => { setListVersion(v => v + 1); reloadParts(); };
 
   // La cartella da cui è partito "+ Aggiungi": chi crea una cartella, ci
   // entra e aggiunge un pezzo si aspetta che il pezzo finisca lì, non che
@@ -3106,7 +3138,10 @@ function PartsListScreen({ partsCount, version, onRefresh, onEdit, onAdd, onDele
     return () => { alive = false; };
   }, [version]);
 
-  useEffect(() => { setPath([]); }, [machine]);
+  // Il percorso si azzera nell'handler del menu a tendina, non qui: farlo in
+  // un effetto lasciava un render intermedio con macchinario NUOVO e cartella
+  // VECCHIA, e faceva partire due giri di richieste, il primo su un percorso
+  // che in quel macchinario non esiste.
 
   // Le cartelle di questo livello, comprese quelle vuote: è la differenza
   // fra chi consulta il catalogo e chi lo costruisce. Si vedono anche senza
@@ -3240,8 +3275,10 @@ function PartsListScreen({ partsCount, version, onRefresh, onEdit, onAdd, onDele
           message={
             confirmFolder.parts === 0
               ? `Eliminare la cartella "${confirmFolder.folder}"? È vuota: sparisce solo dall'elenco, nessun ricambio viene toccato.`
-              : `Eliminare la cartella "${confirmFolder.folder}"? I suoi ${confirmFolder.parts} ricambi NON vengono cancellati: passano a ${path.length ? `"${path[path.length - 1]}"` : "nessuna cartella"}` +
-                (confirmFolder.hasChildren ? ", e le sottocartelle salgono di un livello." : ".")
+              : `Eliminare la cartella "${confirmFolder.folder}"? I suoi ${confirmFolder.parts} ricambi NON vengono cancellati: passano tutti a ${path.length ? `"${path[path.length - 1]}"` : "nessuna cartella"}` +
+                (confirmFolder.hasChildren
+                  ? ", comprese le sottocartelle, che spariscono."
+                  : ".")
           }
           onConfirm={() => removeFolder(confirmFolder)}
           onCancel={() => setConfirmFolder(null)}
@@ -3344,19 +3381,29 @@ function PartsListScreen({ partsCount, version, onRefresh, onEdit, onAdd, onDele
         {refreshing ? <><Spinner size={16} /> Aggiornamento...</> : "↻ Ricarica dal cloud"}
       </button>
 
+      {/* ⚠️ Questo NON è un filtro per cartelle, ed è stato scambiato per
+          tale: elenca i MACCHINARI, ricavati dal campo compatibilità dei
+          ricambi. Eliminare una cartella non toglierà mai una voce da qui.
+          Portava l'icona 🗂️, la stessa delle cartelle: cambiata in ⚙️, e
+          l'etichetta ora lo dice a parole. */}
       {machines.length > 0 && (
+        <>
+        <label style={{ display: "block", fontSize: 12, fontWeight: 700, color: T.textLight, marginBottom: 6, textTransform: "uppercase", letterSpacing: 0.6 }}>
+          Filtra per macchinario (compatibilità)
+        </label>
         <select
-          value={machine} onChange={e => setMachine(e.target.value)}
+          value={machine} onChange={e => { setMachine(e.target.value); setPath([]); }}
           style={{
             width: "100%", padding: "12px 14px", borderRadius: 14, marginBottom: 10,
             border: `1.5px solid ${machine ? T.blue : T.border}`,
             background: T.card, fontSize: 15, color: T.text,
           }}>
-          <option value="">🗂️ Tutti i macchinari</option>
+          <option value="">⚙️ Tutti i macchinari</option>
           {machines.map(m => (
             <option key={m.machine} value={m.machine}>{m.machine} ({m.parts})</option>
           ))}
         </select>
+        </>
       )}
 
       <div style={{ position: "relative", marginBottom: 16 }}>
@@ -3373,7 +3420,7 @@ function PartsListScreen({ partsCount, version, onRefresh, onEdit, onAdd, onDele
           machine={machine}
           path={path}
           rootLabel="← Tutto"
-          onMachine={(m) => setMachine(m || "")}
+          onMachine={(m) => { setMachine(m || ""); setPath([]); }}
           onPath={setPath}
         />
       )}
@@ -3416,7 +3463,10 @@ function PartsListScreen({ partsCount, version, onRefresh, onEdit, onAdd, onDele
             <div style={{ color: T.textLight, fontSize: 12.5, marginTop: 2 }}>
               {f.parts === 0
                 ? "vuota"
-                : `${f.parts} ricambi in tutto`}{f.hasChildren ? " · contiene altre cartelle" : ""}
+                : f.direct === f.parts
+                  ? `${f.parts} ricambi`
+                  : `${f.direct} qui · ${f.parts} in tutto`}
+              {f.hasChildren ? " · contiene altre cartelle" : ""}
             </div>
           </div>
           {/* Spostare ed eliminare valgono per qualunque cartella, piena o
@@ -3525,10 +3575,17 @@ function PartsListScreen({ partsCount, version, onRefresh, onEdit, onAdd, onDele
 // ===================== ADD / EDIT PART =====================
 function AddEditPartScreen({ editingPart, defaultFolder = "", onAddPart, onUpdatePart, onDone }) {
   const isEdit = !!editingPart;
+  // I valori predefiniti stanno PRIMA dello spread: la riga che arriva
+  // dall'elenco non ha le chiavi description e compatibility, e senza questi
+  // valori i campi partirebbero "undefined" — cioè non controllati da React.
   const [form, setForm] = useState(editingPart
-    ? { folder: "", ...editingPart, images: [] }
+    ? { code: "", name: "", description: "", category: "", folder: "", compatibility: [], ...editingPart, images: [] }
     : { code: "", name: "", description: "", category: "", folder: normalizeFolder(defaultFolder), compatibility: [], images: [] }
   );
+  // Quali campi ha già toccato chi sta scrivendo. Serve al riempimento
+  // ritardato qui sotto: se la scheda completa arriva dal server mentre si
+  // sta scrivendo, non deve sovrascrivere quello che si è appena digitato.
+  const touched = useRef(new Set());
   const [galleryLoading, setGalleryLoading] = useState(!!editingPart);
   // I percorsi già in uso, suggeriti mentre si scrive. Se la chiamata
   // fallisce si resta senza suggerimenti: il campo è testo libero comunque.
@@ -3539,13 +3596,37 @@ function AddEditPartScreen({ editingPart, defaultFolder = "", onAddPart, onUpdat
     return () => { alive = false; };
   }, []);
 
-  // In modifica la galleria non arriva con la lista: va richiesta a parte.
+  // In modifica servono due cose che la riga dell'elenco non porta con sé.
+  //
+  // ⚠️ La seconda riparava una perdita di dati vera: la riga che arriva da
+  //    searchParts contiene solo id, codice, nome, categoria, cartella e
+  //    miniatura. Il form partiva da quella, quindi description e
+  //    compatibility erano "undefined", e al salvataggio updatePart scriveva
+  //    `part.description || ""` → stringa vuota. Ogni "Modifica" fatta
+  //    dall'elenco CANCELLAVA la descrizione tecnica e le compatibilità del
+  //    ricambio: proprio il testo su cui l'AI lo riconosce.
+  //
+  // Si riempiono solo i campi ancora vuoti (?? e non =), così se la risposta
+  // arriva tardi non sovrascrive quello che nel frattempo si è già scritto.
   useEffect(() => {
     if (!editingPart) return;
     let alive = true;
-    cloud.loadPartImages(editingPart.id)
-      .then(imgs => { if (alive) setForm(f => ({ ...f, images: imgs })); })
-      .catch(() => {})
+    Promise.all([
+      cloud.loadPartImages(editingPart.id).catch(() => []),
+      cloud.getPart(editingPart.id).catch(() => null),
+    ])
+      .then(([imgs, full]) => {
+        if (!alive) return;
+        setForm(f => {
+          const next = { ...f, images: imgs };
+          if (full) {
+            for (const k of ["code", "name", "category", "folder", "description", "compatibility"]) {
+              if (!touched.current.has(k)) next[k] = full[k];
+            }
+          }
+          return next;
+        });
+      })
       .finally(() => { if (alive) setGalleryLoading(false); });
     return () => { alive = false; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -3555,7 +3636,10 @@ function AddEditPartScreen({ editingPart, defaultFolder = "", onAddPart, onUpdat
   const [errors, setErrors] = useState({});
   const [imgLoading, setImgLoading] = useState(false);
 
-  function field(key, val) { setForm(f => ({ ...f, [key]: val })); }
+  function field(key, val) {
+    touched.current.add(key);
+    setForm(f => ({ ...f, [key]: val }));
+  }
 
   async function handleImage(e) {
     const input = e.target;
