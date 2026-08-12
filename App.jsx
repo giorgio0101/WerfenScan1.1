@@ -1342,8 +1342,8 @@ function ConfirmDialog({ message, onConfirm, onCancel }) {
 // window.prompt non è un'alternativa: su un telefono è una finestra di
 // sistema che diversi browser incorporati bloccano senza dire niente, non si
 // può etichettare, e non c'è modo di mostrare come verrà salvato il valore.
-function PromptDialog({ title, hint, placeholder, confirmLabel, onConfirm, onCancel }) {
-  const [value, setValue] = useState("");
+function PromptDialog({ title, hint, placeholder, confirmLabel, initial = "", onConfirm, onCancel }) {
+  const [value, setValue] = useState(initial);
   const clean = normalizeFolder(value);
 
   return (
@@ -3061,16 +3061,25 @@ function AdminApp({ partsCount, onAddPart, onUpdatePart, onDeletePart, reloadPar
   // entra e aggiunge un pezzo si aspetta che il pezzo finisca lì, non che
   // debba riscrivere il percorso a mano nel form.
   const [newPartFolder, setNewPartFolder] = useState("");
+  // La cartella che si sta sfogliando nella lista. Vive qui e non là dentro
+  // perché serve anche al tasto "➕ Aggiungi" della barra in basso, che
+  // cambia schermata: senza, si perdeva la cartella aperta e il ricambio
+  // nasceva alla radice proprio mentre lo stavi mettendo a posto.
+  const [browsingFolder, setBrowsingFolder] = useState("");
 
   function handleEdit(part)  { setEditingPart(part); setTab("add"); }
-  function handleAddNew(folder = "") { setEditingPart(null); setNewPartFolder(folder); setTab("add"); }
+  function handleAddNew(folder) {
+    setEditingPart(null);
+    setNewPartFolder(typeof folder === "string" ? folder : browsingFolder);
+    setTab("add");
+  }
   function handleDone()      { setEditingPart(null); setNewPartFolder(""); setTab("parts"); reloadParts(); refreshList(); }
 
   return (
     <div className="app-shell">
       <Header title="WERFEN SCAN Admin" subtitle="Area amministratore" onLogout={onLogout} />
       <div className="app-content">
-        {tab === "parts" && <PartsListScreen partsCount={partsCount} version={listVersion} onRefresh={refreshList} onEdit={handleEdit} onAdd={handleAddNew} onDeletePart={onDeletePart} loadError={loadError} />}
+        {tab === "parts" && <PartsListScreen partsCount={partsCount} version={listVersion} onRefresh={refreshList} onEdit={handleEdit} onAdd={handleAddNew} onBrowse={setBrowsingFolder} onDeletePart={onDeletePart} loadError={loadError} />}
         {/* La key forza il remount passando da Edit a New Part: senza,
             il form resterebbe precompilato col ricambio in modifica. */}
         {tab === "add" && (
@@ -3103,7 +3112,7 @@ function AdminApp({ partsCount, onAddPart, onUpdatePart, onDeletePart, reloadPar
 }
 
 // ===================== PARTS LIST =====================
-function PartsListScreen({ partsCount, version, onRefresh, onEdit, onAdd, onDeletePart, loadError }) {
+function PartsListScreen({ partsCount, version, onRefresh, onEdit, onAdd, onBrowse, onDeletePart, loadError }) {
   const [search, setSearch] = useState("");
   const [confirmDelete, setConfirmDelete] = useState(null);
   const [refreshing, setRefreshing] = useState(false);
@@ -3116,6 +3125,8 @@ function PartsListScreen({ partsCount, version, onRefresh, onEdit, onAdd, onDele
   const [folders, setFolders] = useState([]);
   const [newFolder, setNewFolder] = useState(false);       // dialogo di creazione aperto
   const [confirmFolder, setConfirmFolder] = useState(null); // cartella in attesa di conferma
+  const [folderMenu, setFolderMenu] = useState(null);       // cartella col menu ⋯ aperto
+  const [renamingFolder, setRenamingFolder] = useState(null); // cartella da rinominare
   const [movingFolder, setMovingFolder] = useState(null);   // cartella da spostare altrove
   const [partMenu, setPartMenu] = useState(null);           // ricambio col menu ⋯ aperto
   const [movingPart, setMovingPart] = useState(null);       // ricambio da spostare
@@ -3142,6 +3153,11 @@ function PartsListScreen({ partsCount, version, onRefresh, onEdit, onAdd, onDele
   // un effetto lasciava un render intermedio con macchinario NUOVO e cartella
   // VECCHIA, e faceva partire due giri di richieste, il primo su un percorso
   // che in quel macchinario non esiste.
+
+  // La cartella aperta va comunicata al contenitore: il tasto "➕ Aggiungi"
+  // della barra in basso cambia schermata, e senza questo il nuovo ricambio
+  // nascerebbe alla radice proprio mentre lo stai mettendo a posto.
+  useEffect(() => { onBrowse?.(folderPath); }, [folderPath, onBrowse]);
 
   // Le cartelle di questo livello, comprese quelle vuote: è la differenza
   // fra chi consulta il catalogo e chi lo costruisce. Si vedono anche senza
@@ -3199,6 +3215,27 @@ function PartsListScreen({ partsCount, version, onRefresh, onEdit, onAdd, onDele
       onRefresh();
     } catch (e) {
       setActionError(`Impossibile spostare la cartella: ${e.message || "controlla la connessione"}.`);
+    }
+  }
+
+  // Rinominare è lo stesso gesto dello spostare, visto da vicino: cambia
+  // l'ultimo pezzo del percorso invece del prefisso. Per questo usa la stessa
+  // funzione, e per questo scrivendo "Valvole/Sicurezza" si ottengono due
+  // livelli in un colpo.
+  async function renameFolderTo(newName) {
+    const f = renamingFolder;
+    setRenamingFolder(null);
+    setActionError("");
+    if (!f) return;
+    const from = [...path, f.folder].join("/");
+    const to   = [...path, newName].join("/");
+    if (from === to) return;
+    try {
+      await cloud.renameFolder(from, to);
+      setFolderVersion(v => v + 1);
+      onRefresh();
+    } catch (e) {
+      setActionError(`Impossibile rinominare la cartella: ${e.message || "controlla la connessione"}.`);
     }
   }
 
@@ -3282,6 +3319,70 @@ function PartsListScreen({ partsCount, version, onRefresh, onEdit, onAdd, onDele
           }
           onConfirm={() => removeFolder(confirmFolder)}
           onCancel={() => setConfirmFolder(null)}
+        />
+      )}
+
+      {/* Il menu ⋯ della cartella. Stessa forma di quello del ricambio: le
+          azioni sulla struttura stanno tutte in un posto solo. */}
+      {folderMenu && (
+        <div
+          onClick={() => setFolderMenu(null)}
+          style={{
+            position: "fixed", inset: 0, background: "rgba(4,2,107,0.45)",
+            display: "flex", alignItems: "center", justifyContent: "center",
+            zIndex: 9999, padding: 24, animation: "fadeIn 0.2s ease"
+          }}>
+          <div onClick={e => e.stopPropagation()} style={{
+            background: T.card, borderRadius: 20, padding: 20,
+            maxWidth: 340, width: "100%", boxShadow: T.shadowLg,
+            animation: "fadeUp 0.2s ease"
+          }}>
+            <p style={{ color: T.text, fontSize: 15.5, fontWeight: 700 }}>
+              📁 {folderMenu.folder}
+            </p>
+            <p style={{ color: T.textLight, fontSize: 12.5, marginTop: 4, marginBottom: 16 }}>
+              {folderMenu.parts === 0
+                ? "vuota"
+                : folderMenu.direct === folderMenu.parts
+                  ? `${folderMenu.parts} ricambi`
+                  : `${folderMenu.direct} qui · ${folderMenu.parts} in tutto`}
+            </p>
+            {[
+              { label: "✏️ Rinomina",   go: () => setRenamingFolder(folderMenu) },
+              { label: "⇄ Sposta in…",  go: () => setMovingFolder(folderMenu) },
+            ].map(a => (
+              <button key={a.label} onClick={() => { a.go(); setFolderMenu(null); }} className="tap-sc" style={{
+                width: "100%", padding: 13, borderRadius: 12, marginBottom: 10,
+                background: T.bluePale, color: T.blue, fontSize: 15, fontWeight: 700,
+                border: `1px solid ${T.blue}33`, textAlign: "left", paddingLeft: 16
+              }}>{a.label}</button>
+            ))}
+            <button
+              onClick={() => { setConfirmFolder(folderMenu); setFolderMenu(null); }}
+              className="tap-sc"
+              style={{
+                width: "100%", padding: 13, borderRadius: 12, marginBottom: 10,
+                background: "#FEF2F2", color: T.error, fontSize: 15, fontWeight: 700,
+                border: "1px solid #FECACA", textAlign: "left", paddingLeft: 16
+              }}>🗑️ Elimina</button>
+            <button onClick={() => setFolderMenu(null)} style={{
+              width: "100%", padding: 12, borderRadius: 12,
+              background: T.bg, color: T.textMid, fontSize: 15, fontWeight: 600,
+              border: `1px solid ${T.border}`
+            }}>Annulla</button>
+          </div>
+        </div>
+      )}
+
+      {renamingFolder && (
+        <PromptDialog
+          title={`Rinomina "${renamingFolder.folder}"`}
+          hint={"Solo il nome, non il percorso: la cartella resta dov'è. Quello che contiene la segue, ricambi e sottocartelle."}
+          placeholder="es. Valvole"
+          initial={renamingFolder.folder}
+          confirmLabel="Rinomina"
+          onConfirm={renameFolderTo}
+          onCancel={() => setRenamingFolder(null)}
         />
       )}
 
@@ -3469,26 +3570,18 @@ function PartsListScreen({ partsCount, version, onRefresh, onEdit, onAdd, onDele
               {f.hasChildren ? " · contiene altre cartelle" : ""}
             </div>
           </div>
-          {/* Spostare ed eliminare valgono per qualunque cartella, piena o
-              vuota: il contenuto non si perde mai, cambia solo posto.
-              Limitarlo alle cartelle vuote voleva dire non poter disfare
-              niente. stopPropagation, o il tocco aprirebbe la cartella. */}
+          {/* Un pulsante solo invece di tre icone in fila: su un telefono
+              tre bersagli da 30 pixel accanto a una riga che è già toccabile
+              sono un invito a sbagliare. stopPropagation, o il tocco
+              aprirebbe la cartella invece del menu. */}
           <button
-            onClick={(e) => { e.stopPropagation(); setMovingFolder(f); }}
-            aria-label={`Sposta la cartella ${f.folder}`}
+            onClick={(e) => { e.stopPropagation(); setFolderMenu(f); }}
+            aria-label={`Azioni per la cartella ${f.folder}`}
             style={{
-              width: 30, height: 30, borderRadius: 9, flexShrink: 0,
-              background: T.bluePale, color: T.blue, fontSize: 14, fontWeight: 700,
-              border: `1px solid ${T.blue}33`, lineHeight: 1, padding: 0
-            }}>⇄</button>
-          <button
-            onClick={(e) => { e.stopPropagation(); setConfirmFolder(f); }}
-            aria-label={`Elimina la cartella ${f.folder}`}
-            style={{
-              width: 30, height: 30, borderRadius: 9, flexShrink: 0,
-              background: "#FEF2F2", color: T.error, fontSize: 15, fontWeight: 700,
-              border: "1px solid #FECACA", lineHeight: 1, padding: 0
-            }}>×</button>
+              width: 34, height: 34, borderRadius: 10, flexShrink: 0,
+              background: T.bg, color: T.textMid, fontSize: 17, fontWeight: 700,
+              border: `1px solid ${T.border}`, lineHeight: 1, padding: 0
+            }}>⋯</button>
           <span style={{ color: T.textLight, fontSize: 18 }}>›</span>
         </div>
       ))}
@@ -3590,6 +3683,7 @@ function AddEditPartScreen({ editingPart, defaultFolder = "", onAddPart, onUpdat
   // I percorsi già in uso, suggeriti mentre si scrive. Se la chiamata
   // fallisce si resta senza suggerimenti: il campo è testo libero comunque.
   const [folderHints, setFolderHints] = useState([]);
+  const [pickingFolder, setPickingFolder] = useState(false);
   useEffect(() => {
     let alive = true;
     cloud.listAllFolders().then(f => { if (alive) setFolderHints(f); });
@@ -3731,6 +3825,16 @@ function AddEditPartScreen({ editingPart, defaultFolder = "", onAddPart, onUpdat
 
   return (
     <div style={{ padding: 16 }}>
+      {pickingFolder && (
+        <FolderPickerDialog
+          title="Dove va questo ricambio"
+          hint="Scendi fino alla cartella giusta e conferma. Per crearne una nuova, chiudi e scrivi il percorso nel campo."
+          rootLabel="🏠 Nessuna cartella"
+          onPick={(dest) => { field("folder", dest); setPickingFolder(false); }}
+          onCancel={() => setPickingFolder(false)}
+        />
+      )}
+
       <h2 style={{ fontSize: 22, fontWeight: 800, color: T.text, marginBottom: 20, letterSpacing: "-0.4px" }}>
         {isEdit ? "✏️ Modifica ricambio" : "➕ Nuovo ricambio"}
       </h2>
@@ -3838,20 +3942,40 @@ function AddEditPartScreen({ editingPart, defaultFolder = "", onAddPart, onUpdat
           l'SQL ha riempito la seconda con la prima. */}
       <div style={{ marginBottom: 14 }}>
         <label style={{ display: "block", fontSize: 13, fontWeight: 600, color: T.textMid, marginBottom: 6 }}>Cartella nel catalogo</label>
-        <input
-          value={form.folder || ""}
-          onChange={e => field("folder", e.target.value)}
-          list="folder-suggestions"
-          placeholder="es. Idraulica/Valvole/Sicurezza"
-          style={inp("folder")}
-        />
+        {/* Due modi per la stessa cosa, e servono tutti e due: il pulsante
+            per scegliere una cartella che esiste già — che è il caso
+            normale, e non obbliga a ricordare come si scrive il percorso —
+            e il campo di testo per inventarne una nuova al volo mentre si
+            carica il pezzo. */}
+        <div style={{ display: "flex", gap: 8, alignItems: "stretch" }}>
+          <input
+            value={form.folder || ""}
+            onChange={e => field("folder", e.target.value)}
+            list="folder-suggestions"
+            placeholder="es. Idraulica/Valvole/Sicurezza"
+            style={{ ...inp("folder"), flex: 1, minWidth: 0 }}
+          />
+          <button
+            type="button"
+            onClick={() => setPickingFolder(true)}
+            className="tap-sc"
+            style={{
+              flexShrink: 0, padding: "0 14px", borderRadius: 12,
+              background: T.bluePale, color: T.blue, fontSize: 14, fontWeight: 700,
+              border: `1px solid ${T.blue}33`, whiteSpace: "nowrap"
+            }}>📁 Scegli</button>
+        </div>
         <datalist id="folder-suggestions">
           {folderHints.map(f => <option key={f} value={f} />)}
         </datalist>
+        {normalizeFolder(form.folder) && (
+          <p style={{ color: T.textMid, fontSize: 12.5, marginTop: 6, fontWeight: 600 }}>
+            📁 {folderSegments(form.folder).join(" › ")}
+          </p>
+        )}
         <p style={{ color: T.textLight, fontSize: 11, marginTop: 6, lineHeight: 1.5 }}>
           Usa la <strong>/</strong> per le sottocartelle. Lasciala vuota e il ricambio
-          resta in cima al macchinario. Le cartelle non si creano da nessuna parte:
-          esistono finché un ricambio le nomina.
+          resta in cima, fra quelli ancora da sistemare.
         </p>
         {/* Si mostra come verrà salvata davvero: barre doppie e spazi ai bordi
             spariscono, e vederlo subito evita di scoprirlo nell'albero. */}
