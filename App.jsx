@@ -2302,8 +2302,8 @@ function CatalogScreen({ partsCount }) {
   const { t } = useT();
   const [search, setSearch] = useState("");
   const [selected, setSelected] = useState(null);
-  const [machine, setMachine] = useState(null);
-  const [machines, setMachines] = useState(null);   // null = non ancora caricati
+  const [machine, setMachine] = useState("");       // "" = tutti i macchinari
+  const [machines, setMachines] = useState([]);
   const [path, setPath] = useState([]);             // cartella aperta, un segmento per livello
   const [folders, setFolders] = useState([]);
   const [results, setResults] = useState([]);
@@ -2312,48 +2312,50 @@ function CatalogScreen({ partsCount }) {
 
   const q = useDebounced(search.trim());
   const searching = q.length > 0;
-  // Le foto si scaricano solo dopo un gesto esplicito: aprire la cartella di
-  // un macchinario, oppure cercare. La schermata iniziale è solo testo.
-  const browsing = searching || !!machine;
   const folderPath = path.join("/");
 
-  // Livello 1: i macchinari. Solo nomi e conteggi, nessuna immagine.
+  // ⚠️ Il macchinario è un FILTRO, non un cancello. Prima era il primo
+  //    livello obbligatorio del catalogo: si arrivava alle cartelle solo dopo
+  //    aver aperto un macchinario. Con un ricambio generico — compatibilità
+  //    vuota, perché va bene su tutto — list_machines() non restituisce
+  //    niente e il tecnico si trovava davanti a una schermata cieca, senza
+  //    modo di raggiungere le cartelle che l'amministratore vede benissimo.
+  //
+  //    Ora l'albero è lo stesso nelle due aree: si apre sulle cartelle, e il
+  //    macchinario semmai le restringe.
   useEffect(() => {
     let alive = true;
-    cloud.listMachines().then(m => { if (alive) setMachines(m); });
+    cloud.listMachines().then(m => { if (alive) setMachines(m || []); });
     return () => { alive = false; };
   }, []);
 
-  // Cambiare macchinario riparte dalla radice: restare a metà dell'albero
-  // precedente mostrerebbe una cartella che in questo macchinario non esiste.
-  // L'azzeramento sta negli handler (scheda macchinario e briciole di pane),
-  // non in un effetto: da un effetto ci sarebbe un render intermedio con
-  // macchinario nuovo e cartella vecchia, e due giri di richieste.
-
-  // Livello 2: le sottocartelle di dove ci si trova. Durante una ricerca non
-  // si mostrano: i risultati arrivano da tutto il sottoalbero, e disegnare
-  // sopra di loro delle cartelle da aprire suggerirebbe il contrario.
+  // Le sottocartelle di dove ci si trova. Durante una ricerca non si mostrano:
+  // i risultati arrivano da tutto il sottoalbero, e disegnare sopra di loro
+  // delle cartelle da aprire suggerirebbe il contrario.
+  //
+  // include_empty come in amministrazione: il tecnico deve vedere lo STESSO
+  // albero, o una cartella ancora da riempire sembrerebbe non esistere e
+  // nessuno saprebbe dove cercare.
   useEffect(() => {
-    if (!browsing || searching) { setFolders([]); return; }
+    if (searching) { setFolders([]); return; }
     let alive = true;
-    cloud.listFolders(machine, folderPath).then(f => { if (alive) setFolders(f); });
+    cloud.listFolders(machine, folderPath, true).then(f => { if (alive) setFolders(f); });
     return () => { alive = false; };
-  }, [machine, folderPath, browsing, searching]);
+  }, [machine, folderPath, searching]);
 
-  // Livello 3: i ricambi che stanno ESATTAMENTE qui. Quelli delle
-  // sottocartelle si vedono entrandoci — si scende finché non si arriva ai
-  // pezzi, e ogni schermata mostra una cosa sola: o dove andare, o cosa c'è.
+  // I ricambi che stanno ESATTAMENTE qui. Quelli delle sottocartelle si
+  // vedono entrandoci — si scende finché non si arriva ai pezzi, e ogni
+  // schermata mostra una cosa sola: o dove andare, o cosa c'è.
   //
   // Cercando è diverso: search_parts allarga a tutto il sottoalbero, perché
   // scrivere una parola dentro una cartella e non trovare ciò che sta due
   // livelli sotto sarebbe la cosa più frustrante possibile.
   //
-  // Appena entrati in un macchinario la cartella è vuota: lì "esattamente
-  // qui" vuol dire i ricambi che non stanno in nessuna cartella.
+  // Alla radice "esattamente qui" vuol dire i ricambi che non stanno in
+  // nessuna cartella: quelli generici, e quelli non ancora sistemati.
   const rootOnly = !searching && path.length === 0;
 
   useEffect(() => {
-    if (!browsing) { setResults([]); return; }
     let alive = true;
     setLoading(true);
     setFailed(false);
@@ -2362,7 +2364,7 @@ function CatalogScreen({ partsCount }) {
       .catch(() => { if (alive) { setResults([]); setFailed(true); } })
       .finally(() => { if (alive) setLoading(false); });
     return () => { alive = false; };
-  }, [q, machine, folderPath, browsing, rootOnly]);
+  }, [q, machine, folderPath, rootOnly]);
 
   if (selected) return <PartDetail part={selected} onBack={() => setSelected(null)} />;
 
@@ -2378,12 +2380,31 @@ function CatalogScreen({ partsCount }) {
         {t("cat.title")}
       </h2>
 
-      {machine && (
+      {/* Il macchinario restringe l'albero, non lo sostituisce. Compare solo
+          se qualche ricambio dichiara una compatibilità: con un catalogo di
+          pezzi generici non serve a niente e occuperebbe spazio per nulla. */}
+      {machines.length > 0 && (
+        <select
+          value={machine}
+          onChange={e => { setMachine(e.target.value); setPath([]); }}
+          style={{
+            width: "100%", padding: "12px 14px", borderRadius: 14, marginBottom: 12,
+            border: `1.5px solid ${machine ? T.blue : T.border}`,
+            background: T.card, fontSize: 15, color: T.text,
+          }}>
+          <option value="">⚙️ {t("scan.machineAll")}</option>
+          {machines.map(m => (
+            <option key={m.machine} value={m.machine}>{m.machine} ({m.parts})</option>
+          ))}
+        </select>
+      )}
+
+      {path.length > 0 && (
         <FolderBreadcrumb
-          machine={machine}
+          machine={null}
           path={path}
           rootLabel={`← ${t("cat.root")}`}
-          onMachine={(m) => { setMachine(m); setPath([]); setSearch(""); }}
+          onMachine={() => setPath([])}
           onPath={setPath}
         />
       )}
@@ -2400,52 +2421,7 @@ function CatalogScreen({ partsCount }) {
         />
       </div>
 
-      {/* Livello 1 — le cartelle. Nessuna immagine: solo nomi e conteggi. */}
-      {!browsing ? (
-        machines === null ? (
-          <div style={{ display: "flex", justifyContent: "center", padding: "48px 0" }}><Spinner size={30} /></div>
-        ) : machines.length === 0 ? (
-          // Due situazioni diverse che si assomigliano: non c'è proprio
-          // nulla a catalogo, oppure i ricambi ci sono ma nessuno dichiara
-          // un macchinario. Il rimedio non è lo stesso, quindi nemmeno il
-          // messaggio.
-          <div style={{ textAlign: "center", padding: "40px 0" }}>
-            <div style={{ fontSize: 40, marginBottom: 10 }}>{partsCount === 0 ? "📦" : "⚙️"}</div>
-            <p style={{ color: T.text, fontWeight: 700 }}>
-              {partsCount === 0 ? t("cat.empty") : t("cat.noMachines")}
-            </p>
-            <p style={{ color: T.textLight, fontSize: 14, marginTop: 6, lineHeight: 1.5 }}>
-              {partsCount === 0 ? t("cat.emptyHint") : t("cat.noMachinesHint")}
-            </p>
-          </div>
-        ) : (
-          <>
-            <p style={{ color: T.textLight, fontSize: 12.5, marginBottom: 12, lineHeight: 1.5 }}>
-              {t("cat.pickMachine")}
-            </p>
-            {machines.map((m, i) => (
-              <div key={m.machine} onClick={() => { setMachine(m.machine); setPath([]); }} className="fade-in tap-sc" style={{
-                background: T.card, borderRadius: 16, marginBottom: 10,
-                border: `1px solid ${T.border}`, padding: 14, cursor: "pointer",
-                display: "flex", gap: 12, alignItems: "center",
-                boxShadow: T.shadow, animationDelay: `${i * 0.03}s`
-              }}>
-                <div style={{
-                  width: 44, height: 44, borderRadius: 12, flexShrink: 0, background: T.orangePale,
-                  display: "flex", alignItems: "center", justifyContent: "center", fontSize: 22
-                }}>⚙️</div>
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontWeight: 700, color: T.text, fontSize: 15.5 }}>{m.machine}</div>
-                  <div style={{ color: T.textLight, fontSize: 12.5, marginTop: 2 }}>
-                    {t("cat.machineParts", { n: m.parts })}
-                  </div>
-                </div>
-                <span style={{ color: T.textLight, fontSize: 18 }}>›</span>
-              </div>
-            ))}
-          </>
-        )
-      ) : loading ? (
+      {loading ? (
         <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 12, padding: "48px 0" }}>
           <Spinner size={30} />
         </div>
@@ -2455,13 +2431,25 @@ function CatalogScreen({ partsCount }) {
           padding: "12px 14px", color: T.error, fontSize: 13, lineHeight: 1.5
         }}>⚠️ {t("error.dbUnreachable")}</div>
       ) : nothingHere ? (
+        // Tre situazioni che si assomigliano e hanno rimedi diversi: una
+        // ricerca a vuoto, una cartella ancora da riempire, e un catalogo
+        // che non ha proprio niente dentro.
         <div style={{ textAlign: "center", padding: "40px 0" }}>
-          <div style={{ fontSize: 40, marginBottom: 10 }}>🔍</div>
+          <div style={{ fontSize: 40, marginBottom: 10 }}>
+            {partsCount === 0 && !searching ? "📦" : "🔍"}
+          </div>
           <p style={{ color: T.text, fontWeight: 700 }}>
             {searching ? t("cat.noResults", { q: search })
               : path.length ? t("cat.emptyFolder")
-              : t("cat.emptyMachine")}
+              : partsCount === 0 ? t("cat.empty")
+              : machine ? t("cat.emptyMachine")
+              : t("cat.emptyFolder")}
           </p>
+          {partsCount === 0 && !searching && (
+            <p style={{ color: T.textLight, fontSize: 14, marginTop: 6, lineHeight: 1.5 }}>
+              {t("cat.emptyHint")}
+            </p>
+          )}
         </div>
       ) : (
         <>
