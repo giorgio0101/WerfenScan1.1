@@ -633,6 +633,7 @@ const cloud = {
   // i simili. Con 2000 ricambi il vecchio caricamento iniziale era ~1 MB di
   // testo per ogni apertura dell'app, su ogni telefono.
 
+
   // Righe leggere per gli elenchi: niente descrizioni, niente immagini,
   // solo l'URL della miniatura. Con ricerca vuota restituisce i più recenti.
   // L'elenco dei macchinari, ricavato dalle compatibilità dei ricambi. Solo
@@ -898,6 +899,161 @@ const cloud = {
       console.error("pulizia foto:", e?.message);
     }
     return saved;
+  },
+
+  // ── IMPORT DI MASSA ───────────────────────────────────────
+  // Non passa da addPart, e non è pigrizia: addPart chiama savePartPhotos,
+  // che anche con zero foto fa comunque il giro di pulizia degli orfani su
+  // Storage — una chiamata di rete per ricambio, cioè duemila viaggi per
+  // niente su un import che di foto non ne ha nessuna.
+
+  // Tutti i codici già a catalogo, in minuscolo. Si scarica la sola colonna
+  // "code" a pagine da mille: su duemila ricambi sono poche decine di KB, e
+  // confrontare in memoria evita duemila interrogazioni una per codice.
+  //
+  // ⚠️ Il confronto è su lower(btrim(...)), la STESSA espressione
+  //    dell'indice unico parts_code_lower_uidx: se qui si confrontasse il
+  //    codice nudo, "AB-1" passerebbe il controllo accanto a un "ab-1" già
+  //    dentro, e a rifiutarlo sarebbe il database a metà scrittura.
+  async codiciEsistenti() {
+    const visti = new Set();
+    const PAGINA = 1000;
+    for (let da = 0; ; da += PAGINA) {
+      const { data, error } = await supabase
+        .from("parts").select("code").range(da, da + PAGINA - 1);
+      if (error) { console.error("codiciEsistenti:", error.message, error.code); throw error; }
+      for (const r of data || []) visti.add(String(r.code ?? "").trim().toLowerCase());
+      if (!data || data.length < PAGINA) return visti;
+    }
+  },
+
+  // Fa esistere le cartelle anche quando sono vuote, in UNA chiamata sola
+  // invece di una create_folder per cartella. part_folders.path è chiave
+  // primaria, quindi "path" è un bersaglio di conflitto che PostgREST sa
+  // esprimere — a differenza di lower(btrim(code)) su parts.
+  //
+  // ⚠️ .select("path") non è decorativo: sotto RLS una scrittura non
+  //    permessa tocca zero righe IN SILENZIO e l'app direbbe "riuscito". È
+  //    lo stesso guasto che in folders.sql ha costretto a far sollevare
+  //    un'eccezione a create_folder.
+  async assicuraCartelle(percorsi) {
+    const puliti = [...new Set((percorsi || []).map(normalizeFolder).filter(Boolean))];
+    if (!puliti.length) return 0;
+    const { data, error } = await supabase
+      .from("part_folders")
+      .upsert(puliti.map(path => ({ path })), { onConflict: "path" })
+      .select("path");
+    if (error) {
+      console.error("assicuraCartelle:", error.message, error.code);
+      if (error.code === "42501") {
+        throw new Error("Le cartelle non sono state create: questo account non ha i permessi di scrittura. Entra con l'account amministratore.");
+      }
+      throw error;
+    }
+    return (data || []).length;
+  },
+
+  // Scrive un blocco e PRETENDE la prova che sia entrato. Senza .select("id")
+  // supabase-js manda "return=minimal", data torna null e non esiste modo di
+  // sapere se le righe ci sono davvero.
+  async _scriviBlocco(blocco) {
+    const { data, error } = await supabase
+      .from("parts").insert(blocco.map(({ _riga, ...riga }) => riga)).select("id");
+    if (error) throw error;
+    if ((data || []).length !== blocco.length) {
+      throw new Error(`scritte ${(data || []).length} righe su ${blocco.length}`);
+    }
+    return data.length;
+  },
+
+  // Un insert è atomico: una riga rifiutata fa cadere tutto il blocco. Invece
+  // di far fallire l'import, il blocco si dimezza finché il colpevole non
+  // resta solo — log2(300) ≈ 9 tentativi invece di 300, e alla fine si sa
+  // QUALE riga e PERCHÉ.
+  async _scriviDimezzando(blocco, scartate) {
+    try {
+      return await cloud._scriviBlocco(blocco);
+    } catch (e) {
+      if (blocco.length === 1) {
+        const r = blocco[0];
+        const motivo = e.code === "23505"
+          ? "codice già presente a catalogo"
+          : `rifiutato dal database: ${e.message || e.code || "errore"}`;
+        scartate.push({ nRiga: r._riga, motivo, riga: [r.code, r.name] });
+        return 0;
+      }
+      // 42501 è un permesso mancante: dimezzare non serve a niente, nessuna
+      // metà passerà mai. Si ferma subito e lo si dice.
+      if (e.code === "42501") throw e;
+      const meta = Math.ceil(blocco.length / 2);
+      const a = await cloud._scriviDimezzando(blocco.slice(0, meta), scartate);
+      const b = await cloud._scriviDimezzando(blocco.slice(meta), scartate);
+      return a + b;
+    }
+  },
+
+  // Scrive i ricambi a blocchi, avvisando dell'avanzamento e fermandosi se
+  // glielo si chiede. Restituisce { scritti, idScritti, scartate }.
+  //
+  // ⚠️ Solo insert, mai update: un ricambio già a catalogo viene saltato
+  //    prima di arrivare qui. Aggiornare da CSV vorrebbe dire sovrascrivere
+  //    descrizioni e foto di schede curate a mano con celle magari vuote, ed
+  //    è esattamente il guasto che nell'area amministratore era già costato
+  //    la cancellazione silenziosa di descrizione e compatibilità.
+  async importaRicambi(righe, { blocco = 300, onProgress, fermato } = {}) {
+    const scartate = [];
+    const idScritti = [];
+    let scritti = 0;
+
+    for (let i = 0; i < righe.length; i += blocco) {
+      if (fermato && fermato()) break;
+      const pezzo = righe.slice(i, i + blocco);
+      let entrati;
+      try {
+        entrati = await cloud._scriviBlocco(pezzo);
+        idScritti.push(...pezzo.map(r => r.id));
+      } catch (e) {
+        console.error("importaRicambi blocco:", e.message, e.code);
+        if (e.code === "42501") {
+          throw new Error("Scrittura rifiutata: questo account non ha i permessi sul catalogo. Entra con l'account amministratore.");
+        }
+        // Il blocco è caduto per colpa di qualche riga: si isola dimezzando,
+        // così le righe sane entrano lo stesso.
+        const primaDegliScarti = scartate.length;
+        entrati = await cloud._scriviDimezzando(pezzo, scartate);
+        const cadute = new Set(scartate.slice(primaDegliScarti).map(s => s.nRiga));
+        idScritti.push(...pezzo.filter(r => !cadute.has(r._riga)).map(r => r.id));
+      }
+      scritti += entrati;
+      if (onProgress) onProgress(Math.min(i + blocco, righe.length), righe.length);
+    }
+    return { scritti, idScritti, scartate };
+  },
+
+  // L'annullamento subito dopo l'import. Gli id li abbiamo generati noi e
+  // sono in memoria, quindi la cancellazione è chirurgica per costruzione.
+  //
+  // ⚠️ A blocchi da cento e non da trecento: PostgREST mette il filtro "in"
+  //    nella query string, e trecento id da venti caratteri la sfondano.
+  // ⚠️ Mai con .like("id", "p_" + t0 + "%"): negli id il carattere "_" è il
+  //    jolly di LIKE, la stessa trappola che nelle cartelle faceva agganciare
+  //    rami estranei.
+  async eliminaRicambiPerId(ids) {
+    let tolti = 0;
+    for (let i = 0; i < ids.length; i += 100) {
+      const pezzo = ids.slice(i, i + 100);
+      const { data, error } = await supabase
+        .from("parts").delete().in("id", pezzo).select("id");
+      if (error) {
+        console.error("eliminaRicambiPerId:", error.message, error.code);
+        if (error.code === "42501") {
+          throw new Error("Annullamento rifiutato: questo account non ha i permessi di cancellazione.");
+        }
+        throw error;
+      }
+      tolti += (data || []).length;
+    }
+    return tolti;
   },
 
   async addPart(part) {
@@ -1200,6 +1356,384 @@ const normalizeFolder = (v) =>
 // I singoli livelli di un percorso, per le briciole di pane.
 const folderSegments = (path) => (normalizeFolder(path) ? normalizeFolder(path).split("/") : []);
 
+// ===================== IMPORT CSV: LEGGERE IL FILE =====================
+// Tutto quello che serve a trasformare un file scelto dall'amministratore in
+// righe pronte da scrivere. Nessuna libreria: TextDecoder e File bastano, e
+// una dipendenza in più, su un progetto fatto di file singoli senza repo git,
+// è un peso che poi non si toglie più.
+//
+// Il file arriva quasi sempre da Excel su Windows in italiano, che è il caso
+// peggiore possibile: separatore punto e virgola, accenti in ANSI, virgolette
+// raddoppiate. Ogni scelta qui sotto nasce da uno di quei tre.
+
+// Il modello da scaricare. "sep=;" lo capiscono sia Excel sia il parser qui
+// sotto: aprendolo con un doppio clic le colonne sono già divise, invece di
+// finire tutte schiacciate nella prima.
+const MODELLO_CSV = [
+  "sep=;",
+  "codice;nome;descrizione;categoria;compatibilita;cartella",
+  'VAL-001;Valvola a sfera 1/2";Ottone nichelato, attacco filettato, PN40. Sede in PTFE.;Valvole;Mazak 200;Idraulica/Valvole',
+  "GUA-114;Guarnizione OR 114;Viton nero, 14x2 mm, resistente a oli minerali.;Guarnizioni;Mazak 200|Mazak 300;Idraulica/Guarnizioni",
+  "FIL-330;Filtro aria compresso;Cartuccia 5 micron con scarico automatico.;Filtri;;Pneumatica",
+].join("\r\n");
+
+// Normalizza un'intestazione per il confronto: via BOM residuo, accenti,
+// maiuscole e punteggiatura. Così "Cod. Art.", "COD_ART" e "CodArt" sono la
+// stessa chiave, e "Compatibilità", "COMPATIBILITA'" e "Compatibilita" pure.
+const csvKey = (s) => String(s ?? "")
+  .replace(/^﻿/, "")
+  .normalize("NFD").replace(/[̀-ͯ]/g, "")
+  .toLowerCase()
+  .replace(/[^a-z0-9]+/g, "");
+
+// Gli alias ambigui ("articolo", "rif", "descrizione articolo") stanno in
+// FONDO alla lista del loro campo: una colonna chiamata esplicitamente
+// "codice" deve vincere su di loro.
+const CSV_ALIAS = {
+  codice: ["codice", "codice ricambio", "cod", "cod.", "codice articolo", "cod. art.", "codart",
+           "codice pezzo", "codice prodotto", "matricola", "riferimento", "sigla",
+           "code", "part code", "part number", "part no", "p/n", "pn", "sku", "item code",
+           "item number", "ref", "articolo", "art"],
+  nome: ["nome", "nome ricambio", "nome pezzo", "denominazione", "descrizione breve", "titolo",
+         "designazione", "dicitura", "name", "part name", "title", "short description", "label",
+         "descrizione articolo"],
+  descrizione: ["descrizione", "descrizione tecnica", "descrizione lunga", "descrizione estesa",
+                "desc", "dettaglio", "dettagli", "note", "note tecniche", "caratteristiche",
+                "specifiche", "description", "long description", "details", "notes", "remarks"],
+  categoria: ["categoria", "tipo", "tipologia", "famiglia", "gruppo", "gruppo merceologico",
+              "classe", "settore", "reparto", "category", "type", "family", "group", "class"],
+  compatibilita: ["compatibilita", "compatibilita'", "compatibilità", "compatibile", "compatibile con",
+                  "macchina", "macchine", "macchinario", "macchinari", "modello", "modelli",
+                  "applicazione", "applicazioni", "montato su", "usato su", "impianto", "impianti",
+                  "linea", "compatibility", "compatible", "machine", "machines", "model", "models",
+                  "equipment", "used on", "fits"],
+  cartella: ["cartella", "percorso", "percorso cartella", "path", "folder", "folder path",
+             "directory", "dir", "albero", "posizione catalogo", "collocazione", "sezione",
+             "location", "tree"],
+};
+
+const CSV_CAMPI = [
+  { campo: "codice",        etichetta: "Codice",        obbligatorio: true  },
+  { campo: "nome",          etichetta: "Nome",          obbligatorio: true  },
+  { campo: "descrizione",   etichetta: "Descrizione",   obbligatorio: false },
+  { campo: "categoria",     etichetta: "Categoria",     obbligatorio: false },
+  { campo: "compatibilita", etichetta: "Compatibilità", obbligatorio: false },
+  { campo: "cartella",      etichetta: "Cartella",      obbligatorio: false },
+];
+
+// Chiave normalizzata → campo. La tabella sopra resta leggibile con accenti e
+// punti, il confronto avviene normalizzato.
+const CSV_MAPPA_ALIAS = (() => {
+  const m = new Map();
+  for (const [campo, lista] of Object.entries(CSV_ALIAS))
+    for (const a of lista) if (!m.has(csvKey(a))) m.set(csvKey(a), campo);
+  return m;
+})();
+
+// ── Byte → testo ────────────────────────────────────────────
+// Si legge come ArrayBuffer e non con readAsText: readAsText decide UTF-8 per
+// conto suo, e su un file ANSI gli accenti diventano U+FFFD PRIMA che il
+// parser veda qualcosa. Da lì non si torna indietro.
+async function leggiTestoCSV(file) {
+  const buf = new Uint8Array(await file.arrayBuffer());
+
+  // Un .xlsx è uno zip: intercettarlo qui evita di macinare binario e
+  // produrre migliaia di righe senza senso.
+  if (buf[0] === 0x50 && buf[1] === 0x4B) {
+    throw new Error("Questo è un file Excel (.xlsx), non un CSV. In Excel: File → Salva con nome → CSV UTF-8.");
+  }
+
+  // Il BOM è l'unico indizio certo: se c'è, non si indovina niente. Va TOLTO,
+  // o la prima intestazione diventa "﻿codice" e non combacia con nessun
+  // alias: la colonna del codice risulterebbe sconosciuta per una ragione che
+  // a schermo non si vede.
+  if (buf[0] === 0xEF && buf[1] === 0xBB && buf[2] === 0xBF)
+    return { testo: new TextDecoder("utf-8").decode(buf.subarray(3)), codifica: "UTF-8 con BOM" };
+  if (buf[0] === 0xFF && buf[1] === 0xFE)
+    return { testo: new TextDecoder("utf-16le").decode(buf.subarray(2)), codifica: "UTF-16 LE" };
+  if (buf[0] === 0xFE && buf[1] === 0xFF)
+    return { testo: new TextDecoder("utf-16be").decode(buf.subarray(2)), codifica: "UTF-16 BE" };
+
+  // Niente BOM. "fatal: true" trasforma la prova in un test esatto invece che
+  // in un'euristica: in Windows-1252 la "à" è il byte singolo 0xE0, che in
+  // UTF-8 annuncia una sequenza di 3 byte che non arriva mai. Il decoder
+  // lancia, e il catch sa con certezza cos'ha in mano.
+  try {
+    const testo = new TextDecoder("utf-8", { fatal: true }).decode(buf);
+    // Un file può essere UTF-8 valido e comunque sbagliato: UTF-8 letto come
+    // 1252 e risalvato (export aperto in Excel, modificato, salvato). Nessuna
+    // eccezione scatta e "à" si legge "Ã ". Non si ripara indovinando su
+    // migliaia di descrizioni: si avvisa e si chiede di riesportare.
+    const doppia = /Ã[-¿]|â€/.test(testo);
+    return {
+      testo,
+      codifica: "UTF-8",
+      avviso: doppia
+        ? "Il file sembra codificato due volte: al posto degli accenti si leggono \"Ã¨\" e \"â€™\". Riesportalo come CSV UTF-8."
+        : "",
+    };
+  } catch {
+    // windows-1252, non iso-8859-1: differiscono nella fascia 0x80-0x9F, dove
+    // 1252 tiene le virgolette tipografiche e il trattino lungo — cioè quello
+    // che finisce in una descrizione incollata da Word.
+    return { testo: new TextDecoder("windows-1252").decode(buf), codifica: "Windows-1252 (ANSI)" };
+  }
+}
+
+// ── Il parser: una macchina a stati, non uno split ──────────
+// Il CSV non è un formato regolare: un a-capo dentro le virgolette (una
+// descrizione tecnica su più righe) significa una cosa diversa dallo stesso
+// a-capo fuori, e nessuna espressione regolare li distingue in modo
+// affidabile. Serve scorrere il testo con un booleano in mano.
+function analizzaCSV(testo, sep) {
+  const righe = [];
+  let riga = [], campo = "", dentro = false, i = 0, rigaApertura = 0;
+  const n = testo.length;
+
+  while (i < n) {
+    const c = testo[i];
+
+    if (dentro) {
+      if (c === '"') {
+        // "" è UNA virgoletta letterale e la cella CONTINUA: è così che Excel
+        // scrive 'Guarnizione 3/4"'. Chiudere sulla prima sballerebbe tutte
+        // le colonne da lì in poi, e anche il conteggio delle righe.
+        if (testo[i + 1] === '"') { campo += '"'; i += 2; continue; }
+        dentro = false; i++; continue;
+      }
+      // Qui l'a-capo NON chiude la riga. Il CRLF si normalizza a \n: il
+      // ritorno carrello di Windows salvato nel database riemerge come
+      // riquadro strano nella scheda del ricambio sul telefono.
+      if (c === "\r") { campo += "\n"; i += (testo[i + 1] === "\n" ? 2 : 1); continue; }
+      campo += c; i++; continue;
+    }
+
+    // La virgoletta apre solo a cella ancora vuota: così 12" — i pollici,
+    // misura frequentissima su un ricambio — resta letterale. Si tollerano
+    // spazi fra separatore e virgoletta, che diversi gestionali scrivono.
+    if (c === '"' && /^[ \t]*$/.test(campo)) {
+      campo = ""; dentro = true; rigaApertura = righe.length + 1; i++; continue;
+    }
+    if (c === sep) { riga.push(campo); campo = ""; i++; continue; }
+    if (c === "\r" || c === "\n") {
+      i += (c === "\r" && testo[i + 1] === "\n") ? 2 : 1;   // CRLF = un terminatore solo
+      riga.push(campo); campo = "";
+      righe.push(riga); riga = [];
+      continue;
+    }
+    campo += c; i++;
+  }
+
+  // L'ultima riga si emette solo se contiene qualcosa: spingerla sempre crea
+  // una riga fantasma in fondo a ogni file che finisce con un a-capo, cioè
+  // quasi tutti, e l'import annuncerebbe una riga in più senza codice.
+  if (campo !== "" || riga.length) { riga.push(campo); righe.push(riga); }
+
+  // Virgolette mai chiuse: da lì in poi metà file finisce in una cella sola.
+  // Senza questo controllo l'anteprima mostra quaranta righe su duemila e
+  // sembra un file troncato, invece che una virgoletta dimenticata.
+  if (dentro) throw new Error(`Virgolette aperte alla riga ${rigaApertura} e mai chiuse. Controlla quella riga.`);
+  return righe;
+}
+
+// ── Il separatore, senza chiederlo ──────────────────────────
+// Excel in italiano salva con ";" (il separatore di elenco di Windows con
+// locale IT), "CSV UTF-8" con ",", "Testo delimitato da tabulazioni" con TAB.
+// L'ordine dei candidati è la preferenza a parità di punteggio.
+const CSV_SEPARATORI = [";", "\t", ",", "|"];
+
+function trovaSeparatoreCSV(testo) {
+  // Excel a volte dichiara il separatore da solo. Vince su tutto, e la riga
+  // va CONSUMATA: se resta diventa una riga di dati fasulla e l'intestazione
+  // slitta di uno.
+  const m = /^sep=(.)\r?\n/i.exec(testo);
+  if (m) return { sep: m[1], testo: testo.slice(m[0].length) };
+
+  // Si conta col parser VERO, non con una regex: una descrizione che contiene
+  // "12,5 mm; acciaio inox" voterebbe per il separatore sbagliato. Solo i
+  // primi 64 KB, perché serve a contare le colonne e non a leggere i dati:
+  // con quattro candidati, parsare cinque megabyte quattro volte è lavoro
+  // buttato. Il troncamento può tagliare a metà una cella fra virgolette, e
+  // non importa.
+  const assaggio = testo.slice(0, 65536);
+  let migliore = { sep: ";", punteggio: -1 };
+  for (const sep of CSV_SEPARATORI) {
+    let righe;
+    try { righe = analizzaCSV(assaggio, sep); } catch { continue; }
+    righe = righe.filter(r => r.some(c => c.trim() !== "")).slice(0, 6);
+    if (!righe.length) continue;
+    const colonne = righe[0].length;
+    if (colonne < 2) continue;                       // una colonna sola = non è quello
+    const coerenti = righe.filter(r => r.length === colonne).length;
+    // Più colonne, ma solo se regolari: un separatore sbagliato compare un
+    // numero casuale di volte per riga e i conteggi ballano.
+    const punteggio = colonne * 100 + coerenti;
+    if (punteggio > migliore.punteggio) migliore = { sep, punteggio };
+  }
+  // Nessun candidato convince: non si tira a indovinare su duemila righe, la
+  // schermata mostra il selettore e lo fa scegliere.
+  return { sep: migliore.punteggio < 0 ? null : migliore.sep, testo };
+}
+
+// ── Le colonne ──────────────────────────────────────────────
+// NON scrive niente e non decide niente: restituisce la corrispondenza
+// trovata perché la schermata la faccia CONFERMARE. È il punto esatto in cui
+// un import scrive duemila nomi nel campo sbagliato senza dare nessun errore:
+// il file è valido, il database è contento, e il catalogo è da rifare a mano.
+function mappaColonneCSV(intestazione) {
+  const mappa = {};
+  const sconosciute = [];
+  (intestazione || []).forEach((testa, i) => {
+    const campo = CSV_MAPPA_ALIAS.get(csvKey(testa));
+    if (campo && mappa[campo] === undefined) mappa[campo] = i;   // primo arrivato vince
+    else sconosciute.push({ indice: i, testa });
+  });
+  return { mappa, sconosciute, senzaIntestazione: Object.keys(mappa).length === 0 };
+}
+
+// ── I valori dentro una cella ───────────────────────────────
+// Backslash e spazi unicode PRIMA di normalizeFolder, che fa solo split("/"):
+// "Idraulica\Valvole" copiato da un percorso Windows diventerebbe UNA
+// cartella col backslash dentro il nome, e uno spazio unificatore finale
+// (copia-incolla dal web o da un PDF) sopravvive a trim() e sdoppia la
+// cartella nell'albero senza che la differenza si veda.
+const cartellaDaCella = (v) =>
+  normalizeFolder(String(v ?? "").replace(/\\/g, "/").replace(/[   ]/g, " "));
+
+// A cascata: "|", ";" e a-capo sono sempre separatori; la virgola solo se non
+// c'è nessuno degli altri — così "Tornio CNC Mazak, modello 200" resta intero
+// quando accanto c'è già un ";" a dividere davvero.
+const compatDaCella = (v) => {
+  const s = String(v ?? "");
+  const pezzi = /[|;\n]/.test(s) ? s.split(/[|;\n]+/) : s.split(",");
+  return pezzi.map(x => x.trim()).filter(Boolean);
+};
+
+// ⚠️ La forma canonica non è un vezzo. list_machines raggruppa per il VALORE
+//    ESATTO della stringa e il filtro usa l'operatore jsonb "?", anch'esso
+//    esatto: "Mazak 200", "MAZAK 200" e "Mazak 200 " diventerebbero TRE
+//    macchinari distinti nel menu, ognuno con una fetta dei ricambi e nessuno
+//    con tutti. Si tiene la prima grafia incontrata e la si riusa per tutte
+//    le righe successive.
+function canonizzatore() {
+  const visti = new Map();
+  return (nome) => {
+    const k = csvKey(nome);
+    if (!k) return "";
+    if (!visti.has(k)) visti.set(k, String(nome).replace(/\s+/g, " ").trim());
+    return visti.get(k);
+  };
+}
+
+// ── Righe → ricambi, con il rapporto degli scarti ───────────
+// Non scrive niente: è la schermata a decidere se e quando.
+//
+// ⚠️ Gli id li generiamo qui con un CONTATORE, non con i quattro caratteri
+//    casuali di addPart. Generando duemila id in un ciclo stretto Date.now()
+//    resta fermo per centinaia di righe di fila, e dentro lo stesso
+//    millisecondo l'unicità sarebbe appesa al caso: una collisione sulla
+//    chiave primaria fa fallire un blocco intero, e l'utente si ritrova un
+//    errore che parla di duplicati mentre guarda un file in cui i codici sono
+//    tutti diversi. Col contatore è unico per costruzione, ed è anche
+//    deterministico: riprovare dopo una caduta di rete non genera id nuovi.
+function costruisciRicambi(righe, mappa, primaRigaDati) {
+  const pronti = [], scarti = [];
+  const canon = canonizzatore();
+  const codiciVisti = new Map();
+  const cartelle = new Set();
+  const macchinari = new Set();
+  const t0 = Date.now();
+  let colonneInEccesso = 0;
+  const larghezza = Math.max(...Object.values(mappa).map(Number), -1) + 1;
+
+  for (let r = primaRigaDati; r < righe.length; r++) {
+    const riga = righe[r];
+    const nRiga = r + 1;                       // il numero che l'utente vede nel foglio
+
+    // Riga vuota: si salta in silenzio, non è un errore. Sono i separatori di
+    // sezione e la coda del file.
+    if (!riga.some(c => String(c).trim() !== "")) continue;
+    if (riga.length > larghezza && riga.slice(larghezza).some(c => String(c).trim() !== "")) colonneInEccesso++;
+
+    // Righe più corte dell'intestazione sono NORMALI: molti gestionali non
+    // scrivono i separatori finali quando le ultime colonne sono vuote.
+    const cella = (campo) =>
+      (mappa[campo] === undefined ? "" : String(riga[mappa[campo]] ?? "").trim());
+
+    const code = cella("codice");
+    const name = cella("nome");
+    // Obbligatori esattamente come nel form. Qui cadono da sole anche le
+    // righe di totale tipo "TOTALE 2000 articoli".
+    if (!code) { scarti.push({ nRiga, motivo: "codice mancante", riga }); continue; }
+    if (!name) { scarti.push({ nRiga, motivo: "nome mancante", riga }); continue; }
+    if (code.length > 100) { scarti.push({ nRiga, motivo: "codice più lungo di 100 caratteri", riga }); continue; }
+
+    // Stessa espressione dell'indice unico parts_code_lower_uidx. Va fatto
+    // QUI: un insert di trecento righe è atomico, e un solo doppione le fa
+    // fallire tutte e trecento.
+    const k = code.toLowerCase();
+    if (codiciVisti.has(k)) {
+      scarti.push({ nRiga, motivo: `codice doppio nel file, già alla riga ${codiciVisti.get(k)}`, riga });
+      continue;
+    }
+    codiciVisti.set(k, nRiga);
+
+    // Excel l'ha rovinato? Il dato originale non si recupera, ma accorgersene
+    // prima di scrivere duemila righe sì.
+    const rovinato = /^\d+([.,]\d+)?[eE][+-]?\d+$/.test(code) ? "convertito in notazione scientifica da Excel"
+                   : /^\d{1,2}[/-]\d{1,2}[/-]\d{2,4}$/.test(code) ? "convertito in data da Excel" : "";
+    if (rovinato) { scarti.push({ nRiga, motivo: `codice ${rovinato}`, riga }); continue; }
+
+    const folder = cartellaDaCella(cella("cartella"));
+    const compatibility = compatDaCella(cella("compatibilita")).map(canon).filter(Boolean);
+    if (folder) cartelle.add(folder);
+    for (const m of compatibility) macchinari.add(m);
+
+    pronti.push({
+      id: `p_${t0}_${String(pronti.length).padStart(4, "0")}`,
+      code,
+      name,
+      description: cella("descrizione"),
+      category: cella("categoria"),
+      folder,                       // stringa vuota per la radice, mai null
+      compatibility,
+      images: [],
+      thumb_url: null,
+      photo_url: null,
+      _riga: nRiga,                 // solo per il rapporto: non va nel database
+    });
+  }
+
+  return {
+    pronti, scarti, colonneInEccesso,
+    cartelle: [...cartelle].sort(),
+    macchinari: [...macchinari].sort(),
+  };
+}
+
+// Una cella pronta per un CSV: virgolette solo quando servono, raddoppiate
+// dentro. È lo stesso contratto che il parser qui sopra sa leggere, così il
+// file degli scarti si corregge e si ricarica senza conversioni.
+const cellaCSV = (v) => {
+  const s = String(v ?? "");
+  return /[";\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+};
+
+// Scrive un file sul disco dell'amministratore. Il ﻿ iniziale è il BOM:
+// senza, Excel riapre il rapporto degli scarti con gli accenti rotti, e
+// sarebbe beffardo proprio su un file che serve a riparare.
+function scaricaTesto(nomeFile, testo) {
+  const url = URL.createObjectURL(new Blob(["﻿" + testo], { type: "text/csv;charset=utf-8" }));
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = nomeFile;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  // Rilasciare subito libererebbe l'oggetto prima che il browser lo legga.
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
+
 // Normalizza le generazioni di dati che si sono succedute. I ricambi più
 // vecchi hanno un array di stringhe base64, poi sono arrivate le coppie di
 // URL, ora c'è anche la versione per l'AI. Tutte devono continuare a
@@ -1500,14 +2034,14 @@ function FolderPickerDialog({ title, hint, rootLabel, excludePath = "", onPick, 
 // L'<input> è FUORI dal <label>: se fosse annidato e allo stesso tempo
 // referenziato da htmlFor, il browser inoltrerebbe il click due volte
 // e su Android la fotocamera si riaprirebbe dopo lo scatto.
-function PhotoPicker({ id, disabled, onFile, children, style }) {
+function PhotoPicker({ id, disabled, onFile, children, style, accept = "image/*" }) {
   return (
     <>
       <label htmlFor={id} style={style}>{children}</label>
       <input
         id={id}
         type="file"
-        accept="image/*"
+        accept={accept}
         disabled={disabled}
         onChange={onFile}
         style={{ display: "none" }}
@@ -2131,7 +2665,7 @@ function ScanScreen({ partsCount, onAddHistory, reloadParts, loadError, onFeedba
           padding: "12px 14px", marginBottom: 12
         }}>
           <label style={{ display: "block", fontSize: 12, fontWeight: 700, color: T.textMid, marginBottom: 6 }}>
-            ⚙️ {t("scan.machine")}
+            🗂️ {t("scan.machine")}
           </label>
           <select
             value={machine} onChange={e => setMachine(e.target.value)} disabled={analyzing}
@@ -2271,7 +2805,7 @@ function ScanScreen({ partsCount, onAddHistory, reloadParts, loadError, onFeedba
 function FolderBreadcrumb({ machine, path, onMachine, onPath, rootLabel }) {
   const steps = [
     { key: "root", label: rootLabel, go: () => { onMachine(null); onPath([]); } },
-    ...(machine ? [{ key: "machine", label: `⚙️ ${machine}`, go: () => onPath([]) }] : []),
+    ...(machine ? [{ key: "machine", label: `🗂️ ${machine}`, go: () => onPath([]) }] : []),
     ...path.map((seg, i) => ({ key: `s${i}`, label: seg, go: () => onPath(path.slice(0, i + 1)) })),
   ];
 
@@ -3067,7 +3601,11 @@ function AdminApp({ partsCount, onAddPart, onUpdatePart, onDeletePart, reloadPar
     <div className="app-shell">
       <Header title="WERFEN SCAN Admin" subtitle="Area amministratore" onLogout={onLogout} />
       <div className="app-content">
-        {tab === "parts" && <PartsListScreen partsCount={partsCount} version={listVersion} onRefresh={refreshList} onEdit={handleEdit} onAdd={handleAddNew} onBrowse={setBrowsingFolder} onDeletePart={onDeletePart} loadError={loadError} />}
+        {tab === "parts" && <PartsListScreen partsCount={partsCount} version={listVersion} onRefresh={refreshList} onEdit={handleEdit} onAdd={handleAddNew} onBrowse={setBrowsingFolder} onDeletePart={onDeletePart} onImport={() => setTab("import")} loadError={loadError} />}
+        {/* Non è una voce della barra in basso: l'import si fa una volta o
+            due nella vita del catalogo, e una quarta voce fissa costerebbe
+            spazio su ogni schermata per sempre. Ci si arriva dal catalogo. */}
+        {tab === "import" && <ImportScreen onDone={handleDone} onBack={() => setTab("parts")} />}
         {/* La key forza il remount passando da Edit a New Part: senza,
             il form resterebbe precompilato col ricambio in modifica. */}
         {tab === "add" && (
@@ -3100,7 +3638,7 @@ function AdminApp({ partsCount, onAddPart, onUpdatePart, onDeletePart, reloadPar
 }
 
 // ===================== PARTS LIST =====================
-function PartsListScreen({ partsCount, version, onRefresh, onEdit, onAdd, onBrowse, onDeletePart, loadError }) {
+function PartsListScreen({ partsCount, version, onRefresh, onEdit, onAdd, onBrowse, onDeletePart, onImport, loadError }) {
   const [search, setSearch] = useState("");
   const [confirmDelete, setConfirmDelete] = useState(null);
   const [refreshing, setRefreshing] = useState(false);
@@ -3462,13 +4000,19 @@ function PartsListScreen({ partsCount, version, onRefresh, onEdit, onAdd, onBrow
         }}>+ Aggiungi</button>
       </div>
 
-      <button onClick={refresh} disabled={refreshing} style={{
-        width: "100%", padding: 11, borderRadius: 12, marginBottom: 16,
-        background: T.bluePale, color: T.blue, fontSize: 14, fontWeight: 700,
-        display: "flex", alignItems: "center", justifyContent: "center", gap: 8
-      }}>
-        {refreshing ? <><Spinner size={16} /> Aggiornamento...</> : "↻ Ricarica dal cloud"}
-      </button>
+      <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
+        <button onClick={refresh} disabled={refreshing} style={{
+          flex: 1, padding: 11, borderRadius: 12,
+          background: T.bluePale, color: T.blue, fontSize: 14, fontWeight: 700,
+          display: "flex", alignItems: "center", justifyContent: "center", gap: 8
+        }}>
+          {refreshing ? <><Spinner size={16} /> Aggiornamento...</> : "↻ Ricarica"}
+        </button>
+        <button onClick={onImport} className="tap-sc" style={{
+          flex: 1, padding: 11, borderRadius: 12,
+          background: T.bluePale, color: T.blue, fontSize: 14, fontWeight: 700
+        }}>📥 Importa CSV</button>
+      </div>
 
       {/* ⚠️ Questo NON è un filtro per cartelle, ed è stato scambiato per
           tale: elenca i MACCHINARI, ricavati dal campo compatibilità dei
@@ -3598,6 +4142,18 @@ function PartsListScreen({ partsCount, version, onRefresh, onEdit, onAdd, onBrow
               background: T.orange,
               color: "white", fontSize: 15, fontWeight: 700
             }}>+ Aggiungi il primo</button>
+          )}
+          {partsCount === 0 && (
+            <div style={{ marginTop: 14 }}>
+              <button onClick={onImport} style={{
+                padding: "11px 20px", borderRadius: 14,
+                background: "transparent", color: T.blue, fontSize: 14.5, fontWeight: 700,
+                border: `1.5px solid ${T.border}`
+              }}>📥 Oppure importa un CSV</button>
+              <div style={{ color: T.textLight, fontSize: 12.5, marginTop: 8 }}>
+                Per caricarne molti in una volta sola
+              </div>
+            </div>
           )}
         </div>
       ) : (
@@ -4044,6 +4600,561 @@ function AddEditPartScreen({ editingPart, defaultFolder = "", onAddPart, onUpdat
           {saving ? <><Spinner size={18} color="white" /> Salvataggio...</> : (isEdit ? "💾 Salva modifiche" : "✅ Aggiungi al database")}
         </button>
       </div>
+    </div>
+  );
+}
+
+// ===================== IMPORT CSV =====================
+// Cinque fermate, una sola scrittura: file → colonne → conferma → scrittura →
+// esito. La fermata che conta davvero è la seconda.
+//
+// ⚠️ Il danno peggiore di un import non è fallire: è RIUSCIRE con la colonna
+//    sbagliata. Duemila righe col fornitore dentro il nome, o la descrizione
+//    breve al posto di quella tecnica. Quell'errore non produce nessun
+//    messaggio da nessuna parte — il file è valido, il database è contento,
+//    l'indice unico guarda solo il codice — e l'unica cosa al mondo che può
+//    fermarlo è una persona che guarda dei valori veri prima di scrivere.
+//    Per questo la corrispondenza delle colonne è una schermata sua, con
+//    sotto ogni scelta tre valori presi dal file, e non una riga in un
+//    riepilogo che si scorre.
+function ImportScreen({ onDone, onBack }) {
+  const [fase, setFase]         = useState("file");
+  const [nomeFile, setNomeFile] = useState("");
+  const [errore, setErrore]     = useState("");
+  const [avviso, setAvviso]     = useState("");
+  const [codifica, setCodifica] = useState("");
+  const [sep, setSep]           = useState(";");
+  const [testo, setTesto]       = useState("");
+  const [righe, setRighe]       = useState([]);
+  const [conIntestazione, setConIntestazione] = useState(true);
+  const [mappa, setMappa]       = useState({});
+  const [analisi, setAnalisi]   = useState(null);
+  const [esistenti, setEsistenti] = useState(null);
+  const [caricando, setCaricando] = useState(false);
+  const [progresso, setProgresso] = useState({ fatti: 0, totale: 0 });
+  const [esito, setEsito]       = useState(null);
+  const [chiedoAnnulla, setChiedoAnnulla] = useState(false);
+  const [trascina, setTrascina] = useState(false);
+  const fermato = useRef(false);
+
+  const primaRigaDati = conIntestazione ? 1 : 0;
+
+  // ── Lettura del file ──────────────────────────────────────
+  async function apriFile(file) {
+    if (!file) return;
+    setErrore(""); setAvviso(""); setEsito(null); setAnalisi(null);
+    setNomeFile(file.name);
+    try {
+      const letto = await leggiTestoCSV(file);
+      const trovato = trovaSeparatoreCSV(letto.testo);
+      if (!trovato.sep) {
+        setTesto(trovato.testo); setCodifica(letto.codifica); setSep(";");
+        rianalizza(trovato.testo, ";");
+        setErrore("Non riesco a capire da solo come sono divise le colonne. Controlla il separatore qui sotto: nell'anteprima devi vedere più di una colonna.");
+        setFase("mappa");
+        return;
+      }
+      setCodifica(letto.codifica);
+      setAvviso(letto.avviso || "");
+      setTesto(trovato.testo);
+      setSep(trovato.sep);
+      rianalizza(trovato.testo, trovato.sep);
+      setFase("mappa");
+    } catch (e) {
+      console.error("import: lettura", e);
+      setErrore(e.message || "Non riesco a leggere questo file.");
+    }
+  }
+
+  // Rifà il parsing quando cambia il separatore scelto a mano. La
+  // corrispondenza delle colonne si ricalcola da zero: con un separatore
+  // diverso le colonne sono altre, e tenere la vecchia mappa vorrebbe dire
+  // puntare a numeri che non significano più niente.
+  function rianalizza(txt, separatore) {
+    try {
+      const r = analizzaCSV(txt, separatore);
+      setRighe(r);
+      const { mappa: m } = mappaColonneCSV(r[0] || []);
+      setMappa(m);
+      setErrore("");
+    } catch (e) {
+      setRighe([]); setMappa({});
+      setErrore(e.message);
+    }
+  }
+
+  // ── Conteggi, prima di scrivere ───────────────────────────
+  async function preparaConferma() {
+    setCaricando(true); setErrore("");
+    try {
+      const a = costruisciRicambi(righe, mappa, primaRigaDati);
+      // I codici già a catalogo si leggono ADESSO, non in fase di scrittura:
+      // il numero che l'amministratore legge prima di premere dev'essere
+      // quello vero, non una stima.
+      const gia = await cloud.codiciEsistenti();
+      setAnalisi(a); setEsistenti(gia);
+      setFase("conferma");
+    } catch (e) {
+      console.error("import: conferma", e);
+      setErrore(e.message || "Non riesco a leggere i codici già a catalogo.");
+    } finally {
+      setCaricando(false);
+    }
+  }
+
+  // ── La scrittura ──────────────────────────────────────────
+  async function scrivi() {
+    if (!daScrivere.length) return;
+    fermato.current = false;
+    setFase("scrive");
+    setProgresso({ fatti: 0, totale: daScrivere.length });
+    try {
+      // Prima le cartelle: se questo account non ha i permessi, si scopre
+      // ora, su una chiamata sola, e non a metà dei ricambi.
+      await cloud.assicuraCartelle(analisi.cartelle);
+      const r = await cloud.importaRicambi(daScrivere, {
+        onProgress: (fatti, totale) => setProgresso({ fatti, totale }),
+        fermato: () => fermato.current,
+      });
+      setEsito({ ...r, interrotto: fermato.current });
+      setFase("esito");
+    } catch (e) {
+      console.error("import: scrittura", e);
+      setErrore(e.message || "Scrittura interrotta da un errore.");
+      setEsito({ scritti: 0, idScritti: [], scartate: [], errore: true });
+      setFase("esito");
+    }
+  }
+
+  async function annullaImport() {
+    setChiedoAnnulla(false);
+    setCaricando(true);
+    try {
+      const tolti = await cloud.eliminaRicambiPerId(esito.idScritti);
+      setEsito(e => ({ ...e, annullati: tolti, idScritti: [] }));
+    } catch (e) {
+      setErrore(e.message || "Annullamento non riuscito.");
+    } finally {
+      setCaricando(false);
+    }
+  }
+
+  // ── Derivati ──────────────────────────────────────────────
+  const intestazione = righe[0] || [];
+  const esempiColonna = (indice) => {
+    const fuori = [];
+    for (let r = primaRigaDati; r < righe.length && fuori.length < 3; r++) {
+      const v = String(righe[r]?.[indice] ?? "").trim();
+      if (v) fuori.push(v.length > 42 ? v.slice(0, 42) + "…" : v);
+    }
+    return fuori;
+  };
+  const nColonne = righe.reduce((n, r) => Math.max(n, r.length), 0);
+  const mancanoObbligatorie = CSV_CAMPI.filter(c => c.obbligatorio && mappa[c.campo] === undefined);
+
+  const giaPresenti = analisi && esistenti
+    ? analisi.pronti.filter(p => esistenti.has(p.code.toLowerCase()))
+    : [];
+  const daScrivere = analisi && esistenti
+    ? analisi.pronti.filter(p => !esistenti.has(p.code.toLowerCase()))
+    : [];
+  const righeLette = analisi ? analisi.pronti.length + analisi.scarti.length : 0;
+  // Colonne in eccesso su tante righe non è un file sciatto: è il separatore
+  // sbagliato o una virgoletta non chiusa, e va detto forte.
+  const eccessoGrave = analisi && righeLette > 0 && analisi.colonneInEccesso > righeLette * 0.05;
+
+  function scaricaScarti() {
+    const tutti = [...(analisi?.scarti || []), ...(esito?.scartate || [])];
+    const righeCsv = [
+      "sep=;",
+      ["riga_originale", "motivo_scarto", ...CSV_CAMPI.map(c => c.campo)].join(";"),
+      ...tutti.map(s => [
+        s.nRiga,
+        s.motivo,
+        ...CSV_CAMPI.map(c => (mappa[c.campo] === undefined ? "" : (s.riga?.[mappa[c.campo]] ?? ""))),
+      ].map(cellaCSV).join(";")),
+    ];
+    scaricaTesto("scarti-import.csv", righeCsv.join("\r\n"));
+  }
+
+  // ── Pezzi di interfaccia ──────────────────────────────────
+  const Riquadro = ({ children, colore = T.border, fondo = T.card }) => (
+    <div style={{
+      background: fondo, border: `1.5px solid ${colore}`, borderRadius: 16,
+      padding: 14, marginBottom: 12, fontSize: 13.5, color: T.textMid, lineHeight: 1.5,
+    }}>{children}</div>
+  );
+
+  const Numerone = ({ n, testo: etichetta, colore }) => (
+    <div style={{ flex: 1, textAlign: "center", padding: "10px 4px" }}>
+      <div style={{ fontSize: 26, fontWeight: 800, color: colore, letterSpacing: "-0.5px" }}>
+        {n.toLocaleString("it-IT")}
+      </div>
+      <div style={{ fontSize: 11.5, color: T.textLight, fontWeight: 600, marginTop: 2 }}>{etichetta}</div>
+    </div>
+  );
+
+  const bottonePrimario = {
+    width: "100%", padding: 15, borderRadius: 14, background: T.blue, color: "white",
+    fontSize: 15.5, fontWeight: 700, marginTop: 6,
+  };
+  const bottoneChiaro = {
+    width: "100%", padding: 13, borderRadius: 14, background: "transparent",
+    color: T.blue, fontSize: 14.5, fontWeight: 600, border: `1.5px solid ${T.border}`, marginTop: 8,
+  };
+
+  return (
+    <div style={{ padding: 16 }}>
+      {chiedoAnnulla && (
+        <ConfirmDialog
+          message={`Elimino i ${esito.idScritti.length.toLocaleString("it-IT")} ricambi appena importati? I ricambi che c'erano prima non vengono toccati.`}
+          onConfirm={annullaImport}
+          onCancel={() => setChiedoAnnulla(false)}
+        />
+      )}
+
+      <h2 style={{ fontSize: 22, fontWeight: 800, color: T.text, marginBottom: 4, letterSpacing: "-0.4px" }}>
+        📥 Importa da CSV
+      </h2>
+      <div style={{ fontSize: 13, color: T.textLight, marginBottom: 18 }}>
+        {nomeFile ? nomeFile : "Carica molti ricambi in una volta sola"}
+        {codifica && fase !== "file" ? ` · ${codifica}` : ""}
+      </div>
+
+      {errore && (
+        <div style={{
+          background: "#FEF2F2", border: `1.5px solid ${T.error}`, color: T.error,
+          borderRadius: 14, padding: 13, marginBottom: 12, fontSize: 13.5, fontWeight: 600, lineHeight: 1.5,
+        }}>{errore}</div>
+      )}
+
+      {/* ── 1. IL FILE ──────────────────────────────────── */}
+      {fase === "file" && (
+        <>
+          <div
+            onDragOver={e => { e.preventDefault(); setTrascina(true); }}
+            onDragLeave={() => setTrascina(false)}
+            onDrop={e => {
+              e.preventDefault(); setTrascina(false);
+              apriFile(e.dataTransfer?.files?.[0]);
+            }}
+            style={{
+              border: `2px dashed ${trascina ? T.blue : T.border}`,
+              background: trascina ? T.bluePale : T.card,
+              borderRadius: 18, padding: "34px 18px", textAlign: "center", marginBottom: 14,
+            }}>
+            <div style={{ fontSize: 38, marginBottom: 8 }}>📄</div>
+            <div style={{ fontSize: 15, fontWeight: 700, color: T.text, marginBottom: 4 }}>
+              Trascina qui il file CSV
+            </div>
+            <div style={{ fontSize: 12.5, color: T.textLight, marginBottom: 14 }}>
+              oppure
+            </div>
+            {/* Stessa forma del PhotoPicker: l'input resta FUORI dal label,
+                perché annidato e insieme referenziato da htmlFor il click
+                arriverebbe doppio. */}
+            <PhotoPicker
+              id="csv-import"
+              accept=".csv,text/csv,text/plain"
+              onFile={e => apriFile(e.target.files?.[0])}
+              style={{
+                display: "inline-block", padding: "12px 22px", borderRadius: 14,
+                background: T.blue, color: "white", fontSize: 14.5, fontWeight: 700, cursor: "pointer",
+              }}>
+              Scegli il file
+            </PhotoPicker>
+          </div>
+
+          <Riquadro>
+            <b style={{ color: T.text }}>Come dev'essere fatto il file.</b> Una riga per
+            ricambio e una prima riga con i nomi delle colonne. Servono almeno
+            <b> codice</b> e <b>nome</b>; <i>descrizione</i>, <i>categoria</i>,
+            <i> compatibilità</i> e <i>cartella</i> sono facoltative.
+            I nomi delle colonne li riconosco da solo anche se li scrivi in altro
+            modo — e comunque te li faccio confermare prima di scrivere niente.
+          </Riquadro>
+
+          <button style={bottoneChiaro} onClick={() => scaricaTesto("modello-werfen.csv", MODELLO_CSV)}>
+            ⬇️ Scarica il modello CSV
+          </button>
+          <button style={bottoneChiaro} onClick={onBack}>← Torna al catalogo</button>
+        </>
+      )}
+
+      {/* ── 2. LE COLONNE ───────────────────────────────── */}
+      {fase === "mappa" && (
+        <>
+          <Riquadro colore={T.orange} fondo={T.orangePale}>
+            <b style={{ color: T.text }}>Guarda i valori, non i nomi.</b> Sotto ogni
+            campo ci sono tre valori veri presi dal tuo file: se sono quelli
+            giusti, la colonna è giusta. È l'unico controllo che impedisce di
+            riempire duemila schede col dato sbagliato, perché un file con le
+            colonne invertite è perfettamente valido e nessun errore lo segnala.
+          </Riquadro>
+
+          {avviso && (
+            <Riquadro colore={T.orange} fondo={T.orangePale}>⚠️ {avviso}</Riquadro>
+          )}
+
+          <div style={{ display: "flex", gap: 10, marginBottom: 12, alignItems: "center", flexWrap: "wrap" }}>
+            <label style={{ fontSize: 13, color: T.textMid, fontWeight: 600 }}>Colonne divise da</label>
+            <select
+              value={sep}
+              onChange={e => { setSep(e.target.value); rianalizza(testo, e.target.value); }}
+              style={{ padding: "9px 12px", borderRadius: 12, border: `1.5px solid ${T.border}`, background: T.card, fontSize: 14, color: T.text }}>
+              <option value=";">punto e virgola  ;</option>
+              <option value=",">virgola  ,</option>
+              <option value={"\t"}>tabulazione</option>
+              <option value="|">barra verticale  |</option>
+            </select>
+            <span style={{ fontSize: 12.5, color: T.textLight }}>
+              {nColonne} colonne · {Math.max(0, righe.length - primaRigaDati).toLocaleString("it-IT")} righe
+            </span>
+          </div>
+
+          <label style={{ display: "flex", gap: 9, alignItems: "flex-start", marginBottom: 14, fontSize: 13.5, color: T.textMid }}>
+            <input
+              type="checkbox"
+              checked={conIntestazione}
+              onChange={e => setConIntestazione(e.target.checked)}
+              style={{ marginTop: 3, width: 17, height: 17, flexShrink: 0 }}
+            />
+            <span>La prima riga contiene i <b>nomi delle colonne</b> e non un ricambio</span>
+          </label>
+
+          {CSV_CAMPI.map(c => {
+            const scelta = mappa[c.campo];
+            const esempi = scelta === undefined ? [] : esempiColonna(scelta);
+            const manca = c.obbligatorio && scelta === undefined;
+            return (
+              <div key={c.campo} style={{
+                background: T.card, border: `1.5px solid ${manca ? T.error : T.border}`,
+                borderRadius: 14, padding: 12, marginBottom: 9,
+              }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: esempi.length ? 8 : 0 }}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 14, fontWeight: 700, color: T.text }}>
+                      {c.etichetta}{c.obbligatorio && <span style={{ color: T.error }}> *</span>}
+                    </div>
+                  </div>
+                  <select
+                    value={scelta === undefined ? "" : String(scelta)}
+                    onChange={e => {
+                      const v = e.target.value;
+                      setMappa(m => {
+                        const n = { ...m };
+                        if (v === "") delete n[c.campo]; else n[c.campo] = Number(v);
+                        return n;
+                      });
+                    }}
+                    style={{
+                      padding: "9px 10px", borderRadius: 11, border: `1.5px solid ${T.border}`,
+                      background: T.card, fontSize: 13.5, color: T.text, maxWidth: "58%",
+                    }}>
+                    <option value="">— nessuna —</option>
+                    {Array.from({ length: nColonne }, (_, i) => (
+                      <option key={i} value={String(i)}>
+                        {conIntestazione && intestazione[i] ? `${i + 1}. ${intestazione[i]}` : `Colonna ${i + 1}`}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                {esempi.length > 0 && (
+                  <div style={{ borderTop: `1px solid ${T.border}`, paddingTop: 7 }}>
+                    {esempi.map((v, i) => (
+                      <div key={i} className="wrap-anywhere" style={{ fontSize: 12, color: T.textMid, marginTop: 2 }}>
+                        <span style={{ color: T.textLight }}>·</span> {v}
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {manca && (
+                  <div style={{ fontSize: 12, color: T.error, fontWeight: 600, marginTop: 6 }}>
+                    Senza questo campo non si può importare.
+                  </div>
+                )}
+              </div>
+            );
+          })}
+
+          <button
+            style={{ ...bottonePrimario, background: mancanoObbligatorie.length ? T.textLight : T.blue }}
+            disabled={!!mancanoObbligatorie.length || caricando || !righe.length}
+            onClick={preparaConferma}>
+            {caricando ? "Controllo il catalogo…" : "Le colonne sono giuste →"}
+          </button>
+          <button style={bottoneChiaro} onClick={() => { setFase("file"); setNomeFile(""); }}>
+            ← Cambia file
+          </button>
+        </>
+      )}
+
+      {/* ── 3. LA CONFERMA ──────────────────────────────── */}
+      {fase === "conferma" && analisi && (
+        <>
+          <div style={{
+            background: T.card, border: `1.5px solid ${T.border}`, borderRadius: 18,
+            display: "flex", marginBottom: 12, overflow: "hidden",
+          }}>
+            <Numerone n={daScrivere.length}   testo="da scrivere"   colore={T.blue} />
+            <div style={{ width: 1, background: T.border }} />
+            <Numerone n={giaPresenti.length}  testo="già a catalogo" colore={T.textLight} />
+            <div style={{ width: 1, background: T.border }} />
+            <Numerone n={analisi.scarti.length} testo="con errori"   colore={analisi.scarti.length ? T.orange : T.textLight} />
+          </div>
+
+          {/* La somma scritta per esteso: è quello che rende visibile un
+              difetto di classificazione PRIMA di scrivere. Se i conti non
+              tornano con quello che ti aspetti, la colonna è sbagliata. */}
+          <div style={{ fontSize: 12.5, color: T.textLight, textAlign: "center", marginBottom: 14 }}>
+            {daScrivere.length.toLocaleString("it-IT")} + {giaPresenti.length.toLocaleString("it-IT")} + {analisi.scarti.length.toLocaleString("it-IT")} = {righeLette.toLocaleString("it-IT")} righe lette dal file
+          </div>
+
+          {eccessoGrave && (
+            <Riquadro colore={T.error} fondo="#FEF2F2">
+              <b style={{ color: T.error }}>Il file sembra diviso male.</b> {analisi.colonneInEccesso.toLocaleString("it-IT")} righe
+              hanno più colonne dell'intestazione. Di solito vuol dire che il
+              separatore non è quello giusto, o che da qualche parte c'è una
+              virgoletta aperta e mai chiusa. Torna indietro e controlla
+              l'anteprima prima di scrivere.
+            </Riquadro>
+          )}
+
+          <Riquadro colore={T.orange} fondo={T.orangePale}>
+            <b style={{ color: T.text }}>⚠️ Cosa succede quando premi</b>
+            <div style={{ marginTop: 6 }}>
+              · Aggiungo <b>{daScrivere.length.toLocaleString("it-IT")} ricambi nuovi</b><br />
+              · <b>Non modifico e non cancello niente</b> di quello che c'è già<br />
+              · Salto <b>{giaPresenti.length.toLocaleString("it-IT")} codici</b> perché sono già a catalogo<br />
+              · I ricambi nascono <b>senza foto</b>: si aggiungono dopo, aprendoli
+              {analisi.cartelle.length > 0 && <><br />· Creo <b>{analisi.cartelle.length} cartelle</b></>}
+            </div>
+          </Riquadro>
+
+          {analisi.macchinari.length > 0 && (
+            <Riquadro>
+              <b style={{ color: T.text }}>{analisi.macchinari.length} macchinari</b> trovati
+              nella compatibilità: {analisi.macchinari.slice(0, 12).join(" · ")}
+              {analisi.macchinari.length > 12 ? ` … e altri ${analisi.macchinari.length - 12}` : ""}
+              <div style={{ marginTop: 6, color: T.textLight, fontSize: 12.5 }}>
+                Se sono molti più di quelli che hai davvero, la colonna della
+                compatibilità contiene qualcos'altro: ogni grafia diversa
+                diventa un macchinario a sé nel menu del tecnico.
+              </div>
+            </Riquadro>
+          )}
+
+          {analisi.scarti.length > 0 && (
+            <Riquadro colore={T.orange}>
+              <b style={{ color: T.text }}>{analisi.scarti.length} righe non verranno scritte.</b>
+              <div style={{ marginTop: 6 }}>
+                {[...new Set(analisi.scarti.map(s => s.motivo.replace(/, già alla riga \d+/, "")))].slice(0, 5).map(m => (
+                  <div key={m}>· {m}</div>
+                ))}
+              </div>
+              <button
+                style={{ ...bottoneChiaro, marginTop: 10, padding: 11 }}
+                onClick={scaricaScarti}>
+                ⬇️ Scarica le righe scartate
+              </button>
+            </Riquadro>
+          )}
+
+          <button
+            style={{ ...bottonePrimario, background: daScrivere.length ? T.orange : T.textLight }}
+            disabled={!daScrivere.length}
+            onClick={scrivi}>
+            ✅ Scrivi {daScrivere.length.toLocaleString("it-IT")} ricambi nel catalogo
+          </button>
+          <button style={bottoneChiaro} onClick={() => setFase("mappa")}>← Rivedi le colonne</button>
+        </>
+      )}
+
+      {/* ── 4. LA SCRITTURA ─────────────────────────────── */}
+      {fase === "scrive" && (
+        <div style={{ textAlign: "center", padding: "28px 8px" }}>
+          <Spinner size={34} />
+          <div style={{ fontSize: 17, fontWeight: 700, color: T.text, marginTop: 16 }}>
+            {progresso.fatti.toLocaleString("it-IT")} di {progresso.totale.toLocaleString("it-IT")}
+          </div>
+          <div style={{
+            height: 10, background: T.bluePale, borderRadius: 6, overflow: "hidden",
+            margin: "14px 0 10px",
+          }}>
+            <div style={{
+              height: "100%", background: T.blue, borderRadius: 6,
+              width: `${progresso.totale ? Math.round((progresso.fatti / progresso.totale) * 100) : 0}%`,
+              transition: "width 0.3s",
+            }} />
+          </div>
+          <div style={{ fontSize: 13, color: T.textLight, marginBottom: 18 }}>
+            Non chiudere la pagina. Si scrive a blocchi da 300.
+          </div>
+          <button
+            style={{ ...bottoneChiaro, color: T.error, borderColor: T.border }}
+            onClick={() => { fermato.current = true; }}>
+            Interrompi
+          </button>
+        </div>
+      )}
+
+      {/* ── 5. L'ESITO ──────────────────────────────────── */}
+      {fase === "esito" && esito && (
+        <>
+          <div style={{ textAlign: "center", padding: "10px 0 18px" }}>
+            <div style={{ fontSize: 44 }}>{esito.errore ? "⚠️" : esito.interrotto ? "⏸️" : "✅"}</div>
+            <div style={{ fontSize: 20, fontWeight: 800, color: T.text, marginTop: 8 }}>
+              {esito.scritti.toLocaleString("it-IT")} ricambi nel catalogo
+            </div>
+            {(esito.interrotto || esito.errore) && (
+              <div style={{ fontSize: 13.5, color: T.textMid, marginTop: 6 }}>
+                {esito.interrotto ? "Import interrotto da te." : "Import fermato da un errore."}
+              </div>
+            )}
+          </div>
+
+          {(esito.interrotto || esito.errore) && (
+            <Riquadro colore={T.orange} fondo={T.orangePale}>
+              <b style={{ color: T.text }}>Riprova con lo stesso identico file.</b> I
+              ricambi già scritti verranno riconosciuti dal codice e saltati da
+              soli: verranno aggiunti solo quelli che mancano. Non serve
+              preparare un file ridotto, e ripassare due volte non crea doppioni.
+            </Riquadro>
+          )}
+
+          {esito.annullati > 0 && (
+            <Riquadro colore={T.error} fondo="#FEF2F2">
+              Import annullato: {esito.annullati.toLocaleString("it-IT")} ricambi eliminati.
+            </Riquadro>
+          )}
+
+          {(esito.scartate?.length > 0 || analisi?.scarti?.length > 0) && (
+            <Riquadro colore={T.orange}>
+              <b style={{ color: T.text }}>
+                {((esito.scartate?.length || 0) + (analisi?.scarti?.length || 0)).toLocaleString("it-IT")} righe non sono entrate.
+              </b>
+              <div style={{ marginTop: 4 }}>
+                Il file che scarichi ha le stesse colonne dell'originale più il
+                numero di riga e il motivo: si corregge e si ricarica così com'è.
+              </div>
+              <button style={{ ...bottoneChiaro, marginTop: 10, padding: 11 }} onClick={scaricaScarti}>
+                ⬇️ Scarica le righe scartate
+              </button>
+            </Riquadro>
+          )}
+
+          <button style={bottonePrimario} onClick={onDone}>Vai al catalogo</button>
+
+          {esito.idScritti?.length > 0 && (
+            <button
+              style={{ ...bottoneChiaro, color: T.error }}
+              disabled={caricando}
+              onClick={() => setChiedoAnnulla(true)}>
+              ↩️ Annulla l'import ({esito.idScritti.length.toLocaleString("it-IT")} ricambi)
+            </button>
+          )}
+        </>
+      )}
     </div>
   );
 }
