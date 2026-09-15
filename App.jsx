@@ -812,12 +812,41 @@ const cloud = {
 
   // Controllo dei codici doppi in fase di salvataggio. Una ricerca puntuale
   // su indice: prima scorreva l'intero catalogo tenuto nel client.
+  //
+  // ⚠️ L'IDENTITÀ DI UN CODICE È ESATTA, MAIUSCOLE COMPRESE. "AABB123" e
+  //    "aaBB123" sono due ricambi DIVERSI, e devono poter stare tutti e due
+  //    in archivio: è una regola del magazzino, non una svista da correggere.
+  //    Per questo il confronto che BLOCCA usa .eq() e non .ilike().
+  //
+  //    In più .ilike() era sbagliato anche di suo: in SQL "_" e "%" dentro il
+  //    valore sono jolly, quindi un codice come "AB_12" risultava uguale a
+  //    "AB812" e l'app rifiutava un codice legittimo dicendo che esisteva già.
+  //    È la stessa trappola dei LIKE tolti dalle cartelle.
+  //
+  // Restituisce { esatto, varianti }: "esatto" è il doppione vero e blocca il
+  // salvataggio; "varianti" sono i codici che differiscono SOLO per maiuscole
+  // e servono ad avvisare senza impedire niente — sono legittimi, ma sono
+  // anche il modo tipico in cui un refuso si traveste da ricambio nuovo.
   async partByCode(code, exceptId) {
-    let query = supabase.from("parts").select("id,code").ilike("code", (code || "").trim());
-    if (exceptId) query = query.neq("id", exceptId);
-    const { data, error } = await query.limit(1);
-    if (error) { console.error("partByCode:", error.message, error.code); return null; }
-    return data?.[0] || null;
+    const pulito = (code || "").trim();
+    if (!pulito) return { esatto: null, varianti: [] };
+
+    let esatta = supabase.from("parts").select("id,code").eq("code", pulito);
+    if (exceptId) esatta = esatta.neq("id", exceptId);
+    const { data: uguali, error } = await esatta.limit(1);
+    if (error) { console.error("partByCode:", error.message, error.code); return { esatto: null, varianti: [] }; }
+
+    // I jolly vanno neutralizzati: qui ILIKE serve davvero (cerchiamo le
+    // grafie diverse), ma "_" deve valere un underscore e basta.
+    const perIlike = pulito.replace(/([\\%_])/g, "\\$1");
+    let simili = supabase.from("parts").select("id,code").ilike("code", perIlike);
+    if (exceptId) simili = simili.neq("id", exceptId);
+    const { data: vicini } = await simili.limit(5);
+
+    return {
+      esatto: uguali?.[0] || null,
+      varianti: (vicini || []).filter(v => v.code !== pulito),
+    };
   },
 
   // Galleria di un singolo ricambio, su richiesta: dopo una scansione o
@@ -907,23 +936,36 @@ const cloud = {
   // Storage — una chiamata di rete per ricambio, cioè duemila viaggi per
   // niente su un import che di foto non ne ha nessuna.
 
-  // Tutti i codici già a catalogo, in minuscolo. Si scarica la sola colonna
-  // "code" a pagine da mille: su duemila ricambi sono poche decine di KB, e
-  // confrontare in memoria evita duemila interrogazioni una per codice.
+  // Tutti i codici già a catalogo. Si scarica la sola colonna "code" a pagine
+  // da mille: su duemila ricambi sono poche decine di KB, e confrontare in
+  // memoria evita duemila interrogazioni una per codice.
   //
-  // ⚠️ Il confronto è su lower(btrim(...)), la STESSA espressione
-  //    dell'indice unico parts_code_lower_uidx: se qui si confrontasse il
-  //    codice nudo, "AB-1" passerebbe il controllo accanto a un "ab-1" già
-  //    dentro, e a rifiutarlo sarebbe il database a metà scrittura.
+  // ⚠️ "esatti" è la STESSA espressione del vincolo nel database, btrim(code)
+  //    senza lower(): l'identità di un codice comprende le maiuscole, e
+  //    "AABB123" accanto a "aaBB123" sono due ricambi che devono entrare
+  //    tutti e due. Confrontare in minuscolo, come faceva la prima versione,
+  //    avrebbe fatto saltare il secondo dicendo che c'era già.
+  //
+  //    "perMinuscolo" non serve a decidere niente: serve solo ad avvisare che
+  //    due grafie si somigliano, perché è così che un refuso entra in
+  //    magazzino travestito da ricambio nuovo.
   async codiciEsistenti() {
-    const visti = new Set();
+    const esatti = new Set();
+    const perMinuscolo = new Map();
     const PAGINA = 1000;
     for (let da = 0; ; da += PAGINA) {
       const { data, error } = await supabase
         .from("parts").select("code").range(da, da + PAGINA - 1);
       if (error) { console.error("codiciEsistenti:", error.message, error.code); throw error; }
-      for (const r of data || []) visti.add(String(r.code ?? "").trim().toLowerCase());
-      if (!data || data.length < PAGINA) return visti;
+      for (const r of data || []) {
+        const c = String(r.code ?? "").trim();
+        if (!c) continue;
+        esatti.add(c);
+        const k = c.toLowerCase();
+        if (!perMinuscolo.has(k)) perMinuscolo.set(k, []);
+        if (!perMinuscolo.get(k).includes(c)) perMinuscolo.get(k).push(c);
+      }
+      if (!data || data.length < PAGINA) return { esatti, perMinuscolo };
     }
   },
 
@@ -1054,6 +1096,98 @@ const cloud = {
       tolti += (data || []).length;
     }
     return tolti;
+  },
+
+  // Le cartelle che esistono già nel catalogo, tutte, compresi i livelli
+  // intermedi. Serve alla schermata di import, dove si sceglie dove far
+  // nascere i ricambi.
+  //
+  // ⚠️ Se la funzione SQL non risponde — o non è mai stata installata — NON
+  //    si restituisce un elenco vuoto: un menu vuoto sembrerebbe "non hai
+  //    cartelle", che è una bugia, e questo progetto ha già pagato caro il
+  //    costo delle liste vuote in silenzio. Si ricava l'albero dai dati.
+  async cartelleCatalogo() {
+    const viste = new Set();
+    const aggiungi = (p) => {
+      const pulito = normalizeFolder(p);
+      if (!pulito) return;
+      const parti = pulito.split("/");
+      for (let i = 1; i <= parti.length; i++) viste.add(parti.slice(0, i).join("/"));
+    };
+
+    for (const f of await cloud.listAllFolders()) aggiungi(f);
+    if (viste.size) return [...viste].sort();
+
+    const { data: create } = await supabase.from("part_folders").select("path").limit(2000);
+    for (const r of create || []) aggiungi(r.path);
+    const PAGINA = 1000;
+    for (let da = 0; ; da += PAGINA) {
+      const { data, error } = await supabase.from("parts").select("folder").range(da, da + PAGINA - 1);
+      if (error) { console.error("cartelleCatalogo:", error.message, error.code); break; }
+      for (const r of data || []) aggiungi(r.folder);
+      if (!data || data.length < PAGINA) break;
+    }
+    return [...viste].sort();
+  },
+
+  // ── FOTO IN BLOCCO ────────────────────────────────────────
+
+  // L'elenco dei codici con il loro id, per abbinare i nomi dei file. Si
+  // scaricano tre colonne sole: thumb_url serve unicamente a sapere SE il
+  // ricambio ha già una copertina, non a mostrarla.
+  async mappaCodici() {
+    const perCodice = new Map();      // codice esatto → { id, conFoto }
+    const perMinuscolo = new Map();   // minuscolo → [codici esatti]
+    const PAGINA = 1000;
+    for (let da = 0; ; da += PAGINA) {
+      const { data, error } = await supabase
+        .from("parts").select("id,code,thumb_url").range(da, da + PAGINA - 1);
+      if (error) { console.error("mappaCodici:", error.message, error.code); throw error; }
+      for (const r of data || []) {
+        const code = String(r.code ?? "").trim();
+        if (!code) continue;
+        perCodice.set(code, { id: r.id, conFoto: !!r.thumb_url });
+        const k = code.toLowerCase();
+        if (!perMinuscolo.has(k)) perMinuscolo.set(k, []);
+        perMinuscolo.get(k).push(code);
+      }
+      if (!data || data.length < PAGINA) return { perCodice, perMinuscolo };
+    }
+  },
+
+  // Aggiorna SOLO le tre colonne delle foto.
+  //
+  // ⚠️ Non passa da updatePart, e non è una scorciatoia: updatePart riscrive
+  //    anche codice, nome, descrizione, categoria, cartella e compatibilità
+  //    con quello che ha nel form. È esattamente il meccanismo che, partendo
+  //    da una riga di elenco senza descrizione, aveva già cancellato in
+  //    silenzio le descrizioni dei ricambi modificati dalla lista. Qui si
+  //    stanno caricando fotografie: nient'altro deve muoversi.
+  async aggiornaFotoRicambio(id, immagini) {
+    const salvate = await cloud.savePartPhotos(id, immagini);
+    const { data, error } = await supabase
+      .from("parts")
+      .update({
+        images: salvate,
+        thumb_url: salvate[0]?.thumb || null,
+        photo_url: salvate[0]?.ai || null,
+      })
+      .eq("id", id)
+      .select("id");
+    if (error) {
+      console.error("aggiornaFotoRicambio:", error.message, error.code);
+      if (error.code === "42501") {
+        throw new Error("Questo account non ha i permessi di scrittura sul catalogo.");
+      }
+      throw error;
+    }
+    // Sotto RLS un update non permesso tocca zero righe IN SILENZIO e
+    // tornerebbe "riuscito": la prova che la riga esiste ancora ed è stata
+    // scritta è che torni indietro il suo id.
+    if (!data || !data.length) {
+      throw new Error("Nessuna riga aggiornata: il ricambio è stato eliminato, oppure mancano i permessi.");
+    }
+    return salvate.length;
   },
 
   async addPart(part) {
@@ -1382,6 +1516,12 @@ const MODELLO_CSV = [
 // stessa chiave, e "Compatibilità", "COMPATIBILITA'" e "Compatibilita" pure.
 const csvKey = (s) => String(s ?? "")
   .replace(/^﻿/, "")
+  // Le intestazioni NUMERATE sono comunissime negli export dei gestionali:
+  // "1. Part Number", "2) Nome", "3 - Descrizione". Il numero non fa parte
+  // del nome della colonna, e lasciandolo attaccato "3. Description" non
+  // combacia con nessun alias: la colonna risulta sconosciuta, e la
+  // descrizione va mappata a mano su un file in cui era ovvia.
+  .replace(/^\s*\d{1,3}\s*[.):-]\s*/, "")
   .normalize("NFD").replace(/[̀-ͯ]/g, "")
   .toLowerCase()
   .replace(/[^a-z0-9]+/g, "");
@@ -1585,9 +1725,24 @@ function mappaColonneCSV(intestazione) {
   const sconosciute = [];
   (intestazione || []).forEach((testa, i) => {
     const campo = CSV_MAPPA_ALIAS.get(csvKey(testa));
-    if (campo && mappa[campo] === undefined) mappa[campo] = i;   // primo arrivato vince
+    if (!campo) { sconosciute.push({ indice: i, testa }); return; }
+    // La compatibilità è l'unico campo che prende PIÙ colonne, e tiene un
+    // array anche quando ne ha una sola. Un elenco di magazzino tiene spesso
+    // un macchinario per colonna ("Modello 1", "Modello 2", "Si adatta a"):
+    // prenderne una e basta butterebbe via le altre senza dire niente.
+    if (campo === "compatibilita") {
+      mappa.compatibilita = [...(mappa.compatibilita || []), i];
+      return;
+    }
+    if (mappa[campo] === undefined) mappa[campo] = i;   // primo arrivato vince
     else sconosciute.push({ indice: i, testa });
   });
+  // Nome e descrizione, in un catalogo ricambi, sono quasi sempre la stessa
+  // frase: il nome è "Valvola a sfera 1/2 ottone" e la descrizione la ripete
+  // più distesa. Il nome è obbligatorio, e un file che non ha una colonna sua
+  // non deve per questo bloccare l'import: si prende quella della
+  // descrizione. Resta cambiabile a mano nella schermata delle colonne.
+  if (mappa.nome === undefined && mappa.descrizione !== undefined) mappa.nome = mappa.descrizione;
   return { mappa, sconosciute, senzaIntestazione: Object.keys(mappa).length === 0 };
 }
 
@@ -1636,15 +1791,24 @@ function canonizzatore() {
 //    errore che parla di duplicati mentre guarda un file in cui i codici sono
 //    tutti diversi. Col contatore è unico per costruzione, ed è anche
 //    deterministico: riprovare dopo una caduta di rete non genera id nuovi.
-function costruisciRicambi(righe, mappa, primaRigaDati) {
+function costruisciRicambi(righe, mappa, primaRigaDati, opzioni = {}) {
+  // cartellaFissa: null o assente = la cartella si legge dalla colonna del
+  // file; una stringa (anche vuota, che vuol dire radice) = tutti i ricambi
+  // di questo import finiscono lì, e la colonna viene ignorata.
+  const { cartellaFissa = null } = opzioni;
+  const usaColonnaCartella = cartellaFissa === null || cartellaFissa === undefined;
   const pronti = [], scarti = [];
   const canon = canonizzatore();
   const codiciVisti = new Map();
+  const grafie = new Map();          // minuscolo → prima grafia incontrata
+  const varianti = [];               // codici uguali a meno di maiuscole
   const cartelle = new Set();
   const macchinari = new Set();
   const t0 = Date.now();
   let colonneInEccesso = 0;
-  const larghezza = Math.max(...Object.values(mappa).map(Number), -1) + 1;
+  // I valori della mappa possono essere un numero o un array (compatibilità).
+  const larghezza = Math.max(
+    ...Object.values(mappa).flatMap(v => (Array.isArray(v) ? v : [v])).map(Number), -1) + 1;
 
   for (let r = primaRigaDati; r < righe.length; r++) {
     const riga = righe[r];
@@ -1668,15 +1832,25 @@ function costruisciRicambi(righe, mappa, primaRigaDati) {
     if (!name) { scarti.push({ nRiga, motivo: "nome mancante", riga }); continue; }
     if (code.length > 100) { scarti.push({ nRiga, motivo: "codice più lungo di 100 caratteri", riga }); continue; }
 
-    // Stessa espressione dell'indice unico parts_code_lower_uidx. Va fatto
-    // QUI: un insert di trecento righe è atomico, e un solo doppione le fa
-    // fallire tutte e trecento.
-    const k = code.toLowerCase();
-    if (codiciVisti.has(k)) {
-      scarti.push({ nRiga, motivo: `codice doppio nel file, già alla riga ${codiciVisti.get(k)}`, riga });
+    // Stessa espressione del vincolo nel database, btrim(code): il confronto
+    // è ESATTO, maiuscole comprese. Va fatto QUI perché un insert di trecento
+    // righe è atomico, e un solo doppione vero le fa fallire tutte e trecento.
+    if (codiciVisti.has(code)) {
+      scarti.push({ nRiga, motivo: `codice doppio nel file, già alla riga ${codiciVisti.get(code)}`, riga });
       continue;
     }
-    codiciVisti.set(k, nRiga);
+    codiciVisti.set(code, nRiga);
+
+    // Due codici che differiscono SOLO per le maiuscole sono legittimi e
+    // vengono scritti tutti e due. Ma sono anche il modo in cui un refuso
+    // entra in magazzino travestito da ricambio nuovo: non si scarta niente,
+    // si mette in fila un avviso e decide chi guarda.
+    const kMin = code.toLowerCase();
+    if (grafie.has(kMin)) {
+      if (grafie.get(kMin) !== code) varianti.push({ nRiga, code, gemello: grafie.get(kMin) });
+    } else {
+      grafie.set(kMin, code);
+    }
 
     // Excel l'ha rovinato? Il dato originale non si recupera, ma accorgersene
     // prima di scrivere duemila righe sì.
@@ -1684,8 +1858,17 @@ function costruisciRicambi(righe, mappa, primaRigaDati) {
                    : /^\d{1,2}[/-]\d{1,2}[/-]\d{2,4}$/.test(code) ? "convertito in data da Excel" : "";
     if (rovinato) { scarti.push({ nRiga, motivo: `codice ${rovinato}`, riga }); continue; }
 
-    const folder = cartellaDaCella(cella("cartella"));
-    const compatibility = compatDaCella(cella("compatibilita")).map(canon).filter(Boolean);
+    const folder = usaColonnaCartella ? cartellaDaCella(cella("cartella")) : normalizeFolder(cartellaFissa);
+    // Ogni colonna scelta viene divisa per conto suo, e solo dopo si unisce:
+    // unire prima i testi cambierebbe le regole di divisione dentro la cella
+    // ("Mazak, Haas" in una colonna sola si divide sulla virgola, accanto a
+    // un'altra colonna non più). Il Set toglie i doppioni fra colonne.
+    const colonneCompat = mappa.compatibilita === undefined
+      ? []
+      : (Array.isArray(mappa.compatibilita) ? mappa.compatibilita : [mappa.compatibilita]);
+    const compatibility = [...new Set(
+      colonneCompat.flatMap(i => compatDaCella(String(riga[i] ?? ""))).map(canon).filter(Boolean)
+    )];
     if (folder) cartelle.add(folder);
     for (const m of compatibility) macchinari.add(m);
 
@@ -1705,7 +1888,7 @@ function costruisciRicambi(righe, mappa, primaRigaDati) {
   }
 
   return {
-    pronti, scarti, colonneInEccesso,
+    pronti, scarti, colonneInEccesso, varianti,
     cartelle: [...cartelle].sort(),
     macchinari: [...macchinari].sort(),
   };
@@ -1732,6 +1915,58 @@ function scaricaTesto(nomeFile, testo) {
   a.remove();
   // Rilasciare subito libererebbe l'oggetto prima che il browser lo legga.
   setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
+
+// ── ABBINARE UNA FOTO AL SUO RICAMBIO ───────────────────────
+// Il nome del file È il codice. Le varianti ammesse servono a mettere più
+// foto sullo stesso ricambio: "AB-1234 (2).jpg", "AB-1234_2.jpg", "AB-1234-2".
+//
+// ⚠️ La forma senza suffisso si prova SEMPRE per prima, e c'è un motivo
+//    preciso: un codice può finire davvero per "-2". Se si spezzasse prima di
+//    aver cercato il nome intero, la foto di "AB-2" finirebbe su "AB" come
+//    seconda immagine, e il ricambio giusto resterebbe senza.
+const SUFFISSI_FOTO = [
+  /^(.+?)\s*\((\d{1,3})\)$/,   // AB-1234 (2).jpg   ← copia di Windows
+  /^(.+?)_(\d{1,3})$/,         // AB-1234_2.jpg
+  /^(.+?)-(\d{1,3})$/,         // AB-1234-2.jpg
+];
+
+function abbinaFoto(nomeFile, perCodice, perMinuscolo) {
+  const base = String(nomeFile).replace(/\.[a-z0-9]{1,5}$/i, "").trim();
+
+  const prova = (nome, ordine) => {
+    // 1. Identità esatta, maiuscole comprese: è la regola dell'archivio e
+    //    qui vince sempre, prima di qualunque tentativo più morbido.
+    if (perCodice.has(nome)) {
+      const r = perCodice.get(nome);
+      return { esito: "esatto", code: nome, id: r.id, conFoto: r.conFoto, ordine };
+    }
+    // 2. Solo allora si guarda senza maiuscole, e SOLO se non c'è ambiguità.
+    //    Windows non distingue "AB.jpg" da "ab.jpg" nella stessa cartella,
+    //    quindi da un nome di file non si può ricostruire la grafia esatta:
+    //    se in archivio ci sono due ricambi che differiscono solo per le
+    //    maiuscole, questa foto può appartenere a uno qualsiasi dei due e
+    //    indovinare vorrebbe dire metterla, una volta su due, sul pezzo
+    //    sbagliato. Meglio dirlo e farla assegnare a mano.
+    const gemelli = perMinuscolo.get(nome.toLowerCase()) || [];
+    if (gemelli.length === 1) {
+      const c = gemelli[0], r = perCodice.get(c);
+      return { esito: "maiuscole", code: c, id: r.id, conFoto: r.conFoto, ordine };
+    }
+    if (gemelli.length > 1) return { esito: "ambiguo", gemelli, ordine };
+    return null;
+  };
+
+  const intero = prova(base, 1);
+  if (intero) return intero;
+
+  for (const re of SUFFISSI_FOTO) {
+    const m = re.exec(base);
+    if (!m) continue;
+    const spezzato = prova(m[1].trim(), Number(m[2]) || 1);
+    if (spezzato) return spezzato;
+  }
+  return { esito: "assente" };
 }
 
 // Normalizza le generazioni di dati che si sono succedute. I ricambi più
@@ -2034,7 +2269,7 @@ function FolderPickerDialog({ title, hint, rootLabel, excludePath = "", onPick, 
 // L'<input> è FUORI dal <label>: se fosse annidato e allo stesso tempo
 // referenziato da htmlFor, il browser inoltrerebbe il click due volte
 // e su Android la fotocamera si riaprirebbe dopo lo scatto.
-function PhotoPicker({ id, disabled, onFile, children, style, accept = "image/*" }) {
+function PhotoPicker({ id, disabled, onFile, children, style, accept = "image/*", multiple = false }) {
   return (
     <>
       <label htmlFor={id} style={style}>{children}</label>
@@ -2042,6 +2277,7 @@ function PhotoPicker({ id, disabled, onFile, children, style, accept = "image/*"
         id={id}
         type="file"
         accept={accept}
+        multiple={multiple}
         disabled={disabled}
         onChange={onFile}
         style={{ display: "none" }}
@@ -3601,11 +3837,12 @@ function AdminApp({ partsCount, onAddPart, onUpdatePart, onDeletePart, reloadPar
     <div className="app-shell">
       <Header title="WERFEN SCAN Admin" subtitle="Area amministratore" onLogout={onLogout} />
       <div className="app-content">
-        {tab === "parts" && <PartsListScreen partsCount={partsCount} version={listVersion} onRefresh={refreshList} onEdit={handleEdit} onAdd={handleAddNew} onBrowse={setBrowsingFolder} onDeletePart={onDeletePart} onImport={() => setTab("import")} loadError={loadError} />}
+        {tab === "parts" && <PartsListScreen partsCount={partsCount} version={listVersion} onRefresh={refreshList} onEdit={handleEdit} onAdd={handleAddNew} onBrowse={setBrowsingFolder} onDeletePart={onDeletePart} onImport={() => setTab("import")} onFoto={() => setTab("foto")} loadError={loadError} />}
         {/* Non è una voce della barra in basso: l'import si fa una volta o
             due nella vita del catalogo, e una quarta voce fissa costerebbe
             spazio su ogni schermata per sempre. Ci si arriva dal catalogo. */}
         {tab === "import" && <ImportScreen onDone={handleDone} onBack={() => setTab("parts")} />}
+        {tab === "foto" && <FotoBulkScreen onDone={handleDone} onBack={() => setTab("parts")} />}
         {/* La key forza il remount passando da Edit a New Part: senza,
             il form resterebbe precompilato col ricambio in modifica. */}
         {tab === "add" && (
@@ -3638,7 +3875,7 @@ function AdminApp({ partsCount, onAddPart, onUpdatePart, onDeletePart, reloadPar
 }
 
 // ===================== PARTS LIST =====================
-function PartsListScreen({ partsCount, version, onRefresh, onEdit, onAdd, onBrowse, onDeletePart, onImport, loadError }) {
+function PartsListScreen({ partsCount, version, onRefresh, onEdit, onAdd, onBrowse, onDeletePart, onImport, onFoto, loadError }) {
   const [search, setSearch] = useState("");
   const [confirmDelete, setConfirmDelete] = useState(null);
   const [refreshing, setRefreshing] = useState(false);
@@ -4000,18 +4237,28 @@ function PartsListScreen({ partsCount, version, onRefresh, onEdit, onAdd, onBrow
         }}>+ Aggiungi</button>
       </div>
 
-      <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
+      {/* Le due porte del caricamento di massa stanno qui e non nella barra
+          in basso: si aprono una volta o due nella vita del catalogo, e due
+          voci fisse fra le tre di sempre costerebbero spazio su ogni
+          schermata per sempre. Prima i ricambi, poi le loro foto: è anche
+          l'ordine in cui vanno fatte le cose, perché le foto riconoscono i
+          codici e non il contrario. */}
+      <div style={{ display: "flex", gap: 7, marginBottom: 16 }}>
         <button onClick={refresh} disabled={refreshing} style={{
           flex: 1, padding: 11, borderRadius: 12,
-          background: T.bluePale, color: T.blue, fontSize: 14, fontWeight: 700,
-          display: "flex", alignItems: "center", justifyContent: "center", gap: 8
+          background: T.bluePale, color: T.blue, fontSize: 13.5, fontWeight: 700,
+          display: "flex", alignItems: "center", justifyContent: "center", gap: 6
         }}>
-          {refreshing ? <><Spinner size={16} /> Aggiornamento...</> : "↻ Ricarica"}
+          {refreshing ? <Spinner size={16} /> : "↻ Ricarica"}
         </button>
         <button onClick={onImport} className="tap-sc" style={{
           flex: 1, padding: 11, borderRadius: 12,
-          background: T.bluePale, color: T.blue, fontSize: 14, fontWeight: 700
-        }}>📥 Importa CSV</button>
+          background: T.bluePale, color: T.blue, fontSize: 13.5, fontWeight: 700
+        }}>📥 CSV</button>
+        <button onClick={onFoto} className="tap-sc" style={{
+          flex: 1, padding: 11, borderRadius: 12,
+          background: T.bluePale, color: T.blue, fontSize: 13.5, fontWeight: 700
+        }}>📷 Foto</button>
       </div>
 
       {/* ⚠️ Questo NON è un filtro per cartelle, ed è stato scambiato per
@@ -4272,6 +4519,8 @@ function AddEditPartScreen({ editingPart, defaultFolder = "", onAddPart, onUpdat
   const [compatInput, setCompatInput] = useState("");
   const [saving, setSaving] = useState(false);
   const [errors, setErrors] = useState({});
+  // Avviso che NON blocca: un codice uguale a meno di maiuscole.
+  const [avvisoCodice, setAvvisoCodice] = useState("");
   const [imgLoading, setImgLoading] = useState(false);
 
   function field(key, val) {
@@ -4331,13 +4580,19 @@ function AddEditPartScreen({ editingPart, defaultFolder = "", onAddPart, onUpdat
   // Il controllo dei doppioni interroga il database invece di scorrere un
   // catalogo tenuto in memoria: è una ricerca su indice, e soprattutto vede
   // anche i ricambi aggiunti da un altro dispositivo un minuto fa.
+  // ⚠️ Blocca SOLO il codice identico. Un codice che differisce per le
+  //    maiuscole è un ricambio diverso e deve poter entrare: quello diventa
+  //    un avviso che non impedisce il salvataggio.
   async function validate() {
     const e = {};
     if (!form.code.trim()) e.code = "Il codice è obbligatorio";
     if (!form.name.trim()) e.name = "Il nome è obbligatorio";
     if (!e.code) {
-      const dup = await cloud.partByCode(form.code, editingPart?.id);
-      if (dup) e.code = "Questo codice esiste già nel database";
+      const { esatto, varianti } = await cloud.partByCode(form.code, editingPart?.id);
+      if (esatto) e.code = "Questo codice esiste già nel database";
+      setAvvisoCodice(!esatto && varianti.length
+        ? `In archivio c'è già ${varianti.map(v => v.code).join(", ")}: differisce solo per le maiuscole. Se è lo stesso pezzo, correggi; se sono due pezzi diversi, vai avanti.`
+        : "");
     }
     return e;
   }
@@ -4460,6 +4715,9 @@ function AddEditPartScreen({ editingPart, defaultFolder = "", onAddPart, onUpdat
           style={{ ...inp("code"), fontFamily: "monospace", letterSpacing: 0.5 }}
         />
         {errors.code && <p style={{ color: T.error, fontSize: 12, marginTop: 4 }}>⚠️ {errors.code}</p>}
+        {!errors.code && avvisoCodice && (
+          <p style={{ color: T.orange, fontSize: 12, marginTop: 4, lineHeight: 1.45 }}>⚠️ {avvisoCodice}</p>
+        )}
       </div>
 
       <div style={{ marginBottom: 14 }}>
@@ -4628,6 +4886,10 @@ function ImportScreen({ onDone, onBack }) {
   const [righe, setRighe]       = useState([]);
   const [conIntestazione, setConIntestazione] = useState(true);
   const [mappa, setMappa]       = useState({});
+  // Dove nascono i ricambi di questo import: "__col__" = dalla colonna del
+  // file, "" = nessuna cartella, altrimenti il percorso scelto nel catalogo.
+  const [cartellaScelta, setCartellaScelta] = useState("");
+  const [cartelleCatalogo, setCartelleCatalogo] = useState([]);
   const [analisi, setAnalisi]   = useState(null);
   const [esistenti, setEsistenti] = useState(null);
   const [caricando, setCaricando] = useState(false);
@@ -4659,6 +4921,9 @@ function ImportScreen({ onDone, onBack }) {
       setTesto(trovato.testo);
       setSep(trovato.sep);
       rianalizza(trovato.testo, trovato.sep);
+      cloud.cartelleCatalogo()
+        .then(setCartelleCatalogo)
+        .catch(e => console.error("cartelle:", e));
       setFase("mappa");
     } catch (e) {
       console.error("import: lettura", e);
@@ -4676,6 +4941,9 @@ function ImportScreen({ onDone, onBack }) {
       setRighe(r);
       const { mappa: m } = mappaColonneCSV(r[0] || []);
       setMappa(m);
+      // Se il file ha una colonna cartella si parte da quella; altrimenti i
+      // ricambi nascono nella radice e si sceglie dal menu.
+      setCartellaScelta(m.cartella !== undefined ? "__col__" : "");
       setErrore("");
     } catch (e) {
       setRighe([]); setMappa({});
@@ -4687,7 +4955,9 @@ function ImportScreen({ onDone, onBack }) {
   async function preparaConferma() {
     setCaricando(true); setErrore("");
     try {
-      const a = costruisciRicambi(righe, mappa, primaRigaDati);
+      const a = costruisciRicambi(righe, mappa, primaRigaDati, {
+        cartellaFissa: cartellaScelta === "__col__" ? null : cartellaScelta,
+      });
       // I codici già a catalogo si leggono ADESSO, non in fase di scrittura:
       // il numero che l'amministratore legge prima di premere dev'essere
       // quello vero, non una stima.
@@ -4741,23 +5011,51 @@ function ImportScreen({ onDone, onBack }) {
 
   // ── Derivati ──────────────────────────────────────────────
   const intestazione = righe[0] || [];
-  const esempiColonna = (indice) => {
+  const etichettaColonna = (i) =>
+    (conIntestazione && intestazione[i] ? `${i + 1}. ${intestazione[i]}` : `Colonna ${i + 1}`);
+
+  // Accetta un indice o un elenco di indici: la compatibilità ne usa più di
+  // uno, e gli esempi vanno mostrati uniti come li vedrà il ricambio.
+  const esempiColonna = (scelta) => {
+    const indici = scelta === undefined ? [] : (Array.isArray(scelta) ? scelta : [scelta]);
     const fuori = [];
     for (let r = primaRigaDati; r < righe.length && fuori.length < 3; r++) {
-      const v = String(righe[r]?.[indice] ?? "").trim();
+      const v = indici.map(i => String(righe[r]?.[i] ?? "").trim()).filter(Boolean).join(" · ");
       if (v) fuori.push(v.length > 42 ? v.slice(0, 42) + "…" : v);
     }
     return fuori;
   };
+
+  const colonneCompat = mappa.compatibilita === undefined
+    ? []
+    : (Array.isArray(mappa.compatibilita) ? mappa.compatibilita : [mappa.compatibilita]);
+
+  const cambiaCompat = (i) => setMappa(m => {
+    const attive = m.compatibilita === undefined
+      ? [] : (Array.isArray(m.compatibilita) ? m.compatibilita : [m.compatibilita]);
+    const nuove = attive.includes(i) ? attive.filter(x => x !== i) : [...attive, i].sort((a, b) => a - b);
+    const n = { ...m };
+    if (nuove.length) n.compatibilita = nuove; else delete n.compatibilita;
+    return n;
+  });
   const nColonne = righe.reduce((n, r) => Math.max(n, r.length), 0);
   const mancanoObbligatorie = CSV_CAMPI.filter(c => c.obbligatorio && mappa[c.campo] === undefined);
 
+  // Identità esatta: un codice che differisce solo per le maiuscole da uno
+  // già a catalogo NON è "già presente", è un ricambio nuovo e va scritto.
   const giaPresenti = analisi && esistenti
-    ? analisi.pronti.filter(p => esistenti.has(p.code.toLowerCase()))
+    ? analisi.pronti.filter(p => esistenti.esatti.has(p.code))
     : [];
   const daScrivere = analisi && esistenti
-    ? analisi.pronti.filter(p => !esistenti.has(p.code.toLowerCase()))
+    ? analisi.pronti.filter(p => !esistenti.esatti.has(p.code))
     : [];
+  // Le somiglianze da far vedere: dentro il file, e verso il catalogo.
+  const variantiCatalogo = analisi && esistenti
+    ? daScrivere
+        .map(p => ({ code: p.code, nRiga: p._riga, gemelli: (esistenti.perMinuscolo.get(p.code.toLowerCase()) || []).filter(c => c !== p.code) }))
+        .filter(v => v.gemelli.length)
+    : [];
+  const nVarianti = (analisi?.varianti?.length || 0) + variantiCatalogo.length;
   const righeLette = analisi ? analisi.pronti.length + analisi.scarti.length : 0;
   // Colonne in eccesso su tante righe non è un file sciatto: è il separatore
   // sbagliato o una virgoletta non chiusa, e va detto forte.
@@ -4771,7 +5069,12 @@ function ImportScreen({ onDone, onBack }) {
       ...tutti.map(s => [
         s.nRiga,
         s.motivo,
-        ...CSV_CAMPI.map(c => (mappa[c.campo] === undefined ? "" : (s.riga?.[mappa[c.campo]] ?? ""))),
+        ...CSV_CAMPI.map(c => {
+          const m = mappa[c.campo];
+          if (m === undefined) return "";
+          return (Array.isArray(m) ? m : [m])
+            .map(i => String(s.riga?.[i] ?? "").trim()).filter(Boolean).join(" | ");
+        }),
       ].map(cellaCSV).join(";")),
     ];
     scaricaTesto("scarti-import.csv", righeCsv.join("\r\n"));
@@ -4924,43 +5227,102 @@ function ImportScreen({ onDone, onBack }) {
 
           {CSV_CAMPI.map(c => {
             const scelta = mappa[c.campo];
-            const esempi = scelta === undefined ? [] : esempiColonna(scelta);
+            // La cartella non si legge quasi mai dal file: si sceglie fra
+            // quelle che esistono. Gli esempi presi dalle celle hanno senso
+            // solo quando la colonna la si sta usando davvero.
+            const daColonna = c.campo !== "cartella" || cartellaScelta === "__col__";
+            const esempi = daColonna ? esempiColonna(scelta) : [];
             const manca = c.obbligatorio && scelta === undefined;
+            const comeDescrizione = c.campo === "nome"
+              && scelta !== undefined && scelta === mappa.descrizione;
+            const selettore = {
+              padding: "9px 10px", borderRadius: 11, border: `1.5px solid ${T.border}`,
+              background: T.card, fontSize: 13.5, color: T.text, maxWidth: "58%",
+            };
             return (
               <div key={c.campo} style={{
                 background: T.card, border: `1.5px solid ${manca ? T.error : T.border}`,
                 borderRadius: 14, padding: 12, marginBottom: 9,
               }}>
-                <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: esempi.length ? 8 : 0 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
                   <div style={{ flex: 1, minWidth: 0 }}>
                     <div style={{ fontSize: 14, fontWeight: 700, color: T.text }}>
                       {c.etichetta}{c.obbligatorio && <span style={{ color: T.error }}> *</span>}
                     </div>
+                    {comeDescrizione && (
+                      <div style={{ fontSize: 11.5, color: T.textLight, marginTop: 2 }}>
+                        stessa colonna della descrizione
+                      </div>
+                    )}
                   </div>
-                  <select
-                    value={scelta === undefined ? "" : String(scelta)}
-                    onChange={e => {
-                      const v = e.target.value;
-                      setMappa(m => {
-                        const n = { ...m };
-                        if (v === "") delete n[c.campo]; else n[c.campo] = Number(v);
-                        return n;
-                      });
-                    }}
-                    style={{
-                      padding: "9px 10px", borderRadius: 11, border: `1.5px solid ${T.border}`,
-                      background: T.card, fontSize: 13.5, color: T.text, maxWidth: "58%",
-                    }}>
-                    <option value="">— nessuna —</option>
-                    {Array.from({ length: nColonne }, (_, i) => (
-                      <option key={i} value={String(i)}>
-                        {conIntestazione && intestazione[i] ? `${i + 1}. ${intestazione[i]}` : `Colonna ${i + 1}`}
-                      </option>
-                    ))}
-                  </select>
+
+                  {c.campo === "cartella" ? (
+                    // ⚠️ Qui le opzioni sono le CARTELLE DEL CATALOGO, non le
+                    //    colonne del file: dove va un ricambio è una decisione
+                    //    che si prende guardando l'archivio, non il foglio.
+                    //    La colonna resta disponibile in fondo, per i file che
+                    //    ce l'hanno davvero.
+                    <select value={cartellaScelta} onChange={e => setCartellaScelta(e.target.value)} style={selettore}>
+                      <option value="">🏠 Nessuna cartella</option>
+                      {cartelleCatalogo.map(p => <option key={p} value={p}>📁 {p}</option>)}
+                      {mappa.cartella !== undefined && (
+                        <option value="__col__">📄 dalla colonna «{etichettaColonna(mappa.cartella)}»</option>
+                      )}
+                    </select>
+                  ) : c.campo === "compatibilita" ? (
+                    <span style={{ fontSize: 12.5, fontWeight: 700, color: colonneCompat.length ? T.blue : T.textLight }}>
+                      {colonneCompat.length ? `${colonneCompat.length} scelte` : "nessuna"}
+                    </span>
+                  ) : (
+                    <select
+                      value={scelta === undefined ? "" : String(scelta)}
+                      onChange={e => {
+                        const v = e.target.value;
+                        setMappa(m => {
+                          const n = { ...m };
+                          if (v === "") delete n[c.campo]; else n[c.campo] = Number(v);
+                          return n;
+                        });
+                      }}
+                      style={selettore}>
+                      <option value="">— nessuna —</option>
+                      {Array.from({ length: nColonne }, (_, i) => (
+                        <option key={i} value={String(i)}>{etichettaColonna(i)}</option>
+                      ))}
+                    </select>
+                  )}
                 </div>
+
+                {/* La compatibilità prende PIÙ colonne: un elenco di magazzino
+                    tiene spesso un macchinario per colonna, e con una sola
+                    scelta gli altri sparirebbero senza dire niente. */}
+                {c.campo === "compatibilita" && (
+                  <>
+                    <div style={{ fontSize: 11.5, color: T.textLight, margin: "8px 0 7px", lineHeight: 1.45 }}>
+                      Tocca tutte le colonne che contengono un macchinario: finiscono
+                      insieme sullo stesso ricambio, e diventano le voci del menu che
+                      il tecnico usa per filtrare.
+                    </div>
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                      {Array.from({ length: nColonne }, (_, i) => {
+                        const attiva = colonneCompat.includes(i);
+                        return (
+                          <button key={i} onClick={() => cambiaCompat(i)} style={{
+                            padding: "7px 10px", borderRadius: 10, fontSize: 12, fontWeight: 600,
+                            border: `1.5px solid ${attiva ? T.blue : T.border}`,
+                            background: attiva ? T.bluePale : T.card,
+                            color: attiva ? T.blue : T.textMid,
+                            maxWidth: "100%", whiteSpace: "nowrap",
+                            overflow: "hidden", textOverflow: "ellipsis",
+                          }}>{attiva ? "✓ " : ""}{etichettaColonna(i)}</button>
+                        );
+                      })}
+                    </div>
+                  </>
+                )}
+
                 {esempi.length > 0 && (
-                  <div style={{ borderTop: `1px solid ${T.border}`, paddingTop: 7 }}>
+                  <div style={{ borderTop: `1px solid ${T.border}`, paddingTop: 7, marginTop: 8 }}>
                     {esempi.map((v, i) => (
                       <div key={i} className="wrap-anywhere" style={{ fontSize: 12, color: T.textMid, marginTop: 2 }}>
                         <span style={{ color: T.textLight }}>·</span> {v}
@@ -4968,6 +5330,18 @@ function ImportScreen({ onDone, onBack }) {
                     ))}
                   </div>
                 )}
+
+                {c.campo === "cartella" && cartellaScelta !== "__col__" && (
+                  <div style={{
+                    borderTop: `1px solid ${T.border}`, paddingTop: 7, marginTop: 8,
+                    fontSize: 12, color: T.textMid, lineHeight: 1.45,
+                  }}>
+                    {cartellaScelta
+                      ? <>Tutti i ricambi di questo import vanno in <b>{cartellaScelta}</b></>
+                      : "I ricambi nascono fuori da ogni cartella. Li trovi in cima all'elenco dell'amministratore e li sposti quando vuoi."}
+                  </div>
+                )}
+
                 {manca && (
                   <div style={{ fontSize: 12, color: T.error, fontWeight: 600, marginTop: 6 }}>
                     Senza questo campo non si può importare.
@@ -5030,6 +5404,27 @@ function ImportScreen({ onDone, onBack }) {
               {analisi.cartelle.length > 0 && <><br />· Creo <b>{analisi.cartelle.length} cartelle</b></>}
             </div>
           </Riquadro>
+
+          {nVarianti > 0 && (
+            <Riquadro colore={T.orange} fondo={T.orangePale}>
+              <b style={{ color: T.text }}>
+                {nVarianti.toLocaleString("it-IT")} codici differiscono da un altro solo per le maiuscole.
+              </b>
+              <div style={{ marginTop: 6 }}>
+                Verranno scritti <b>tutti</b>, perché sono ricambi diversi: è la
+                regola dell'archivio. Guardali però una volta, perché è così che
+                un refuso si traveste da ricambio nuovo.
+              </div>
+              <div style={{ marginTop: 8, fontFamily: "monospace", fontSize: 12, color: T.textMid }}>
+                {[...(analisi.varianti || []).map(v => ({ ...v, gemelli: [v.gemello] })), ...variantiCatalogo]
+                  .slice(0, 8)
+                  .map(v => (
+                    <div key={`${v.nRiga}-${v.code}`}>riga {v.nRiga}: {v.code} ≠ {v.gemelli.join(", ")}</div>
+                  ))}
+                {nVarianti > 8 && <div>… e altri {nVarianti - 8}</div>}
+              </div>
+            </Riquadro>
+          )}
 
           {analisi.macchinari.length > 0 && (
             <Riquadro>
@@ -5153,6 +5548,404 @@ function ImportScreen({ onDone, onBack }) {
               ↩️ Annulla l'import ({esito.idScritti.length.toLocaleString("it-IT")} ricambi)
             </button>
           )}
+        </>
+      )}
+    </div>
+  );
+}
+
+// ===================== FOTO IN BLOCCO =====================
+// Si trascina dentro una cartella di fotografie e ognuna va sul suo ricambio,
+// riconosciuta dal nome del file. Le tre versioni — piena 1400px, copertina
+// 512px per l'AI, miniatura 128px — le genera questo browser, esattamente
+// come quando si carica una foto sola dal form: il telefono del tecnico non
+// deve scaricare un pixel in più del necessario.
+//
+// ⚠️ Non tocca nient'altro del ricambio. Codice, nome, descrizione, cartella
+//    e compatibilità restano quelli che sono: qui si stanno caricando
+//    fotografie, e un import che "sistema" anche il resto è il modo in cui si
+//    perde una descrizione scritta a mano.
+function FotoBulkScreen({ onDone, onBack }) {
+  const [fase, setFase]         = useState("file");
+  const [errore, setErrore]     = useState("");
+  const [caricando, setCaricando] = useState(false);
+  const [abbinamenti, setAbbinamenti] = useState([]);
+  const [soloSenzaFoto, setSoloSenzaFoto] = useState(true);
+  const [progresso, setProgresso] = useState({ fatti: 0, totale: 0 });
+  const [esito, setEsito]       = useState(null);
+  const [trascina, setTrascina] = useState(false);
+  const fermato = useRef(false);
+
+  async function scegliFoto(lista) {
+    const files = [...(lista || [])].filter(f => /^image\//.test(f.type) || /\.(jpe?g|png|webp|heic|heif)$/i.test(f.name));
+    if (!files.length) {
+      setErrore("Non ho trovato nessuna immagine fra i file scelti.");
+      return;
+    }
+    setErrore(""); setCaricando(true); setEsito(null);
+    try {
+      const { perCodice, perMinuscolo } = await cloud.mappaCodici();
+      if (!perCodice.size) {
+        setErrore("Il catalogo è vuoto: prima vanno caricati i ricambi, poi le loro foto.");
+        setCaricando(false);
+        return;
+      }
+      const fatti = files
+        .map(file => ({ file, nome: file.name, ...abbinaFoto(file.name, perCodice, perMinuscolo) }))
+        // Più foto sullo stesso ricambio nell'ordine del suffisso, e a parità
+        // di suffisso in ordine di nome: così "(2)" arriva prima di "(10)" e
+        // la copertina è sempre quella che l'occhio si aspetta.
+        .sort((a, b) => (a.ordine || 1) - (b.ordine || 1) || a.nome.localeCompare(b.nome, "it"));
+      setAbbinamenti(fatti);
+      setFase("anteprima");
+    } catch (e) {
+      console.error("foto in blocco: lettura catalogo", e);
+      setErrore(e.message || "Non riesco a leggere i codici dal catalogo.");
+    } finally {
+      setCaricando(false);
+    }
+  }
+
+  // ── Raggruppa per ricambio ────────────────────────────────
+  const gruppi = [];
+  const perId = new Map();
+  for (const a of abbinamenti) {
+    if (a.esito !== "esatto" && a.esito !== "maiuscole") continue;
+    if (!perId.has(a.id)) {
+      const g = { id: a.id, code: a.code, conFoto: a.conFoto, files: [] };
+      perId.set(a.id, g); gruppi.push(g);
+    }
+    perId.get(a.id).files.push(a);
+  }
+  const daFare      = gruppi.filter(g => !soloSenzaFoto || !g.conFoto);
+  const saltati     = gruppi.length - daFare.length;
+  const nonAbbinate = abbinamenti.filter(a => a.esito === "assente");
+  const ambigue     = abbinamenti.filter(a => a.esito === "ambiguo");
+  const fotoDaCaricare = daFare.reduce((n, g) => n + g.files.length, 0);
+
+  // ── Il caricamento vero ───────────────────────────────────
+  async function carica() {
+    fermato.current = false;
+    setFase("carica");
+    setProgresso({ fatti: 0, totale: fotoDaCaricare });
+    const errori = [];
+    let ricambiFatti = 0, fotoFatte = 0;
+
+    for (const g of daFare) {
+      if (fermato.current) break;
+      try {
+        const esistenti = await cloud.loadPartImages(g.id);
+        const spazio = MAX_PART_IMAGES - esistenti.length;
+        if (spazio <= 0) {
+          for (const f of g.files) errori.push({ nome: f.nome, motivo: `${g.code} ha già ${MAX_PART_IMAGES} foto` });
+          setProgresso(p => ({ ...p, fatti: p.fatti + g.files.length }));
+          continue;
+        }
+        const nuove = [];
+        for (const f of g.files.slice(0, spazio)) {
+          if (fermato.current) break;
+          try {
+            // Le stesse tre versioni del form, con le stesse misure: una foto
+            // caricata da qui e una caricata dal telefono devono pesare
+            // uguale, o il risparmio sui dati del tecnico salta da una parte.
+            const full  = await compressImage(f.file, PHOTO_FULL_PX, PHOTO_FULL_Q);
+            const ai    = await makeThumb(full, PHOTO_AI_PX, PHOTO_AI_Q);
+            const thumb = await makeThumb(full, PHOTO_THUMB_PX, PHOTO_THUMB_Q);
+            nuove.push({ full, thumb: thumb || full, ai });
+          } catch (e) {
+            errori.push({ nome: f.nome, motivo: "immagine illeggibile o troppo grande" });
+          }
+          setProgresso(p => ({ ...p, fatti: p.fatti + 1 }));
+        }
+        for (const f of g.files.slice(spazio)) {
+          errori.push({ nome: f.nome, motivo: `${g.code} arriva al massimo di ${MAX_PART_IMAGES} foto` });
+          setProgresso(p => ({ ...p, fatti: p.fatti + 1 }));
+        }
+        if (nuove.length) {
+          await cloud.aggiornaFotoRicambio(g.id, [...esistenti, ...nuove]);
+          ricambiFatti++; fotoFatte += nuove.length;
+        }
+      } catch (e) {
+        console.error("foto in blocco:", g.code, e);
+        // Un ricambio che fallisce non ferma gli altri: il rapporto finale
+        // dirà quali sono rimasti indietro, e si ripassa solo su quelli.
+        for (const f of g.files) errori.push({ nome: f.nome, motivo: e.message || "scrittura non riuscita" });
+        if (/permess/i.test(e.message || "")) { setErrore(e.message); break; }
+      }
+    }
+    setEsito({ ricambiFatti, fotoFatte, errori, interrotto: fermato.current });
+    setFase("esito");
+  }
+
+  function scaricaNonAbbinate() {
+    const righe = [
+      "sep=;",
+      "file;motivo",
+      ...nonAbbinate.map(a => [a.nome, "nessun ricambio con questo codice"].map(cellaCSV).join(";")),
+      ...ambigue.map(a => [a.nome, `più ricambi uguali a meno di maiuscole: ${a.gemelli.join(", ")}`].map(cellaCSV).join(";")),
+      ...(esito?.errori || []).map(e => [e.nome, e.motivo].map(cellaCSV).join(";")),
+    ];
+    scaricaTesto("foto-non-caricate.csv", righe.join("\r\n"));
+  }
+
+  const Riquadro = ({ children, colore = T.border, fondo = T.card }) => (
+    <div style={{
+      background: fondo, border: `1.5px solid ${colore}`, borderRadius: 16,
+      padding: 14, marginBottom: 12, fontSize: 13.5, color: T.textMid, lineHeight: 1.5,
+    }}>{children}</div>
+  );
+  const bottonePrimario = {
+    width: "100%", padding: 15, borderRadius: 14, background: T.blue, color: "white",
+    fontSize: 15.5, fontWeight: 700, marginTop: 6,
+  };
+  const bottoneChiaro = {
+    width: "100%", padding: 13, borderRadius: 14, background: "transparent",
+    color: T.blue, fontSize: 14.5, fontWeight: 600, border: `1.5px solid ${T.border}`, marginTop: 8,
+  };
+
+  return (
+    <div style={{ padding: 16 }}>
+      <h2 style={{ fontSize: 22, fontWeight: 800, color: T.text, marginBottom: 4, letterSpacing: "-0.4px" }}>
+        📷 Foto in blocco
+      </h2>
+      <div style={{ fontSize: 13, color: T.textLight, marginBottom: 18 }}>
+        Una cartella di fotografie, ognuna sul suo ricambio
+      </div>
+
+      {errore && (
+        <div style={{
+          background: "#FEF2F2", border: `1.5px solid ${T.error}`, color: T.error,
+          borderRadius: 14, padding: 13, marginBottom: 12, fontSize: 13.5, fontWeight: 600, lineHeight: 1.5,
+        }}>{errore}</div>
+      )}
+
+      {/* ── 1. LE FOTO ──────────────────────────────────── */}
+      {fase === "file" && (
+        <>
+          <div
+            onDragOver={e => { e.preventDefault(); setTrascina(true); }}
+            onDragLeave={() => setTrascina(false)}
+            onDrop={e => { e.preventDefault(); setTrascina(false); scegliFoto(e.dataTransfer?.files); }}
+            style={{
+              border: `2px dashed ${trascina ? T.blue : T.border}`,
+              background: trascina ? T.bluePale : T.card,
+              borderRadius: 18, padding: "34px 18px", textAlign: "center", marginBottom: 14,
+            }}>
+            <div style={{ fontSize: 38, marginBottom: 8 }}>🖼️</div>
+            <div style={{ fontSize: 15, fontWeight: 700, color: T.text, marginBottom: 4 }}>
+              Trascina qui le fotografie
+            </div>
+            <div style={{ fontSize: 12.5, color: T.textLight, marginBottom: 14 }}>oppure</div>
+            <PhotoPicker
+              id="foto-blocco"
+              multiple
+              disabled={caricando}
+              onFile={e => scegliFoto(e.target.files)}
+              style={{
+                display: "inline-block", padding: "12px 22px", borderRadius: 14,
+                background: T.blue, color: "white", fontSize: 14.5, fontWeight: 700, cursor: "pointer",
+              }}>
+              {caricando ? "Leggo il catalogo…" : "Scegli le foto"}
+            </PhotoPicker>
+          </div>
+
+          <Riquadro>
+            <b style={{ color: T.text }}>Il nome del file è il codice.</b> `AB-1234.jpg`
+            va sul ricambio `AB-1234`. Per mettere più foto sullo stesso pezzo:
+            <span style={{ fontFamily: "monospace" }}> AB-1234 (2).jpg</span>,
+            <span style={{ fontFamily: "monospace" }}> AB-1234_2.jpg</span> o
+            <span style={{ fontFamily: "monospace" }}> AB-1234-3.jpg</span>. La prima
+            diventa la copertina, ed è l'unica che viaggia verso l'AI.
+            Massimo {MAX_PART_IMAGES} foto per ricambio.
+          </Riquadro>
+
+          <Riquadro colore={T.orange} fondo={T.orangePale}>
+            <b style={{ color: T.text }}>Le maiuscole contano, ma i nomi dei file no.</b>{" "}
+            Windows non distingue <span style={{ fontFamily: "monospace" }}>AB.jpg</span> da{" "}
+            <span style={{ fontFamily: "monospace" }}>ab.jpg</span>, quindi se in
+            archivio hai due ricambi che differiscono solo per le maiuscole non
+            c'è modo di sapere a quale appartenga la foto: quei file te li
+            segnalo e restano da assegnare a mano, aprendo il ricambio.
+          </Riquadro>
+
+          <button style={bottoneChiaro} onClick={onBack}>← Torna al catalogo</button>
+        </>
+      )}
+
+      {/* ── 2. L'ANTEPRIMA ──────────────────────────────── */}
+      {fase === "anteprima" && (
+        <>
+          <div style={{
+            background: T.card, border: `1.5px solid ${T.border}`, borderRadius: 18,
+            display: "flex", marginBottom: 12, overflow: "hidden",
+          }}>
+            <div style={{ flex: 1, textAlign: "center", padding: "10px 4px" }}>
+              <div style={{ fontSize: 26, fontWeight: 800, color: T.blue }}>{fotoDaCaricare}</div>
+              <div style={{ fontSize: 11.5, color: T.textLight, fontWeight: 600 }}>foto</div>
+            </div>
+            <div style={{ width: 1, background: T.border }} />
+            <div style={{ flex: 1, textAlign: "center", padding: "10px 4px" }}>
+              <div style={{ fontSize: 26, fontWeight: 800, color: T.blue }}>{daFare.length}</div>
+              <div style={{ fontSize: 11.5, color: T.textLight, fontWeight: 600 }}>ricambi</div>
+            </div>
+            <div style={{ width: 1, background: T.border }} />
+            <div style={{ flex: 1, textAlign: "center", padding: "10px 4px" }}>
+              <div style={{ fontSize: 26, fontWeight: 800, color: (nonAbbinate.length + ambigue.length) ? T.orange : T.textLight }}>
+                {nonAbbinate.length + ambigue.length}
+              </div>
+              <div style={{ fontSize: 11.5, color: T.textLight, fontWeight: 600 }}>senza ricambio</div>
+            </div>
+          </div>
+
+          <label style={{ display: "flex", gap: 9, alignItems: "flex-start", marginBottom: 14, fontSize: 13.5, color: T.textMid }}>
+            <input type="checkbox" checked={soloSenzaFoto}
+              onChange={e => setSoloSenzaFoto(e.target.checked)}
+              style={{ marginTop: 3, width: 17, height: 17, flexShrink: 0 }} />
+            <span>
+              <b>Salta i ricambi che hanno già una foto</b> ({saltati} in questo gruppo)
+              <div style={{ color: T.textLight, fontSize: 12.5, marginTop: 2 }}>
+                Tienilo acceso e ripassare la stessa cartella non aggiunge doppioni.
+                Spegnilo solo se stai aggiungendo di proposito altre foto a
+                ricambi che ne hanno già una.
+              </div>
+            </span>
+          </label>
+
+          {daFare.length > 0 && (
+            <Riquadro>
+              <b style={{ color: T.text }}>Primi abbinamenti</b>
+              <div style={{ marginTop: 6, fontFamily: "monospace", fontSize: 12 }}>
+                {daFare.slice(0, 8).map(g => (
+                  <div key={g.id} className="wrap-anywhere">
+                    {g.files.map(f => f.nome).join(", ")} → <b>{g.code}</b>
+                  </div>
+                ))}
+                {daFare.length > 8 && <div>… e altri {daFare.length - 8} ricambi</div>}
+              </div>
+            </Riquadro>
+          )}
+
+          {ambigue.length > 0 && (
+            <Riquadro colore={T.orange} fondo={T.orangePale}>
+              <b style={{ color: T.text }}>{ambigue.length} foto non so a chi darle.</b>
+              <div style={{ marginTop: 6 }}>
+                Il nome corrisponde a più ricambi che differiscono solo per le
+                maiuscole, e dal nome di un file la grafia esatta non si
+                ricostruisce. Vanno caricate a mano aprendo il ricambio giusto.
+              </div>
+              <div style={{ marginTop: 8, fontFamily: "monospace", fontSize: 12 }}>
+                {ambigue.slice(0, 5).map(a => (
+                  <div key={a.nome} className="wrap-anywhere">{a.nome} → {a.gemelli.join(" · ")}</div>
+                ))}
+              </div>
+            </Riquadro>
+          )}
+
+          {nonAbbinate.length > 0 && (
+            <Riquadro colore={T.orange}>
+              <b style={{ color: T.text }}>{nonAbbinate.length} foto senza un ricambio.</b>
+              <div style={{ marginTop: 6 }}>
+                Nessun codice a catalogo corrisponde al nome del file. Se i
+                ricambi non li hai ancora caricati, fallo prima: le foto
+                riconoscono i codici, non il contrario.
+              </div>
+              <div style={{ marginTop: 8, fontFamily: "monospace", fontSize: 12 }}>
+                {nonAbbinate.slice(0, 5).map(a => <div key={a.nome} className="wrap-anywhere">{a.nome}</div>)}
+                {nonAbbinate.length > 5 && <div>… e altre {nonAbbinate.length - 5}</div>}
+              </div>
+              <button style={{ ...bottoneChiaro, marginTop: 10, padding: 11 }} onClick={scaricaNonAbbinate}>
+                ⬇️ Scarica l'elenco
+              </button>
+            </Riquadro>
+          )}
+
+          <Riquadro colore={T.orange} fondo={T.orangePale}>
+            <b style={{ color: T.text }}>⚠️ Cosa succede quando premi</b>
+            <div style={{ marginTop: 6 }}>
+              · Carico <b>{fotoDaCaricare} foto</b> su <b>{daFare.length} ricambi</b><br />
+              · Di ogni foto genero tre versioni: piena, copertina per l'AI, miniatura<br />
+              · <b>Non tocco nient'altro</b>: codice, nome, descrizione e cartella restano quelli<br />
+              · Le foto già presenti su un ricambio <b>non vengono sostituite</b>: le nuove vanno in coda
+            </div>
+          </Riquadro>
+
+          <button
+            style={{ ...bottonePrimario, background: fotoDaCaricare ? T.orange : T.textLight }}
+            disabled={!fotoDaCaricare}
+            onClick={carica}>
+            ✅ Carica {fotoDaCaricare} foto
+          </button>
+          <button style={bottoneChiaro} onClick={() => { setFase("file"); setAbbinamenti([]); }}>
+            ← Scegli altre foto
+          </button>
+        </>
+      )}
+
+      {/* ── 3. IL CARICAMENTO ───────────────────────────── */}
+      {fase === "carica" && (
+        <div style={{ textAlign: "center", padding: "28px 8px" }}>
+          <Spinner size={34} />
+          <div style={{ fontSize: 17, fontWeight: 700, color: T.text, marginTop: 16 }}>
+            {progresso.fatti} di {progresso.totale} foto
+          </div>
+          <div style={{ height: 10, background: T.bluePale, borderRadius: 6, overflow: "hidden", margin: "14px 0 10px" }}>
+            <div style={{
+              height: "100%", background: T.blue, borderRadius: 6,
+              width: `${progresso.totale ? Math.round((progresso.fatti / progresso.totale) * 100) : 0}%`,
+              transition: "width 0.3s",
+            }} />
+          </div>
+          <div style={{ fontSize: 13, color: T.textLight, marginBottom: 18 }}>
+            Ogni foto viene rimpicciolita qui prima di partire: è la parte lenta,
+            ed è anche quella che fa risparmiare dati ai tecnici. Non chiudere la pagina.
+          </div>
+          <button style={{ ...bottoneChiaro, color: T.error }} onClick={() => { fermato.current = true; }}>
+            Interrompi
+          </button>
+        </div>
+      )}
+
+      {/* ── 4. L'ESITO ──────────────────────────────────── */}
+      {fase === "esito" && esito && (
+        <>
+          <div style={{ textAlign: "center", padding: "10px 0 18px" }}>
+            <div style={{ fontSize: 44 }}>{esito.interrotto ? "⏸️" : esito.errori.length ? "⚠️" : "✅"}</div>
+            <div style={{ fontSize: 20, fontWeight: 800, color: T.text, marginTop: 8 }}>
+              {esito.fotoFatte} foto su {esito.ricambiFatti} ricambi
+            </div>
+            {esito.interrotto && (
+              <div style={{ fontSize: 13.5, color: T.textMid, marginTop: 6 }}>Caricamento interrotto da te.</div>
+            )}
+          </div>
+
+          {(esito.interrotto || esito.errori.length > 0) && (
+            <Riquadro colore={T.orange} fondo={T.orangePale}>
+              <b style={{ color: T.text }}>Ripassa pure la stessa cartella.</b> Con
+              "salta i ricambi che hanno già una foto" acceso, quelli sistemati
+              vengono lasciati stare e si riprende da dove eri rimasto.
+            </Riquadro>
+          )}
+
+          {(esito.errori.length > 0 || nonAbbinate.length > 0 || ambigue.length > 0) && (
+            <Riquadro colore={T.orange}>
+              <b style={{ color: T.text }}>
+                {esito.errori.length + nonAbbinate.length + ambigue.length} foto non sono entrate.
+              </b>
+              <div style={{ marginTop: 8, fontFamily: "monospace", fontSize: 12 }}>
+                {esito.errori.slice(0, 6).map((e, i) => (
+                  <div key={i} className="wrap-anywhere">{e.nome} — {e.motivo}</div>
+                ))}
+              </div>
+              <button style={{ ...bottoneChiaro, marginTop: 10, padding: 11 }} onClick={scaricaNonAbbinate}>
+                ⬇️ Scarica l'elenco completo
+              </button>
+            </Riquadro>
+          )}
+
+          <button style={bottonePrimario} onClick={onDone}>Vai al catalogo</button>
+          <button style={bottoneChiaro} onClick={() => { setFase("file"); setAbbinamenti([]); setEsito(null); }}>
+            📷 Carica altre foto
+          </button>
         </>
       )}
     </div>
