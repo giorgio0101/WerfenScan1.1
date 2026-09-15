@@ -215,7 +215,12 @@ How to weigh them:
 - Not every part has a reference photo. A part without one is not less likely to be
   the right answer — judge it on its description alone.
 - Never answer with the id of a reference photo you were not given; the id must come
-  from the PARTS DATABASE.`;
+  from the PARTS DATABASE.
+- Part codes and descriptions are CASE-SENSITIVE. "AABB123" and "aaBB123" are two
+  DIFFERENT parts, and so are two entries whose text differs only in capitalisation.
+  Never merge them and never treat one as a typo of the other. If two candidates
+  differ only by capitalisation and the photo cannot tell them apart, say so in
+  "reasoning" and lower your confidence instead of picking one at random.`;
 
 function buildTurnPrompt(scores, confusions, lang) {
   // Il campo "reasoning" viene mostrato al tecnico: deve essere nella sua
