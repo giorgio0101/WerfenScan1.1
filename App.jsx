@@ -2335,6 +2335,57 @@ function Gallery({ images, height = 200 }) {
   );
 }
 
+// ===================== CAMPO PASSWORD =====================
+// Password con l'occhio per rileggerla mentre la si scrive. Non è un vezzo:
+// si entra da un telefono, spesso in officina e spesso con i guanti, e una
+// password scritta alla cieca è il primo motivo per cui un accesso fallisce
+// tre volte di fila — e alla terza il tecnico chiama l'amministratore.
+//
+// ⚠️ Il pulsante è type="button" ESPLICITO. Dentro un form, un <button> senza
+//    type vale "submit": premere l'occhio manderebbe il login invece di
+//    mostrare la password.
+//
+// La visibilità non è ricordata da nessuna parte e riparte sempre nascosta:
+// una password che resta in chiaro perché "l'ultima volta l'avevo mostrata"
+// è un regalo a chi guarda lo schermo da dietro.
+function CampoPassword({
+  value, onChange, placeholder, onKeyDown, style,
+  autoComplete = "current-password", colore = "white",
+}) {
+  const [visibile, setVisibile] = useState(false);
+  const etichetta = visibile ? "Nascondi la password" : "Mostra la password";
+  return (
+    <div style={{ position: "relative", marginBottom: style?.marginBottom ?? 0 }}>
+      <input
+        type={visibile ? "text" : "password"}
+        placeholder={placeholder}
+        autoComplete={autoComplete}
+        autoCapitalize="none" autoCorrect="off" spellCheck={false}
+        value={value}
+        onChange={onChange}
+        onKeyDown={onKeyDown}
+        // Lo spazio a destra tiene il testo lontano dall'occhio: senza, una
+        // password lunga ci finisce sotto e non si legge proprio quando la
+        // si è appena scoperta.
+        style={{ ...style, marginBottom: 0, paddingRight: 50 }}
+      />
+      <button
+        type="button"
+        onClick={() => setVisibile(v => !v)}
+        aria-label={etichetta}
+        title={etichetta}
+        style={{
+          position: "absolute", right: 4, top: 0, bottom: 0, width: 44,
+          display: "flex", alignItems: "center", justifyContent: "center",
+          background: "transparent", border: "none", padding: 0,
+          fontSize: 17, color: colore, opacity: visibile ? 1 : 0.6, cursor: "pointer",
+        }}>
+        {visibile ? "🙈" : "👁️"}
+      </button>
+    </div>
+  );
+}
+
 // ===================== LOGIN SCREEN (Supabase Auth) =====================
 function LoginScreen({ expiredReason }) {
   const { t } = useT();
@@ -2483,8 +2534,8 @@ function LoginScreen({ expiredReason }) {
               onChange={e => { setEmail(e.target.value); setError(""); }}
               style={inputStyle}
             />
-            <input
-              type="password" placeholder={t("login.password")} autoComplete="current-password"
+            <CampoPassword
+              placeholder={t("login.password")} autoComplete="current-password"
               value={password}
               onChange={e => { setPassword(e.target.value); setError(""); }}
               onKeyDown={e => e.key === "Enter" && handleLogin()}
@@ -2571,13 +2622,16 @@ function NewPasswordScreen({ onDone }) {
           {t("login.newPwdBody")}
         </p>
 
-        <input
-          type="password" placeholder={t("login.newPwd")} autoComplete="new-password"
+        {/* Qui l'occhio conta ancora di più che nel login: si sta SCEGLIENDO
+            una password, e sbagliarla due volte di fila nello stesso modo
+            significa restare fuori senza capire perché. */}
+        <CampoPassword
+          placeholder={t("login.newPwd")} autoComplete="new-password"
           value={pwd} onChange={e => { setPwd(e.target.value); setError(""); }}
           style={inputStyle}
         />
-        <input
-          type="password" placeholder={t("login.newPwdConfirm")} autoComplete="new-password"
+        <CampoPassword
+          placeholder={t("login.newPwdConfirm")} autoComplete="new-password"
           value={confirm} onChange={e => { setConfirm(e.target.value); setError(""); }}
           onKeyDown={e => e.key === "Enter" && save()}
           style={inputStyle}
@@ -5030,6 +5084,37 @@ function ImportScreen({ onDone, onBack }) {
     ? []
     : (Array.isArray(mappa.compatibilita) ? mappa.compatibilita : [mappa.compatibilita]);
 
+  // Le colonne già assegnate a un altro campo non sono macchinari: mostrarle
+  // fra le levette è rumore da scorrere prima di arrivare a quelle vere.
+  // Restano visibili se sono GIÀ selezionate come compatibilità, perché
+  // niente deve sparire da sotto le mani di chi sta scegliendo.
+  const colonneAltrove = new Set(
+    Object.entries(mappa)
+      .filter(([campo]) => campo !== "compatibilita")
+      .flatMap(([, v]) => (Array.isArray(v) ? v : [v]))
+      .map(Number)
+  );
+  const colonneLibere = Array.from({ length: nColonne }, (_, i) => i).filter(i => {
+    if (colonneCompat.includes(i)) return true;    // già scelta: non sparisce
+    if (colonneAltrove.has(i)) return false;       // assegnata a un altro campo
+    // Anche una colonna NON assegnata può essere palesemente di un altro
+    // campo: un file con due colonne "descrizione" ne usa una sola, e la
+    // seconda resta libera pur non avendo niente a che fare coi macchinari.
+    const campo = conIntestazione ? CSV_MAPPA_ALIAS.get(csvKey(intestazione[i])) : undefined;
+    return !campo || campo === "compatibilita";
+  });
+
+  // Sulle levette il numero d'ordine sparisce: serviva solo a distinguere due
+  // colonne che si chiamano allo stesso modo, e allora lo si rimette a quelle
+  // e basta.
+  const nomiLevette = colonneLibere.map(i => (conIntestazione ? String(intestazione[i] ?? "").trim() : ""));
+  const etichettaLevetta = (i) => {
+    const pos = colonneLibere.indexOf(i);
+    const nome = pos < 0 ? "" : nomiLevette[pos];
+    if (!nome) return `Colonna ${i + 1}`;
+    return nomiLevette.filter(x => x === nome).length > 1 ? `${nome} (${i + 1})` : nome;
+  };
+
   const cambiaCompat = (i) => setMappa(m => {
     const attive = m.compatibilita === undefined
       ? [] : (Array.isArray(m.compatibilita) ? m.compatibilita : [m.compatibilita]);
@@ -5304,7 +5389,7 @@ function ImportScreen({ onDone, onBack }) {
                       il tecnico usa per filtrare.
                     </div>
                     <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-                      {Array.from({ length: nColonne }, (_, i) => {
+                      {colonneLibere.map(i => {
                         const attiva = colonneCompat.includes(i);
                         return (
                           <button key={i} onClick={() => cambiaCompat(i)} style={{
@@ -5314,9 +5399,14 @@ function ImportScreen({ onDone, onBack }) {
                             color: attiva ? T.blue : T.textMid,
                             maxWidth: "100%", whiteSpace: "nowrap",
                             overflow: "hidden", textOverflow: "ellipsis",
-                          }}>{attiva ? "✓ " : ""}{etichettaColonna(i)}</button>
+                          }}>{attiva ? "✓ " : ""}{etichettaLevetta(i)}</button>
                         );
                       })}
+                      {colonneLibere.length === 0 && (
+                        <span style={{ fontSize: 12, color: T.textLight }}>
+                          Tutte le colonne del file sono già assegnate a un altro campo.
+                        </span>
+                      )}
                     </div>
                   </>
                 )}
@@ -6049,10 +6139,11 @@ function SettingsScreen({ partsCount, userEmail }) {
         ].map(({ val, set, label, ph }, idx) => (
           <div key={idx} style={{ marginBottom: 14 }}>
             <label style={{ display: "block", fontSize: 13, fontWeight: 600, color: T.textMid, marginBottom: 6 }}>{label}</label>
-            <input
-              type="password" value={val} autoComplete="new-password"
+            <CampoPassword
+              value={val} autoComplete="new-password"
               onChange={e => { set(e.target.value); setFeedback({ msg: "", type: "" }); }}
               placeholder={ph}
+              colore={T.textLight}
               style={{ width: "100%", padding: "13px 16px", borderRadius: 14, border: `1.5px solid ${T.border}`, background: T.bg, fontSize: 15, color: T.text }}
             />
           </div>
