@@ -5065,6 +5065,13 @@ function ImportScreen({ onDone, onBack }) {
 
   // ── Derivati ──────────────────────────────────────────────
   const intestazione = righe[0] || [];
+  // ⚠️ DEVE restare quassù, sopra colonneLibere e le levette della
+  //    compatibilità. Dichiarata più in basso, le costanti che la usano la
+  //    leggerebbero prima che esista: JavaScript solleva un ReferenceError
+  //    mentre disegna, React smonta tutto e la schermata diventa NERA. Non è
+  //    un errore che esbuild veda, né che si noti senza aprire quella
+  //    schermata: lo trova test-tdz.mjs.
+  const nColonne = righe.reduce((n, r) => Math.max(n, r.length), 0);
   const etichettaColonna = (i) =>
     (conIntestazione && intestazione[i] ? `${i + 1}. ${intestazione[i]}` : `Colonna ${i + 1}`);
 
@@ -5123,7 +5130,6 @@ function ImportScreen({ onDone, onBack }) {
     if (nuove.length) n.compatibilita = nuove; else delete n.compatibilita;
     return n;
   });
-  const nColonne = righe.reduce((n, r) => Math.max(n, r.length), 0);
   const mancanoObbligatorie = CSV_CAMPI.filter(c => c.obbligatorio && mappa[c.campo] === undefined);
 
   // Identità esatta: un codice che differisce solo per le maiuscole da uno
@@ -6512,3 +6518,5 @@ export default function App() {
     </LangContext.Provider>
   );
 }
+
+      
