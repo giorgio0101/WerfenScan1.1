@@ -1155,6 +1155,26 @@ const cloud = {
     return [...viste].sort();
   },
 
+  // Il rapporto sulle valutazioni dei tecnici. Un oggetto solo, calcolato
+  // dal database: contare persone distinte in memoria avrebbe voluto dire
+  // scaricare tutte le righe sul telefono dell'amministratore.
+  //
+  // ⚠️ Lo stesso taglio che applica analyze.js — le valutazioni anteriori
+  //    all'ultima modifica della scheda non contano. Deve essere lo stesso,
+  //    o si tarerebbe l'AI guardando numeri che il modello non vede.
+  async feedbackReport(giorni = 90) {
+    const { data, error } = await supabase.rpc("feedback_report", { giorni });
+    if (error) {
+      console.error("feedbackReport:", error.message, error.code);
+      // 42883 = la funzione non esiste: feedback.sql non è stato eseguito.
+      // È un caso da spiegare, non un guasto da nascondere.
+      throw new Error(error.code === "42883"
+        ? "Manca la funzione feedback_report: esegui feedback.sql in Supabase (punto 4m del SETUP)."
+        : error.message);
+    }
+    return data || null;
+  },
+
   // ── FOTO IN BLOCCO ────────────────────────────────────────
 
   // L'elenco dei codici con il loro id, per abbinare i nomi dei file. Si
@@ -6074,6 +6094,164 @@ function FotoBulkScreen({ onDone, onBack }) {
 }
 
 // ===================== SETTINGS =====================
+// ===================== PANNELLO RICONOSCIMENTO =====================
+// Quello che i tecnici hanno risposto, nella stessa forma in cui lo legge
+// l'AI. Serve a una decisione precisa: alzare o no AI_EFFORT, e su quali
+// schede vale la pena lavorare.
+//
+// ⚠️ Ogni numero che parla di persone conta PERSONE DISTINTE. Dieci conferme
+//    di dieci tecnici sono dieci pareri indipendenti; dieci conferme dello
+//    stesso tecnico sono un parere ripetuto dieci volte. Mostrarli con lo
+//    stesso numero farebbe prendere decisioni sbagliate, ed è il motivo per
+//    cui accanto a "volte" c'è sempre "persone".
+function FeedbackPanel() {
+  const [giorni, setGiorni] = useState(90);
+  const [dati, setDati] = useState(null);
+  const [errore, setErrore] = useState("");
+  const [caricando, setCaricando] = useState(true);
+
+  useEffect(() => {
+    let vivo = true;
+    setCaricando(true); setErrore("");
+    cloud.feedbackReport(giorni)
+      .then(r => { if (vivo) setDati(r); })
+      .catch(e => { if (vivo) { setErrore(e.message || "Rapporto non disponibile."); setDati(null); } })
+      .finally(() => { if (vivo) setCaricando(false); });
+    return () => { vivo = false; };
+  }, [giorni]);
+
+  const t = dati?.totali || {};
+  const valutazioni = Number(t.valutazioni || 0);
+  const corrette = Number(t.corrette || 0);
+  const percentuale = valutazioni ? Math.round((corrette / valutazioni) * 100) : null;
+  const settimane = dati?.settimane || [];
+  const mancati = dati?.mancati || [];
+  const peggiori = dati?.peggiori || [];
+  const confusioni = dati?.confusioni || [];
+
+  const Titoletto = ({ children }) => (
+    <div style={{ fontSize: 12.5, fontWeight: 700, color: T.textMid, margin: "16px 0 8px" }}>{children}</div>
+  );
+  const Riga = ({ code, name, persone, volte, extra }) => (
+    <div style={{ display: "flex", gap: 10, alignItems: "baseline", padding: "7px 0", borderTop: `1px solid ${T.border}` }}>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div className="wrap-anywhere" style={{ fontFamily: "monospace", fontSize: 11.5, color: T.blue, fontWeight: 700 }}>{code}</div>
+        <div className="wrap-anywhere" style={{ fontSize: 12.5, color: T.text }}>{name}{extra}</div>
+      </div>
+      <div style={{ textAlign: "right", flexShrink: 0 }}>
+        <div style={{ fontSize: 14, fontWeight: 800, color: T.text }}>{persone}</div>
+        <div style={{ fontSize: 10.5, color: T.textLight }}>{persone === 1 ? "tecnico" : "tecnici"} · {volte}×</div>
+      </div>
+    </div>
+  );
+
+  return (
+    <div style={{ background: T.card, borderRadius: 20, padding: 20, border: `1px solid ${T.border}`, boxShadow: T.shadow, marginBottom: 16 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 4 }}>
+        <h3 style={{ fontWeight: 800, color: T.text, fontSize: 17, flex: 1 }}>📊 Riconoscimento</h3>
+        <select value={giorni} onChange={e => setGiorni(Number(e.target.value))}
+          style={{ padding: "7px 9px", borderRadius: 10, border: `1.5px solid ${T.border}`, background: T.card, fontSize: 12.5, color: T.text }}>
+          <option value={30}>30 giorni</option>
+          <option value={90}>90 giorni</option>
+          <option value={365}>un anno</option>
+        </select>
+      </div>
+
+      {caricando && <div style={{ padding: "18px 0", textAlign: "center" }}><Spinner size={22} /></div>}
+
+      {!caricando && errore && (
+        <div style={{ background: "#FEF2F2", border: `1px solid ${T.error}`, borderRadius: 12, padding: 12, fontSize: 12.5, color: T.error, lineHeight: 1.5 }}>
+          {errore}
+        </div>
+      )}
+
+      {!caricando && !errore && valutazioni === 0 && (
+        <p style={{ color: T.textMid, fontSize: 13, lineHeight: 1.6, marginTop: 6 }}>
+          Nessuna valutazione in questo periodo. I tecnici rispondono 👍 o 👎 sotto
+          ogni scansione: finché non arrivano risposte, l'AI lavora solo sul testo
+          delle schede e non c'è niente da misurare.
+        </p>
+      )}
+
+      {!caricando && !errore && valutazioni > 0 && (
+        <>
+          <div style={{ display: "flex", marginTop: 10, borderRadius: 14, overflow: "hidden", border: `1px solid ${T.border}` }}>
+            {[
+              { n: `${percentuale}%`, e: "corrette", c: percentuale >= 80 ? T.success : percentuale >= 60 ? T.orange : T.error },
+              { n: valutazioni, e: "valutazioni", c: T.text },
+              { n: Number(t.tecnici || 0), e: Number(t.tecnici) === 1 ? "tecnico" : "tecnici", c: T.text },
+            ].map((b, i) => (
+              <div key={i} style={{ flex: 1, textAlign: "center", padding: "10px 4px", borderLeft: i ? `1px solid ${T.border}` : "none" }}>
+                <div style={{ fontSize: 22, fontWeight: 800, color: b.c }}>{b.n}</div>
+                <div style={{ fontSize: 11, color: T.textLight, fontWeight: 600 }}>{b.e}</div>
+              </div>
+            ))}
+          </div>
+
+          {settimane.length > 1 && (
+            <>
+              <Titoletto>Andamento per settimana</Titoletto>
+              {settimane.map(s => {
+                const v = Number(s.valutazioni || 0), c = Number(s.corrette || 0);
+                const p = v ? Math.round((c / v) * 100) : 0;
+                return (
+                  <div key={s.settimana} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 5 }}>
+                    <span style={{ fontSize: 11, color: T.textLight, width: 62, flexShrink: 0 }}>{s.settimana}</span>
+                    <div style={{ flex: 1, height: 8, background: T.bluePale, borderRadius: 4, overflow: "hidden" }}>
+                      <div style={{ width: `${p}%`, height: "100%", background: p >= 80 ? T.success : p >= 60 ? T.orange : T.error }} />
+                    </div>
+                    <span style={{ fontSize: 11, color: T.textMid, width: 58, textAlign: "right", flexShrink: 0 }}>{p}% · {v}</span>
+                  </div>
+                );
+              })}
+            </>
+          )}
+
+          {mancati.length > 0 && (
+            <>
+              <Titoletto>🔍 Non li trova: schede da riscrivere</Titoletto>
+              <p style={{ fontSize: 11.5, color: T.textLight, lineHeight: 1.5, marginBottom: 2 }}>
+                L'AI ha risposto "nessuna corrispondenza" e il tecnico ha trovato il
+                pezzo da solo. È la lista su cui conviene lavorare per prima: quasi
+                sempre la descrizione è povera, o manca la foto.
+              </p>
+              {mancati.map(m => (
+                <Riga key={m.id} code={m.code} name={m.name} persone={Number(m.trovato_da)} volte={Number(m.volte)}
+                  extra={m.con_foto ? "" : <span style={{ color: T.orange, fontWeight: 600 }}> · senza foto</span>} />
+              ))}
+            </>
+          )}
+
+          {peggiori.length > 0 && (
+            <>
+              <Titoletto>👎 Più segnalati come sbagliati</Titoletto>
+              {peggiori.map(p => <Riga key={p.id} code={p.code} name={p.name} persone={Number(p.segnalato_da)} volte={Number(p.volte)} />)}
+            </>
+          )}
+
+          {confusioni.length > 0 && (
+            <>
+              <Titoletto>🔀 Coppie che si confondono</Titoletto>
+              {confusioni.map((c, i) => (
+                <Riga key={i} code={`${c.proposto_code} → ${c.vero_code}`}
+                  name={`${c.proposto_name} scambiato per ${c.vero_name}`}
+                  persone={Number(c.tecnici)} volte={Number(c.volte)} />
+              ))}
+            </>
+          )}
+
+          <p style={{ fontSize: 11.5, color: T.textLight, lineHeight: 1.6, marginTop: 16, paddingTop: 12, borderTop: `1px solid ${T.border}` }}>
+            Questi numeri sono gli stessi che legge l'AI a ogni scansione. Una scheda
+            entra nel suo contesto con <b>due tecnici diversi</b> che l'hanno valutata,
+            oppure con tre valutazioni della stessa persona. Correggere una scheda
+            <b> azzera i giudizi precedenti</b>: quelli parlavano di un altro testo.
+          </p>
+        </>
+      )}
+    </div>
+  );
+}
+
 function SettingsScreen({ partsCount, userEmail }) {
   const [newPwd, setNewPwd] = useState("");
   const [confirmPwd, setConfirmPwd] = useState("");
@@ -6141,6 +6319,8 @@ function SettingsScreen({ partsCount, userEmail }) {
           <div style={{ color: "rgba(255,255,255,0.6)", fontSize: 13 }}>nel database</div>
         </div>
       </div>
+
+      <FeedbackPanel />
 
       {/* Chiave AI — ora server-side */}
       <div style={{ background: T.card, borderRadius: 20, padding: 20, border: `1px solid ${T.border}`, boxShadow: T.shadow, marginBottom: 16 }}>
