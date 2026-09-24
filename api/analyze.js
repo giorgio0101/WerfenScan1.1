@@ -52,6 +52,9 @@ const PROMPT_DESC_MAX = 600;       // caratteri di descrizione mandati all'AI
 const MAX_SCORES      = 150;       // contatori feedback nel prompt (i più votati)
 const MAX_FEEDBACK    = 2000;      // valutazioni lette per costruire i contatori
 const MAX_CONFUSIONS  = 30;        // coppie di confusione passate nel prompt
+const MAX_MISSED      = 40;        // ricambi che il modello non trova mai
+const MIN_VOTERS      = 2;         // tecnici DIVERSI perché un ricambio entri
+const MIN_REPEATS     = 3;         // ...oppure tante valutazioni da uno solo
 const MAX_IMAGE_CHARS = 8_000_000; // ~6 MB di base64
 
 // ── Le foto del catalogo viaggiano col testo ─────────────────
@@ -222,7 +225,7 @@ How to weigh them:
   differ only by capitalisation and the photo cannot tell them apart, say so in
   "reasoning" and lower your confidence instead of picking one at random.`;
 
-function buildTurnPrompt(scores, confusions, lang) {
+function buildTurnPrompt(scores, confusions, missed, lang) {
   // Il campo "reasoning" viene mostrato al tecnico: deve essere nella sua
   // lingua. Sta qui e non nel blocco in cache, altrimenti italiano e inglese
   // userebbero due cache separate invece di condividerne una.
@@ -236,9 +239,13 @@ function buildTurnPrompt(scores, confusions, lang) {
 TECHNICIAN FEEDBACK — PER-PART TRACK RECORD (refers to the "id" field above):
 ${scores.map(s => JSON.stringify(s)).join("\n")}
 
-A high "confirmed" count means that part's description has proven reliable. A high
-"reported_wrong" count means it has been proposed incorrectly before — treat it with
-more scrutiny and require clearer visual evidence before choosing it.
+"confirmed_by" and "reported_wrong_by" count DISTINCT technicians; "times" is the total
+number of evaluations. Weigh PEOPLE, not repetitions: several technicians agreeing is
+far stronger evidence than one technician repeating the same verdict ten times.
+
+A part confirmed by several technicians has a description that has proven reliable. A
+part reported wrong by several technicians has been proposed incorrectly before — treat
+it with more scrutiny and require clearer visual evidence before choosing it.
 `
     : "";
 
@@ -247,15 +254,37 @@ more scrutiny and require clearer visual evidence before choosing it.
 TECHNICIAN FEEDBACK — RECURRING CONFUSIONS:
 ${confusions.map(c => JSON.stringify(c)).join("\n")}
 
-Each entry means: technicians reported that a part identified as "wrongly_identified_as"
-turned out to be "actually_was", that many times. When the image could plausibly match
+Each entry means: "by_technicians" distinct technicians reported, "times" times in total,
+that a part identified as "wrongly_identified_as" turned out to be "actually_was". A pair
+reported by several different people is a real confusion; one reported many times by a
+single person may be one recurring job. When the image could plausibly match
 either side of such a pair, weigh the evidence more carefully and prefer the part whose
 specific visual details actually appear in the photo. Do not blindly flip to the other
 part — use these only as a warning that the two are easily mistaken.
 `
     : "";
 
-  return `${scoreSection}${confusionSection}
+  // ⚠️ Questa sezione non esisteva, e con lei si buttava via il segnale più
+  //    prezioso che i tecnici producono: i pezzi che il modello NON trova.
+  //    Sono quelli la cui scheda è scritta male — esattamente i casi in cui
+  //    un aiuto serve.
+  const missedSection = missed.length
+    ? `
+TECHNICIAN FEEDBACK — PARTS THIS MODEL FAILED TO PROPOSE:
+${missed.map(m => JSON.stringify(m)).join("\n")}
+
+Each entry is a catalogue part that technicians had to identify themselves because a scan
+answered "no match": "found_by_technicians" distinct people, "times" times in total. Their
+written description is probably poor or incomplete, which is precisely why they get
+overlooked. Before answering "no match", check these parts against the photo one more
+time.
+
+This is NOT permission to prefer them over a part that genuinely fits, and NOT a reason to
+lower your confidence bar: it is a reason not to overlook them.
+`
+    : "";
+
+  return `${scoreSection}${confusionSection}${missedSection}
 Identify which catalogue part the photo above shows.
 
 Reply ONLY with valid JSON (no extra text, no markdown, no backticks).
@@ -282,44 +311,112 @@ async function supabaseSelect(supabaseUrl, supabaseAnon, token, path) {
 // Aggrega le valutazioni dei tecnici: quante conferme e quante smentite per
 // ricambio, e quali coppie vengono scambiate più spesso. Prima girava sul
 // telefono di ogni tecnico a ogni avvio dell'app.
-function aggregateFeedback(rows) {
-  const byPart = new Map();
-  const pairs  = new Map();
+function aggregateFeedback(rows, updatedAt = new Map()) {
+  const byPart = new Map();   // id    → { ok:Set(persone), ko:Set(persone), tot }
+  const pairs  = new Map();   // "A>B" → { chi:Set(persone), volte }
+  const missed = new Map();   // id    → { chi:Set(persone), volte }
+
+  // Una valutazione vale per un ricambio solo se è SUCCESSIVA all'ultima
+  // modifica di QUEL ricambio: se la scheda è stata riscritta, i giudizi di
+  // prima parlavano di un altro testo e di un'altra foto. Senza questo taglio
+  // correggere una descrizione non servirebbe a niente — la cattiva
+  // reputazione continuerebbe a pesare fino a uscire dalla finestra delle
+  // ultime MAX_FEEDBACK righe, cioè per mesi.
+  //
+  // La stessa riga può contare per un ricambio e non per l'altro: il taglio è
+  // per ricambio, non per riga.
+  const vale = (partId, quando) => {
+    const limite = updatedAt.get(String(partId));
+    if (!limite) return true;                       // scheda mai modificata
+    const t = Date.parse(quando || "");
+    return !Number.isFinite(t) || t >= limite;      // data illeggibile: si tiene
+  };
+
+  // ⚠️ Righe senza user_id: contano tutte come UNA persona sconosciuta, non
+  //    come una ciascuna. Delle due approssimazioni possibili questa è quella
+  //    prudente — sbagliare per eccesso gonfierebbe il conteggio delle
+  //    persone, che è esattamente il numero su cui il modello si fida di più.
+  //    Il totale "times" resta comunque vero, quindi nessuna informazione va
+  //    persa: si dichiara solo di non sapere quante teste ci fossero.
+  //    (Oggi non dovrebbero esistere: addFeedback rifiuta di scrivere senza
+  //    sessione attiva. Vale per righe inserite a mano.)
+  const autoreDi = (f) => f.user_id || "sconosciuto";
 
   for (const f of rows || []) {
     const pid = f.predicted_part_id;
-    if (pid) {
-      const s = byPart.get(pid) || { ok: 0, ko: 0 };
-      if (f.is_correct) s.ok++; else s.ko++;
+    const cid = f.correct_part_id;
+    const autore = autoreDi(f);
+
+    if (pid && vale(pid, f.created_at)) {
+      const s = byPart.get(pid) || { ok: new Set(), ko: new Set(), tot: 0 };
+      (f.is_correct ? s.ok : s.ko).add(autore);
+      s.tot++;
       byPart.set(pid, s);
     }
-    if (!f.is_correct && pid && f.correct_part_id && pid !== f.correct_part_id) {
-      const key = `${pid}>${f.correct_part_id}`;
-      pairs.set(key, (pairs.get(key) || 0) + 1);
+
+    // ⚠️ continue, NON return: in un ciclo for...of un return uscirebbe
+    //    dall'intera funzione, e la prima conferma incontrata azzererebbe
+    //    tutti i conteggi restituendo undefined.
+    if (f.is_correct || !cid) continue;
+
+    if (pid && pid !== cid && vale(pid, f.created_at)) {
+      const key = `${pid}>${cid}`;
+      const p = pairs.get(key) || { chi: new Set(), volte: 0 };
+      p.chi.add(autore); p.volte++;
+      pairs.set(key, p);
+    }
+
+    // ⚠️ Il segnale che prima finiva nel cestino: il modello non ha proposto
+    //    NIENTE e il tecnico ha detto lui qual era il pezzo. È il caso che
+    //    grida "questa scheda è descritta male" più di ogni altro, e la
+    //    vecchia aggregazione lo scartava perché partiva sempre dal ricambio
+    //    proposto — che qui non c'è.
+    if (!pid && vale(cid, f.created_at)) {
+      const m = missed.get(cid) || { chi: new Set(), volte: 0 };
+      m.chi.add(autore); m.volte++;
+      missed.set(cid, m);
     }
   }
 
   // Ordinamento deterministico: due scansioni con gli stessi dati devono
   // produrre lo stesso testo, altrimenti il modello riceve rumore inutile.
-  // Solo i ricambi con un bilancio significativo, e non tutti: con un
-  // catalogo grande questa sezione sta nella parte NON in cache, quindi
-  // ogni voce si ripaga a ogni singola scansione. I ricambi con una sola
-  // valutazione non dicono nulla di statisticamente utile.
+  // Si ordina per PERSONE, poi per volte, poi per id.
+  const perPersone = (x, y) =>
+    y[1].chi.size - x[1].chi.size || y[1].volte - x[1].volte || x[0].localeCompare(y[0]);
+
+  // Non tutti i ricambi, e non tutti i pareri: questa sezione sta nella parte
+  // NON in cache del prompt, quindi ogni voce si ripaga a ogni scansione.
+  //
+  // Si entra con DUE TECNICI DIVERSI, oppure con tre valutazioni di una
+  // persona sola — che a quel punto non è una svista, è un'insistenza da
+  // ascoltare. Un solo parere isolato non dice niente e costa comunque.
   const scores = [...byPart.entries()]
-    .filter(([, s]) => s.ok + s.ko >= 2)
-    .sort((a, b) => (b[1].ok + b[1].ko) - (a[1].ok + a[1].ko) || a[0].localeCompare(b[0]))
+    .filter(([, s]) => (s.ok.size + s.ko.size) >= MIN_VOTERS || s.tot >= MIN_REPEATS)
+    .sort((x, y) => (y[1].ok.size + y[1].ko.size) - (x[1].ok.size + x[1].ko.size)
+                 || y[1].tot - x[1].tot || x[0].localeCompare(y[0]))
     .slice(0, MAX_SCORES)
-    .map(([id, s]) => ({ id, confirmed: s.ok, reported_wrong: s.ko }));
+    .map(([id, s]) => ({
+      id,
+      confirmed_by: s.ok.size,        // persone diverse, non righe
+      reported_wrong_by: s.ko.size,
+      times: s.tot,
+    }));
 
   const confusions = [...pairs.entries()]
-    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .sort(perPersone)
     .slice(0, MAX_CONFUSIONS)
-    .map(([key, times]) => {
+    .map(([key, p]) => {
       const [predicted, actual] = key.split(">");
-      return { wrongly_identified_as: predicted, actually_was: actual, times };
+      return { wrongly_identified_as: predicted, actually_was: actual,
+               by_technicians: p.chi.size, times: p.volte };
     });
 
-  return { scores, confusions };
+  const missedParts = [...missed.entries()]
+    .sort(perPersone)
+    .slice(0, MAX_MISSED)
+    .map(([id, m]) => ({ id, found_by_technicians: m.chi.size, times: m.volte }));
+
+  return { scores, confusions, missed: missedParts };
 }
 
 export default async function handler(req, res) {
@@ -441,8 +538,20 @@ export default async function handler(req, res) {
   const partsQuery = (cols) =>
     `parts?select=${cols}${machineFilter}&order=created_at.desc&limit=${MAX_PARTS + 1}`;
 
-  let photoColumn = true;
+  // Due colonne facoltative, due ripieghi. photo_url arriva con ai-photos.sql
+  // e updated_at con feedback.sql: se il codice va in produzione prima
+  // dell'SQL, PostgREST risponde 400 su una colonna che non esiste e senza
+  // rete ogni scansione morirebbe lì. Si scende di un gradino alla volta, e
+  // ogni gradino lascia una riga nei log invece di sparire in silenzio.
+  let photoColumn = true, updatedColumn = true;
   const fetchParts = async () => {
+    try {
+      return await supabaseSelect(supabaseUrl, supabaseAnon, token,
+        partsQuery(`${PART_COLS},photo_url,updated_at`));
+    } catch (e) {
+      console.error("updated_at non leggibile (feedback.sql non applicato?):", e.message);
+      updatedColumn = false;
+    }
     try {
       return await supabaseSelect(supabaseUrl, supabaseAnon, token,
         partsQuery(`${PART_COLS},photo_url`));
@@ -453,12 +562,15 @@ export default async function handler(req, res) {
     }
   };
 
-  let safeParts, scores, safeConfusions, truncated = false;
+  let safeParts, scores, safeConfusions, safeMissed, truncated = false;
   try {
     const [partRows, feedbackRows] = await Promise.all([
       fetchParts(),
       supabaseSelect(supabaseUrl, supabaseAnon, token,
-        `scan_feedback?select=predicted_part_id,correct_part_id,is_correct&order=created_at.desc&limit=${MAX_FEEDBACK}`)
+        // user_id serve a contare PERSONE invece che righe; created_at a
+        // buttare via i giudizi anteriori all'ultima modifica della scheda.
+        // Nessuno dei due finisce nel prompt: servono solo a contare.
+        `scan_feedback?select=predicted_part_id,correct_part_id,is_correct,user_id,created_at&order=created_at.desc&limit=${MAX_FEEDBACK}`)
         .catch((e) => { console.error("feedback:", e.message); return []; }),
     ]);
 
@@ -500,7 +612,17 @@ export default async function handler(req, res) {
         : "",
     }));
 
-    ({ scores, confusions: safeConfusions } = aggregateFeedback(feedbackRows));
+    // id → quando la scheda è cambiata l'ultima volta. Se la colonna non c'è
+    // la mappa resta vuota e nessuna valutazione viene scartata: si torna al
+    // comportamento di prima, che è il ripiego giusto.
+    const updatedAt = new Map();
+    for (const p of partRows) {
+      const t = Date.parse(p?.updated_at || "");
+      if (Number.isFinite(t)) updatedAt.set(String(p?.id ?? ""), t);
+    }
+
+    ({ scores, confusions: safeConfusions, missed: safeMissed } =
+      aggregateFeedback(feedbackRows, updatedAt));
   } catch (e) {
     console.error("lettura catalogo:", e);
     return res.status(503).json({ error: "Impossibile leggere il catalogo. Riprova." });
@@ -566,7 +688,7 @@ export default async function handler(req, res) {
               type: "image",
               source: { type: "base64", media_type: image.media_type, data: image.data },
             },
-            { type: "text", text: buildTurnPrompt(scores, safeConfusions, body?.lang) },
+            { type: "text", text: buildTurnPrompt(scores, safeConfusions, safeMissed, body?.lang) },
           ],
         }],
       }),
@@ -602,6 +724,13 @@ export default async function handler(req, res) {
       photos: photoParts.length,
       photos_left_out: photosLeftOut,
       photo_column: photoColumn,
+      // Le tre sezioni dei feedback: se restano a zero mentre i tecnici
+      // valutano, o le soglie non sono raggiunte o updated_at sta buttando
+      // via tutto — e conviene saperlo dai log invece che dai risultati.
+      fb_scores: scores.length,
+      fb_confusions: safeConfusions.length,
+      fb_missed: safeMissed.length,
+      updated_column: updatedColumn,
       input: u.input_tokens ?? 0,
       cache_write: u.cache_creation_input_tokens ?? 0,
       cache_read: u.cache_read_input_tokens ?? 0,
