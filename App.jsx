@@ -525,10 +525,35 @@ const GLOBAL_STYLES = `
     -webkit-font-smoothing: antialiased;
     -webkit-tap-highlight-color: transparent;
     width: 100%;
+    /* ⚠️ clip, NON hidden — su Android era il motivo per cui la pagina non
+       si scorreva col dito, e il guasto è istruttivo.
+
+       "overflow-x: hidden" su un elemento NON taglia e basta: lo trasforma in
+       un contenitore di scorrimento, e l'asse verticale passa da "visible" ad
+       "auto". Con quella regola su html E su body, il body diventava uno
+       scroller alto quanto il suo contenuto — quindi con ZERO pixel da
+       scorrere — che intercettava il gesto del dito. Normalmente lo avrebbe
+       passato alla pagina sotto, ma "overscroll-behavior-y: contain" serve
+       proprio a impedire quel passaggio: il gesto moriva lì e la schermata
+       restava immobile. Rotella e scorrimento da codice continuavano a
+       funzionare, per questo su desktop non si vedeva, e iOS gestisce la
+       propagazione in modo diverso, per questo sull'iPhone non si vedeva.
+
+       "overflow-x: clip" taglia senza creare nessuno scroller. La riga
+       "hidden" resta prima come ripiego per i browser che non conoscono clip
+       (Chrome < 90, Safari < 16), e su quelli il guasto non torna lo stesso
+       perché contain si è spostato su html — vedi sotto. */
     overflow-x: hidden;
+    overflow-x: clip;
   }
-  body { overscroll-behavior-y: contain; line-height: 1.4; }
-  #root { width: 100%; overflow-x: hidden; }
+  /* ⚠️ contain va su HTML, che è l'elemento che scorre davvero, non su body.
+     Sul body serviva a togliere il "tira per aggiornare" di Android, ma se
+     per qualunque ragione il body torna a essere uno scroller, lì contain
+     blocca il dito invece della pagina. Su html fa la stessa cosa senza
+     poter bloccare niente. */
+  html { overscroll-behavior-y: contain; }
+  body { line-height: 1.4; }
+  #root { width: 100%; overflow-x: hidden; overflow-x: clip; }
 
   /* Colonna dell'app. 100dvh segue il ridimensionamento della barra di
      Chrome su mobile; 100vh resta come fallback per i browser più vecchi. */
@@ -6518,5 +6543,3 @@ export default function App() {
     </LangContext.Provider>
   );
 }
-
-      
