@@ -1129,6 +1129,29 @@ const cloud = {
     return tolti;
   },
 
+  // Le categorie già in uso, in ordine alfabetico. Non serve una funzione
+  // SQL: si legge una colonna sola, poche decine di KB anche con duemila
+  // ricambi, e si raggruppa qui.
+  //
+  // ⚠️ Nessuna normalizzazione: "Valvole" e "valvole" restano due categorie
+  //    distinte, come sono nel database. Suggerirle serve proprio a NON
+  //    farle nascere — una volta nate, fonderle in silenzio cambierebbe i
+  //    dati alle spalle di chi le ha scritte.
+  async categorieCatalogo() {
+    const viste = new Set();
+    const PAGINA = 1000;
+    for (let da = 0; ; da += PAGINA) {
+      const { data, error } = await supabase
+        .from("parts").select("category").range(da, da + PAGINA - 1);
+      if (error) { console.error("categorieCatalogo:", error.message, error.code); return [...viste].sort(); }
+      for (const r of data || []) {
+        const c = String(r.category ?? "").trim();
+        if (c) viste.add(c);
+      }
+      if (!data || data.length < PAGINA) return [...viste].sort((a, b) => a.localeCompare(b, "it"));
+    }
+  },
+
   // Le cartelle che esistono già nel catalogo, tutte, compresi i livelli
   // intermedi. Serve alla schermata di import, dove si sceglie dove far
   // nascere i ricambi.
@@ -1949,8 +1972,12 @@ function costruisciRicambi(righe, mappa, primaRigaDati, opzioni = {}) {
   // cartellaFissa: null o assente = la cartella si legge dalla colonna del
   // file; una stringa (anche vuota, che vuol dire radice) = tutti i ricambi
   // di questo import finiscono lì, e la colonna viene ignorata.
-  const { cartellaFissa = null } = opzioni;
+  // Stessa forma per cartella e categoria: null o assente = si legge dalla
+  // colonna del file; una stringa (anche vuota) = vale per TUTTE le righe di
+  // questo import, e la colonna viene ignorata.
+  const { cartellaFissa = null, categoriaFissa = null } = opzioni;
   const usaColonnaCartella = cartellaFissa === null || cartellaFissa === undefined;
+  const usaColonnaCategoria = categoriaFissa === null || categoriaFissa === undefined;
   const pronti = [], scarti = [];
   const canon = canonizzatore();
   const codiciVisti = new Map();
@@ -2031,7 +2058,7 @@ function costruisciRicambi(righe, mappa, primaRigaDati, opzioni = {}) {
       code,
       name,
       description: cella("descrizione"),
-      category: cella("categoria"),
+      category: usaColonnaCategoria ? cella("categoria") : String(categoriaFissa).trim(),
       folder,                       // stringa vuota per la radice, mai null
       compatibility,
       images: [],
@@ -4722,10 +4749,16 @@ function AddEditPartScreen({ editingPart, defaultFolder = "", onAddPart, onUpdat
   // I percorsi già in uso, suggeriti mentre si scrive. Se la chiamata
   // fallisce si resta senza suggerimenti: il campo è testo libero comunque.
   const [folderHints, setFolderHints] = useState([]);
+  // Le categorie già usate, suggerite mentre si scrive. Stesso trattamento
+  // delle cartelle: il campo resta libero — inventarne una nuova deve
+  // restare possibile — ma scegliere quella che esiste è più veloce che
+  // riscriverla, e soprattutto non la sdoppia con una maiuscola diversa.
+  const [categoryHints, setCategoryHints] = useState([]);
   const [pickingFolder, setPickingFolder] = useState(false);
   useEffect(() => {
     let alive = true;
     cloud.listAllFolders().then(f => { if (alive) setFolderHints(f); });
+    cloud.categorieCatalogo().then(c => { if (alive) setCategoryHints(c); });
     return () => { alive = false; };
   }, []);
 
@@ -4981,9 +5014,20 @@ function AddEditPartScreen({ editingPart, defaultFolder = "", onAddPart, onUpdat
       <div style={{ marginBottom: 14 }}>
         <label style={{ display: "block", fontSize: 13, fontWeight: 600, color: T.textMid, marginBottom: 6 }}>Categoria / Tipo</label>
         <input value={form.category} onChange={e => field("category", e.target.value)}
+          list="category-suggestions"
           placeholder="es. Meccanica, Elettronica, Idraulica"
           style={inp("category")}
         />
+        {/* Le categorie già in uso. Restano suggerimenti, non una gabbia: il
+            campo accetta comunque un testo nuovo. */}
+        <datalist id="category-suggestions">
+          {categoryHints.map(c => <option key={c} value={c} />)}
+        </datalist>
+        {categoryHints.length > 0 && (
+          <p style={{ color: T.textLight, fontSize: 11.5, marginTop: 5, lineHeight: 1.45 }}>
+            {categoryHints.length} categorie già in uso: tocca il campo per vederle.
+          </p>
+        )}
       </div>
 
       {/* Categoria e cartella dicono due cose diverse e non vanno fuse:
@@ -5138,6 +5182,11 @@ function ImportScreen({ onDone, onBack }) {
   // file, "" = nessuna cartella, altrimenti il percorso scelto nel catalogo.
   const [cartellaScelta, setCartellaScelta] = useState("");
   const [cartelleCatalogo, setCartelleCatalogo] = useState([]);
+  // "__col__" = dalla colonna del file, "" = nessuna categoria,
+  // "__nuova__" = quella scritta a mano qui sotto, altrimenti il nome scelto.
+  const [categoriaScelta, setCategoriaScelta] = useState("__col__");
+  const [categoriaNuova, setCategoriaNuova] = useState("");
+  const [categorieCatalogo, setCategorieCatalogo] = useState([]);
   const [analisi, setAnalisi]   = useState(null);
   const [esistenti, setEsistenti] = useState(null);
   const [caricando, setCaricando] = useState(false);
@@ -5172,6 +5221,9 @@ function ImportScreen({ onDone, onBack }) {
       cloud.cartelleCatalogo()
         .then(setCartelleCatalogo)
         .catch(e => console.error("cartelle:", e));
+      cloud.categorieCatalogo()
+        .then(setCategorieCatalogo)
+        .catch(e => console.error("categorie:", e));
       setFase("mappa");
     } catch (e) {
       console.error("import: lettura", e);
@@ -5192,6 +5244,9 @@ function ImportScreen({ onDone, onBack }) {
       // Se il file ha una colonna cartella si parte da quella; altrimenti i
       // ricambi nascono nella radice e si sceglie dal menu.
       setCartellaScelta(m.cartella !== undefined ? "__col__" : "");
+      // Se il file ha una colonna categoria si parte da quella: è il caso in
+      // cui ogni riga ha la sua, e cambiarlo d'ufficio sarebbe una sorpresa.
+      setCategoriaScelta(m.categoria !== undefined ? "__col__" : "");
       setErrore("");
     } catch (e) {
       setRighe([]); setMappa({});
@@ -5205,6 +5260,7 @@ function ImportScreen({ onDone, onBack }) {
     try {
       const a = costruisciRicambi(righe, mappa, primaRigaDati, {
         cartellaFissa: cartellaScelta === "__col__" ? null : cartellaScelta,
+        categoriaFissa,
       });
       // I codici già a catalogo si leggono ADESSO, non in fase di scrittura:
       // il numero che l'amministratore legge prima di premere dev'essere
@@ -5280,6 +5336,12 @@ function ImportScreen({ onDone, onBack }) {
     }
     return fuori;
   };
+
+  // La categoria che finirà su ogni ricambio: null vuol dire "dalla colonna".
+  const categoriaFissa =
+    categoriaScelta === "__col__" ? null :
+    categoriaScelta === "__nuova__" ? categoriaNuova.trim() :
+    categoriaScelta;
 
   const colonneCompat = mappa.compatibilita === undefined
     ? []
@@ -5515,7 +5577,9 @@ function ImportScreen({ onDone, onBack }) {
             // La cartella non si legge quasi mai dal file: si sceglie fra
             // quelle che esistono. Gli esempi presi dalle celle hanno senso
             // solo quando la colonna la si sta usando davvero.
-            const daColonna = c.campo !== "cartella" || cartellaScelta === "__col__";
+            const daColonna =
+              (c.campo !== "cartella"  || cartellaScelta  === "__col__") &&
+              (c.campo !== "categoria" || categoriaScelta === "__col__");
             const esempi = daColonna ? esempiColonna(scelta) : [];
             const manca = c.obbligatorio && scelta === undefined;
             const comeDescrizione = c.campo === "nome"
@@ -5554,6 +5618,18 @@ function ImportScreen({ onDone, onBack }) {
                         <option value="__col__">📄 dalla colonna «{etichettaColonna(mappa.cartella)}»</option>
                       )}
                     </select>
+                  ) : c.campo === "categoria" ? (
+                    // Stessa scelta della cartella: o la colonna del file, o
+                    // una categoria sola per tutto il lotto. Il secondo caso
+                    // è la norma quando si carica un gruppo omogeneo.
+                    <select value={categoriaScelta} onChange={e => setCategoriaScelta(e.target.value)} style={selettore}>
+                      {mappa.categoria !== undefined && (
+                        <option value="__col__">📄 dalla colonna «{etichettaColonna(mappa.categoria)}»</option>
+                      )}
+                      <option value="">— nessuna —</option>
+                      {categorieCatalogo.map(c2 => <option key={c2} value={c2}>🏷️ {c2}</option>)}
+                      <option value="__nuova__">✏️ una categoria nuova…</option>
+                    </select>
                   ) : c.campo === "compatibilita" ? (
                     <span style={{ fontSize: 12.5, fontWeight: 700, color: colonneCompat.length ? T.blue : T.textLight }}>
                       {colonneCompat.length ? `${colonneCompat.length} scelte` : "nessuna"}
@@ -5577,6 +5653,32 @@ function ImportScreen({ onDone, onBack }) {
                     </select>
                   )}
                 </div>
+
+                {c.campo === "categoria" && categoriaScelta === "__nuova__" && (
+                  <input
+                    value={categoriaNuova}
+                    onChange={e => setCategoriaNuova(e.target.value)}
+                    placeholder="es. Guarnizioni"
+                    style={{
+                      width: "100%", marginTop: 8, padding: "10px 12px", borderRadius: 11,
+                      border: `1.5px solid ${categoriaNuova.trim() ? T.border : T.orange}`,
+                      background: T.card, fontSize: 14, color: T.text,
+                    }}
+                  />
+                )}
+
+                {c.campo === "categoria" && categoriaScelta !== "__col__" && (
+                  <div style={{
+                    borderTop: `1px solid ${T.border}`, paddingTop: 7, marginTop: 8,
+                    fontSize: 12, color: T.textMid, lineHeight: 1.45,
+                  }}>
+                    {categoriaFissa
+                      ? <>Tutti i ricambi di questo import avranno categoria <b>{categoriaFissa}</b></>
+                      : categoriaScelta === "__nuova__"
+                        ? <span style={{ color: T.orange }}>Scrivi il nome della categoria qui sopra.</span>
+                        : "I ricambi nascono senza categoria. La categoria dice che cosa è il pezzo, e all'AI serve: conviene metterla."}
+                  </div>
+                )}
 
                 {/* La compatibilità prende PIÙ colonne: un elenco di magazzino
                     tiene spesso un macchinario per colonna, e con una sola
