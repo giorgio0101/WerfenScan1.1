@@ -207,6 +207,9 @@ const STRINGS = {
     "scan.checkConnection": "controlla la connessione.",
 
     "result.identified": "✅ Ricambio identificato",
+    "result.uncertain": "⚠️ Identificazione incerta",
+    "result.uncertainTitle": "Confidenza bassa: controlla prima di usarlo",
+    "result.uncertainBody": "Sotto il {n}% l'AI non è sicura di quello che propone. Confronta il codice e la foto con il pezzo che hai in mano. Se è sbagliato, 👎 qui sotto ti mostra i ricambi più simili.",
     "result.noMatch": "❌ Nessuna corrispondenza",
     "result.confidence": "Confidenza AI: {n}%",
     "result.compat": "Compatibilità",
@@ -332,6 +335,9 @@ const STRINGS = {
     "scan.checkConnection": "check your connection.",
 
     "result.identified": "✅ Part identified",
+    "result.uncertain": "⚠️ Uncertain identification",
+    "result.uncertainTitle": "Low confidence: check before using it",
+    "result.uncertainBody": "Below {n}% the AI is not sure of what it proposes. Compare the code and the photo with the part in your hand. If it is wrong, 👎 below shows you the most similar parts.",
     "result.noMatch": "❌ No match found",
     "result.confidence": "AI confidence: {n}%",
     "result.compat": "Compatibility",
@@ -2337,6 +2343,20 @@ function PhotoPicker({ id, disabled, onFile, children, style, accept = "image/*"
 // non mostra: filettature, marcature, profilo laterale.
 const MAX_PART_IMAGES = 6;
 
+// ── Sotto quale confidenza il risultato va preso con le pinze ─
+// Il numero che l'AI dichiara è un'AUTOVALUTAZIONE, non una misura tarata:
+// dice quanto il modello si fida, non quanto ha ragione. Finché arrivava al
+// tecnico senza soglia, un 45% e un 95% avevano la stessa faccia — stesso
+// riquadro blu, stesso "identificato" — e cambiava solo una cifra che a
+// colpo d'occhio nessuno legge.
+//
+// 60 è una scelta di prudenza, non un valore ricavato dai dati: sotto quella
+// linea il riconoscimento si mostra ancora (nasconderlo butterebbe via
+// l'unico candidato che il tecnico ha) ma cambia colore e si prende un
+// avviso. Quando i pollici 👍/👎 saranno abbastanza, il pannello dirà se la
+// linea va spostata: si guarda a quale confidenza le conferme crollano.
+const CONFIDENCE_MIN = 60;
+
 function Gallery({ images, height = 200 }) {
   const [idx, setIdx] = useState(0);
   useEffect(() => { setIdx(0); }, [images]);
@@ -3468,6 +3488,9 @@ function ResultCard({ result, onReset, onFeedback }) {
   const { t } = useT();
   const { matched, part, confidence, reasoning } = result;
   const pct = Math.max(0, Math.min(100, Number(confidence) || 0));
+  // Un riconoscimento c'è, ma il modello non se la sente. Non è un "non
+  // trovato": il candidato resta a schermo, con addosso un avviso.
+  const incerto = matched && pct < CONFIDENCE_MIN;
 
   // Galleria del pezzo riconosciuto: è qui che serve di più, perché il
   // tecnico confronta la foto appena scattata con le angolazioni di riferimento.
@@ -3553,26 +3576,49 @@ function ResultCard({ result, onReset, onFeedback }) {
     <div className="fade-up" style={{ padding: 16 }}>
       <div style={{ background: T.card, borderRadius: 20, overflow: "hidden", boxShadow: T.shadowLg, border: `1px solid ${T.border}` }}>
         <div style={{
-          background: matched ? T.blue : "#4B5563",
+          // Tre stati, tre colori: trovato (blu), trovato ma incerto
+          // (arancione), non trovato (grigio). Il colore è la prima cosa che
+          // il tecnico vede, prima di qualunque numero.
+          background: !matched ? "#4B5563" : incerto ? T.orange : T.blue,
           padding: 20, display: "flex", alignItems: "center", justifyContent: "space-between"
         }}>
           <div>
             <div style={{ color: "white", fontWeight: 700, fontSize: 17 }}>
-              {matched ? t("result.identified") : t("result.noMatch")}
+              {!matched ? t("result.noMatch") : incerto ? t("result.uncertain") : t("result.identified")}
             </div>
             <div style={{ color: "rgba(255,255,255,0.7)", fontSize: 13, marginTop: 3 }}>
               {t("result.confidence", { n: pct })}
             </div>
           </div>
           <div style={{
-            background: matched ? T.orange : "rgba(255,255,255,0.15)",
+            // Sull'arancione un badge arancione sparirebbe: qui il contrasto
+            // lo dà il bianco trasparente, come nel caso "non trovato".
+            background: matched && !incerto ? T.orange : "rgba(255,255,255,0.18)",
             borderRadius: 14, padding: "8px 14px", color: "white", fontSize: 18, fontWeight: 800
           }}>{pct}%</div>
         </div>
         <div style={{ height: 4, background: T.border }}>
-          <div style={{ height: "100%", width: `${pct}%`, background: T.orange, transition: "width 0.8s ease" }} />
+          <div style={{ height: "100%", width: `${pct}%`,
+            background: incerto ? T.error : T.orange, transition: "width 0.8s ease" }} />
         </div>
         <div style={{ padding: 20 }}>
+          {/* ⚠️ Sta PRIMA di ogni altra cosa, foto compresa: se il tecnico
+              legge il codice e va a prendere il pezzo senza scorrere, deve
+              aver già incontrato l'avviso. */}
+          {incerto && (
+            <div style={{
+              background: T.orangePale, border: `1.5px solid ${T.orange}`,
+              borderRadius: 12, padding: "12px 14px", marginBottom: 16
+            }}>
+              <p style={{ color: "#92400E", fontSize: 13.5, fontWeight: 700, marginBottom: 4 }}>
+                ⚠️ {t("result.uncertainTitle")}
+              </p>
+              <p style={{ color: "#92400E", fontSize: 12.5, lineHeight: 1.55 }}>
+                {t("result.uncertainBody", { n: CONFIDENCE_MIN })}
+              </p>
+            </div>
+          )}
+
           {/* Un "non trovato" su un confronto parziale non vuol dire che il
               pezzo non sia a catalogo: va detto, o il tecnico ci crede. */}
           {result.partial && (
