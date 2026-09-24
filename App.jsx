@@ -2075,6 +2075,39 @@ function costruisciRicambi(righe, mappa, primaRigaDati, opzioni = {}) {
   };
 }
 
+// ── Correzioni fatte riga per riga ──────────────────────────
+// Quante righe si possono rivedere a mano prima che la schermata diventi
+// ingestibile. Oltre, le altre tengono quello che hanno dal file: meglio
+// dirlo che disegnare duemila campi su un telefono.
+const MAX_RIFINITURA = 300;
+
+// Applica le correzioni alle righe costruite dal file. Restituisce righe
+// NUOVE e non tocca le originali: tornare indietro dalla rifinitura non deve
+// perdere quello che il file diceva.
+//
+// ⚠️ "undefined" e stringa vuota vogliono dire due cose diverse: la prima è
+//    "non l'ho toccato", la seconda è "l'ho svuotato apposta". Trattarle
+//    uguali renderebbe impossibile togliere una categoria sbagliata.
+function applicaModifiche(righe, modifiche) {
+  if (!modifiche || !Object.keys(modifiche).length) return righe;
+  return righe.map(r => {
+    const m = modifiche[r.id];
+    if (!m) return r;
+    return {
+      ...r,
+      category: m.category === undefined ? r.category : String(m.category).trim(),
+      folder:   m.folder   === undefined ? r.folder   : normalizeFolder(m.folder),
+    };
+  });
+}
+
+// Le cartelle da far esistere, ricavate dalle righe DEFINITIVE. Va ricalcolato
+// dopo le correzioni: una cartella scritta a mano nella rifinitura non è nel
+// conto fatto leggendo il file, e senza questo passaggio nascerebbe un
+// ricambio dentro una cartella che nessuno ha creato.
+const cartelleDaRighe = (righe) =>
+  [...new Set((righe || []).map(r => r.folder).filter(Boolean))].sort();
+
 // Una cella pronta per un CSV: virgolette solo quando servono, raddoppiate
 // dentro. È lo stesso contratto che il parser qui sopra sa leggere, così il
 // file degli scarti si corregge e si ricarica senza conversioni.
@@ -5187,6 +5220,8 @@ function ImportScreen({ onDone, onBack }) {
   const [categoriaScelta, setCategoriaScelta] = useState("__col__");
   const [categoriaNuova, setCategoriaNuova] = useState("");
   const [categorieCatalogo, setCategorieCatalogo] = useState([]);
+  // id del ricambio → { category?, folder? }. Vuoto = nessuna correzione.
+  const [modifiche, setModifiche] = useState({});
   const [analisi, setAnalisi]   = useState(null);
   const [esistenti, setEsistenti] = useState(null);
   const [caricando, setCaricando] = useState(false);
@@ -5247,6 +5282,7 @@ function ImportScreen({ onDone, onBack }) {
       // Se il file ha una colonna categoria si parte da quella: è il caso in
       // cui ogni riga ha la sua, e cambiarlo d'ufficio sarebbe una sorpresa.
       setCategoriaScelta(m.categoria !== undefined ? "__col__" : "");
+      setModifiche({});
       setErrore("");
     } catch (e) {
       setRighe([]); setMappa({});
@@ -5279,14 +5315,17 @@ function ImportScreen({ onDone, onBack }) {
   // ── La scrittura ──────────────────────────────────────────
   async function scrivi() {
     if (!daScrivere.length) return;
+    const finali = applicaModifiche(daScrivere, modifiche);
     fermato.current = false;
     setFase("scrive");
-    setProgresso({ fatti: 0, totale: daScrivere.length });
+    setProgresso({ fatti: 0, totale: finali.length });
     try {
       // Prima le cartelle: se questo account non ha i permessi, si scopre
-      // ora, su una chiamata sola, e non a metà dei ricambi.
-      await cloud.assicuraCartelle(analisi.cartelle);
-      const r = await cloud.importaRicambi(daScrivere, {
+      // ora, su una chiamata sola, e non a metà dei ricambi. Si ricavano
+      // dalle righe DEFINITIVE, non da quelle lette dal file: una cartella
+      // scritta a mano nella rifinitura va creata come le altre.
+      await cloud.assicuraCartelle(cartelleDaRighe(finali));
+      const r = await cloud.importaRicambi(finali, {
         onProgress: (fatti, totale) => setProgresso({ fatti, totale }),
         fermato: () => fermato.current,
       });
@@ -5853,7 +5892,124 @@ function ImportScreen({ onDone, onBack }) {
             onClick={scrivi}>
             ✅ Scrivi {daScrivere.length.toLocaleString("it-IT")} ricambi nel catalogo
           </button>
+
+          {/* Il passo in più: facoltativo di proposito. Con dieci ricambi si
+              sistemano categoria e cartella uno per uno in un minuto; con
+              duemila non ha senso nemmeno aprirlo. */}
+          {daScrivere.length > 0 && (
+            <button style={bottoneChiaro} onClick={() => setFase("rifinisci")}>
+              ✏️ Categoria e cartella, ricambio per ricambio
+              {Object.keys(modifiche).length > 0 && ` · ${Object.keys(modifiche).length} modificati`}
+            </button>
+          )}
           <button style={bottoneChiaro} onClick={() => setFase("mappa")}>← Rivedi le colonne</button>
+        </>
+      )}
+
+      {/* ── 3b. RIGA PER RIGA (facoltativo) ─────────────── */}
+      {fase === "rifinisci" && analisi && (
+        <>
+          <Riquadro>
+            <b style={{ color: T.text }}>Una riga per ricambio.</b> Cambia quello che
+            serve e lascia stare il resto: quello che non tocchi resta come l'ha
+            letto dal file. <b>Categoria</b> dice che cosa è il pezzo,
+            <b> cartella</b> dove finisce nel catalogo — sono due cose diverse e
+            non si sostituiscono a vicenda.
+            <div style={{ marginTop: 6, color: T.textLight }}>
+              I campi suggeriscono quello che esiste già, ma accettano anche un
+              nome nuovo: una cartella scritta qui viene creata insieme ai ricambi.
+            </div>
+          </Riquadro>
+
+          {daScrivere.length > MAX_RIFINITURA && (
+            <Riquadro colore={T.orange} fondo={T.orangePale}>
+              Sono {daScrivere.length.toLocaleString("it-IT")} ricambi: qui sotto
+              compaiono i <b>primi {MAX_RIFINITURA}</b>. Gli altri tengono categoria
+              e cartella lette dal file — per gruppi così grandi conviene sistemare
+              il CSV, o usare la scelta unica nella schermata delle colonne.
+            </Riquadro>
+          )}
+
+          {/* Le due scorciatoie: si compila la prima riga e si estende a tutte.
+              È il caso del lotto omogeneo, che altrimenti costerebbe N gesti
+              identici. */}
+          <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+            {[
+              { campo: "category", etichetta: "🏷️ Categoria a tutti" },
+              { campo: "folder",   etichetta: "📁 Cartella a tutte" },
+            ].map(({ campo, etichetta }) => (
+              <button key={campo} style={{ ...bottoneChiaro, marginTop: 0, padding: 10, fontSize: 13 }}
+                onClick={() => {
+                  const primo = daScrivere[0];
+                  if (!primo) return;
+                  const valore = modifiche[primo.id]?.[campo] ?? primo[campo] ?? "";
+                  setModifiche(m => {
+                    const nuovo = { ...m };
+                    for (const r of daScrivere.slice(0, MAX_RIFINITURA)) {
+                      nuovo[r.id] = { ...nuovo[r.id], [campo]: valore };
+                    }
+                    return nuovo;
+                  });
+                }}>{etichetta}</button>
+            ))}
+          </div>
+
+          {/* Due elenchi condivisi da tutte le righe: con trecento ricambi,
+              ripeterli per riga vorrebbe dire decine di migliaia di voci. */}
+          <datalist id="import-categorie">
+            {[...new Set([...categorieCatalogo, ...daScrivere.map(r => r.category).filter(Boolean)])]
+              .sort((a, b) => a.localeCompare(b, "it"))
+              .map(c => <option key={c} value={c} />)}
+          </datalist>
+          <datalist id="import-cartelle">
+            {[...new Set([...cartelleCatalogo, ...daScrivere.map(r => r.folder).filter(Boolean)])]
+              .sort((a, b) => a.localeCompare(b, "it"))
+              .map(f => <option key={f} value={f} />)}
+          </datalist>
+
+          <div style={{ background: T.card, border: `1.5px solid ${T.border}`, borderRadius: 14, padding: "4px 12px 12px" }}>
+            {daScrivere.slice(0, MAX_RIFINITURA).map(r => {
+              const campo = (nome) => modifiche[r.id]?.[nome] ?? r[nome] ?? "";
+              const cambia = (nome, valore) =>
+                setModifiche(m => ({ ...m, [r.id]: { ...m[r.id], [nome]: valore } }));
+              const toccato = !!modifiche[r.id];
+              const stile = {
+                flex: 1, minWidth: 0, padding: "9px 10px", borderRadius: 10,
+                border: `1.5px solid ${T.border}`, background: T.card,
+                fontSize: 13, color: T.text,
+              };
+              return (
+                <div key={r.id} style={{ borderTop: `1px solid ${T.border}`, padding: "10px 0" }}>
+                  <div style={{ display: "flex", gap: 8, alignItems: "baseline" }}>
+                    <span className="wrap-anywhere" style={{ fontFamily: "monospace", fontSize: 11.5, color: T.blue, fontWeight: 700 }}>
+                      {r.code}
+                    </span>
+                    <span style={{ fontSize: 11, color: T.textLight }}>riga {r._riga}</span>
+                    {toccato && <span style={{ fontSize: 11, color: T.orange, fontWeight: 700 }}>modificato</span>}
+                  </div>
+                  <div className="wrap-anywhere" style={{ fontSize: 12.5, color: T.textMid, margin: "2px 0 7px" }}>
+                    {r.name.length > 70 ? r.name.slice(0, 70) + "…" : r.name}
+                  </div>
+                  <div style={{ display: "flex", gap: 7 }}>
+                    <input list="import-categorie" value={campo("category")} placeholder="categoria"
+                      onChange={e => cambia("category", e.target.value)} style={stile} />
+                    <input list="import-cartelle" value={campo("folder")} placeholder="cartella"
+                      onChange={e => cambia("folder", e.target.value)} style={stile} />
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          <button style={{ ...bottonePrimario, background: T.orange }} onClick={scrivi}>
+            ✅ Scrivi {daScrivere.length.toLocaleString("it-IT")} ricambi nel catalogo
+          </button>
+          <button style={bottoneChiaro} onClick={() => setFase("conferma")}>← Torna al riepilogo</button>
+          {Object.keys(modifiche).length > 0 && (
+            <button style={{ ...bottoneChiaro, color: T.error }} onClick={() => setModifiche({})}>
+              ↩️ Annulla tutte le modifiche fatte qui
+            </button>
+          )}
         </>
       )}
 
