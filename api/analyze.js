@@ -12,6 +12,8 @@
 //  Opzionale:
 //    AI_MODEL            default "claude-opus-5"
 //    AI_MAX_PHOTOS       quante foto del catalogo mandare (default 300, 0 = nessuna)
+//    AI_EFFORT           quanto ragiona: low | medium | high | xhigh (default "medium")
+//    AI_CACHE_TTL        riuso del catalogo fra scansioni: 1h | 5m | off (default "1h")
 // ════════════════════════════════════════════════════════════════════
 
 // ── Quanto può durare la funzione su Vercel ──────────────────
@@ -113,14 +115,23 @@ const CACHE_CONTROL =
 //    automatico. Sui modelli precedenti era il contrario, ed è la trappola
 //    che rendeva insufficiente il vecchio tetto di 3000 token.
 //
-// Riconoscere un ricambio industriale fra cento simili, da una foto scattata
-// in officina, non è un compito banale: "low" potrebbe essere tarato basso.
-// Resta il default per non cambiare i risultati alle spalle di nessuno, ma
-// ora è regolabile da Vercel senza toccare il codice. Come misurare quale
-// livello conviene: sezione "Taratura" in SETUP.md.
+// Regolabile da Vercel senza toccare il codice. Come misurare se il livello
+// scelto sta davvero lavorando: Impostazioni → 📊 Riconoscimento, andamento
+// per settimana, e la sezione "Taratura" in SETUP.md.
 const EFFORTS = ["low", "medium", "high", "xhigh"];
-const RAW_EFFORT = (process.env.AI_EFFORT || "low").trim().toLowerCase();
-const EFFORT = EFFORTS.includes(RAW_EFFORT) ? RAW_EFFORT : "low";
+// Default "medium" dal 24 settembre 2026, su richiesta. Riconoscere un
+// ricambio industriale fra migliaia di simili, da una foto scattata in
+// officina con la luce che c'è, non è un compito da "low": era il livello
+// più basso dei quattro, scelto per prudenza e mai misurato.
+//
+// ⚠️ Questo è solo il ripiego. Se su Vercel esiste una variabile AI_EFFORT
+//    con scritto "low", vince lei e questa riga non serve a niente: o la si
+//    cambia in "medium" o la si cancella.
+// ⚠️ Costa: medium ragiona di più, e il ragionamento si paga a token
+//    generati. Il tetto max_tokens sale di conseguenza (4000 → 8000), o
+//    alzare la manopola senza alzare il tetto significherebbe solo troncare.
+const RAW_EFFORT = (process.env.AI_EFFORT || "medium").trim().toLowerCase();
+const EFFORT = EFFORTS.includes(RAW_EFFORT) ? RAW_EFFORT : "medium";
 
 // max_tokens è un tetto su RAGIONAMENTO + RISPOSTA insieme, non sulla sola
 // risposta. Deve quindi crescere con l'effort: alzare la manopola senza
@@ -731,6 +742,9 @@ export default async function handler(req, res) {
       fb_confusions: safeConfusions.length,
       fb_missed: safeMissed.length,
       updated_column: updatedColumn,
+      // Con quale livello di ragionamento è stata fatta QUESTA scansione.
+      // Serve a confrontare prima e dopo senza fidarsi della memoria.
+      effort: EFFORT,
       input: u.input_tokens ?? 0,
       cache_write: u.cache_creation_input_tokens ?? 0,
       cache_read: u.cache_read_input_tokens ?? 0,
