@@ -1181,6 +1181,109 @@ const cloud = {
     return data || null;
   },
 
+  // ── SPAZIO E FILE ORFANI ──────────────────────────────────
+
+  // Quante foto esistono, contate dal database.
+  async reportSpazio() {
+    const { data, error } = await supabase.rpc("storage_report");
+    if (error) {
+      console.error("reportSpazio:", error.message, error.code);
+      throw new Error(error.code === "42883"
+        ? "Manca la funzione storage_report: esegui storage-report.sql in Supabase."
+        : error.message);
+    }
+    return data || null;
+  },
+
+  // Tutti gli id a catalogo. Serve a sapere quali cartelle su Storage hanno
+  // ancora un ricambio dietro e quali no.
+  async _tuttiGliId() {
+    const ids = new Set();
+    const PAGINA = 1000;
+    for (let da = 0; ; da += PAGINA) {
+      const { data, error } = await supabase
+        .from("parts").select("id").range(da, da + PAGINA - 1);
+      if (error) { console.error("_tuttiGliId:", error.message, error.code); throw error; }
+      for (const r of data || []) ids.add(String(r.id));
+      if (!data || data.length < PAGINA) return ids;
+    }
+  },
+
+  // Cerca i file rimasti senza padrone.
+  //
+  // ⚠️ Nascono da un guasto preciso, e vale la pena ricordarlo: deletePart
+  //    cancella PRIMA le foto e POI la riga, e se la cancellazione delle foto
+  //    fallisce l'errore viene ingoiato di proposito — meglio un ricambio
+  //    cancellato con qualche file di troppo che un'operazione bloccata a
+  //    metà. Il prezzo è che quei file non li reclama più nessuno, perché
+  //    nessuno sa più a chi appartenevano.
+  //
+  // Non cancella niente: guarda e riferisce.
+  async trovaOrfani(avanzamento) {
+    const ids = await cloud._tuttiGliId();
+    const sospette = [];
+    const PAGINA = 1000;
+
+    // Il primo livello del bucket è una cartella per ricambio, che si
+    // riconosce perché NON ha metadata: i file ce l'hanno, le cartelle no.
+    for (let offset = 0; ; offset += PAGINA) {
+      const { data, error } = await supabase.storage
+        .from(PHOTO_BUCKET).list("", { limit: PAGINA, offset });
+      if (error) { console.error("trovaOrfani list:", error.message); throw error; }
+      for (const v of data || []) {
+        const eCartella = !v?.metadata;
+        // Un file alla radice non può appartenere a nessun ricambio: tutte
+        // le scritture passano da "<id>/<nome>".
+        if (!eCartella) { sospette.push({ nome: v.name, radice: true }); continue; }
+        if (!ids.has(v.name)) sospette.push({ nome: v.name, radice: false });
+      }
+      if (!data || data.length < PAGINA) break;
+    }
+
+    // Solo per le sospette si guarda dentro: su un catalogo sano sono zero,
+    // e il giro costa una chiamata e basta.
+    const gruppi = [], percorsi = [];
+    let byte = 0;
+    for (let i = 0; i < sospette.length; i++) {
+      const s = sospette[i];
+      if (avanzamento) avanzamento(i + 1, sospette.length);
+      if (s.radice) { gruppi.push({ nome: s.nome, file: 1, byte: 0 }); percorsi.push(s.nome); continue; }
+      const { data: files } = await supabase.storage
+        .from(PHOTO_BUCKET).list(s.nome, { limit: 100 });
+      const suoi = (files || []).filter(f => f?.metadata);
+      const peso = suoi.reduce((t, f) => t + (Number(f.metadata?.size) || 0), 0);
+      byte += peso;
+      gruppi.push({ nome: s.nome, file: suoi.length, byte: peso });
+      percorsi.push(...suoi.map(f => `${s.nome}/${f.name}`));
+    }
+    return { gruppi, percorsi, byte };
+  },
+
+  // ⚠️ Rilegge gli id PRIMA di cancellare. Fra la ricerca e il pulsante
+  //    possono passare minuti, e in quei minuti un import può aver creato
+  //    ricambi: cancellare sulla fiducia vorrebbe dire buttare le foto di
+  //    un pezzo appena nato.
+  async eliminaOrfani(percorsi) {
+    const ids = await cloud._tuttiGliId();
+    const sicuri = (percorsi || []).filter(p => {
+      const cartella = String(p).split("/")[0];
+      return !ids.has(cartella) || cartella === p;   // file alla radice compresi
+    });
+    if (!sicuri.length) return { tolti: 0, saltati: (percorsi || []).length };
+
+    let tolti = 0;
+    for (let i = 0; i < sicuri.length; i += 100) {
+      const pezzo = sicuri.slice(i, i + 100);
+      const { data, error } = await supabase.storage.from(PHOTO_BUCKET).remove(pezzo);
+      if (error) {
+        console.error("eliminaOrfani:", error.message);
+        throw new Error("Cancellazione rifiutata: serve l'account amministratore.");
+      }
+      tolti += (data || []).length;
+    }
+    return { tolti, saltati: (percorsi || []).length - sicuri.length };
+  },
+
   // ── FOTO IN BLOCCO ────────────────────────────────────────
 
   // L'elenco dei codici con il loro id, per abbinare i nomi dei file. Si
@@ -6298,6 +6401,177 @@ function FeedbackPanel() {
   );
 }
 
+// ===================== SPAZIO E FOTO =====================
+// Due cose che finora si scoprivano tardi: quanto stai occupando, e quali
+// file non appartengono più a nessuno.
+const KB_PER_FOTO = 138;   // 110 piena + 25 copertina AI + 3,5 miniatura
+
+function SpazioPanel() {
+  const [dati, setDati] = useState(null);
+  const [errore, setErrore] = useState("");
+  const [caricando, setCaricando] = useState(true);
+  const [orfani, setOrfani] = useState(null);
+  const [cercando, setCercando] = useState(false);
+  const [passo, setPasso] = useState(null);
+  const [eliminando, setEliminando] = useState(false);
+  const [conferma, setConferma] = useState(false);
+  const [esito, setEsito] = useState("");
+
+  useEffect(() => {
+    let vivo = true;
+    cloud.reportSpazio()
+      .then(r => { if (vivo) setDati(r); })
+      .catch(e => { if (vivo) setErrore(e.message || "Conteggio non disponibile."); })
+      .finally(() => { if (vivo) setCaricando(false); });
+    return () => { vivo = false; };
+  }, []);
+
+  const mb = (byte) => (byte / 1048576).toFixed(byte < 10485760 ? 1 : 0);
+  const foto = Number(dati?.foto || 0);
+  const stimaMB = (foto * KB_PER_FOTO / 1024);
+
+  async function cerca() {
+    setCercando(true); setErrore(""); setEsito(""); setOrfani(null); setPasso(null);
+    try {
+      const r = await cloud.trovaOrfani((fatti, totale) => setPasso({ fatti, totale }));
+      setOrfani(r);
+    } catch (e) {
+      setErrore(e.message || "Ricerca non riuscita.");
+    } finally {
+      setCercando(false); setPasso(null);
+    }
+  }
+
+  async function elimina() {
+    setConferma(false); setEliminando(true); setErrore("");
+    try {
+      const r = await cloud.eliminaOrfani(orfani.percorsi);
+      setEsito(r.saltati
+        ? `${r.tolti} file eliminati. ${r.saltati} lasciati stare: nel frattempo è comparso il ricambio a cui appartengono.`
+        : `${r.tolti} file eliminati.`);
+      setOrfani(null);
+    } catch (e) {
+      setErrore(e.message || "Cancellazione non riuscita.");
+    } finally {
+      setEliminando(false);
+    }
+  }
+
+  return (
+    <div style={{ background: T.card, borderRadius: 20, padding: 20, border: `1px solid ${T.border}`, boxShadow: T.shadow, marginBottom: 16 }}>
+      {conferma && (
+        <ConfirmDialog
+          message={`Elimino ${orfani.percorsi.length} file che non appartengono a nessun ricambio? I ricambi a catalogo non vengono toccati.`}
+          onConfirm={elimina}
+          onCancel={() => setConferma(false)}
+        />
+      )}
+
+      <h3 style={{ fontWeight: 800, color: T.text, fontSize: 17, marginBottom: 10 }}>💾 Spazio e foto</h3>
+
+      {caricando && <div style={{ padding: "14px 0", textAlign: "center" }}><Spinner size={22} /></div>}
+
+      {!caricando && errore && (
+        <div style={{ background: "#FEF2F2", border: `1px solid ${T.error}`, borderRadius: 12, padding: 12, fontSize: 12.5, color: T.error, lineHeight: 1.5, marginBottom: 12 }}>
+          {errore}
+        </div>
+      )}
+
+      {dati && (
+        <>
+          <div style={{ display: "flex", borderRadius: 14, overflow: "hidden", border: `1px solid ${T.border}` }}>
+            {[
+              { n: Number(dati.ricambi || 0), e: "ricambi" },
+              { n: foto, e: foto === 1 ? "foto" : "foto" },
+              { n: stimaMB >= 1024 ? `${(stimaMB / 1024).toFixed(1)} GB` : `${Math.round(stimaMB)} MB`, e: "circa" },
+            ].map((b, i) => (
+              <div key={i} style={{ flex: 1, textAlign: "center", padding: "10px 4px", borderLeft: i ? `1px solid ${T.border}` : "none" }}>
+                <div style={{ fontSize: 21, fontWeight: 800, color: T.text }}>{b.n}</div>
+                <div style={{ fontSize: 11, color: T.textLight, fontWeight: 600 }}>{b.e}</div>
+              </div>
+            ))}
+          </div>
+          <p style={{ fontSize: 11.5, color: T.textLight, lineHeight: 1.55, marginTop: 8 }}>
+            Stima: ogni fotografia diventa tre file — piena, copertina per l'AI,
+            miniatura — per ~{KB_PER_FOTO} KB in tutto. Il numero esatto sta in
+            Supabase → Settings → Usage.
+          </p>
+
+          {Number(dati.senza_foto || 0) > 0 && (
+            <p style={{ fontSize: 12.5, color: T.textMid, lineHeight: 1.55, marginTop: 10 }}>
+              📷 <b>{dati.senza_foto} ricambi senza nessuna foto.</b> Vanno all'AI col
+              solo testo: è la descrizione a doverli salvare.
+            </p>
+          )}
+          {Number(dati.senza_copia_ai || 0) > 0 && (
+            <p style={{ fontSize: 12.5, color: T.orange, lineHeight: 1.55, marginTop: 8 }}>
+              ⚠️ <b>{dati.senza_copia_ai} ricambi hanno foto ma non la copia per l'AI.</b>{" "}
+              Sono stati caricati prima che quella versione esistesse: riaprili e
+              salvali, l'app la rigenera da sola.
+            </p>
+          )}
+          {Number(dati.base64_rimasti || 0) > 0 && (
+            <p style={{ fontSize: 12.5, color: T.orange, lineHeight: 1.55, marginTop: 8 }}>
+              ⚠️ <b>{dati.base64_rimasti} ricambi hanno ancora l'immagine dentro il
+              database</b> nel vecchio formato: pesano centinaia di KB ciascuno e
+              viaggiano insieme alla scheda. Si risolvono risalvandoli.
+            </p>
+          )}
+        </>
+      )}
+
+      <div style={{ borderTop: `1px solid ${T.border}`, marginTop: 16, paddingTop: 14 }}>
+        <p style={{ fontSize: 12.5, color: T.textMid, lineHeight: 1.55, marginBottom: 10 }}>
+          <b>File orfani</b> — fotografie di ricambi che non esistono più. Succede
+          quando la cancellazione di un ricambio riesce a metà: la scheda sparisce,
+          le foto restano, e non c'è più nessuno che sappia a chi appartenevano.
+        </p>
+
+        <button onClick={cerca} disabled={cercando || eliminando} style={{
+          width: "100%", padding: 12, borderRadius: 12,
+          background: T.bluePale, color: T.blue, fontSize: 14, fontWeight: 700,
+          display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
+        }}>
+          {cercando
+            ? <><Spinner size={16} /> {passo ? `Controllo ${passo.fatti} di ${passo.totale}…` : "Leggo lo Storage…"}</>
+            : "🔎 Cerca file orfani"}
+        </button>
+
+        {esito && (
+          <p style={{ fontSize: 12.5, color: T.success, fontWeight: 600, marginTop: 10, lineHeight: 1.5 }}>✅ {esito}</p>
+        )}
+
+        {orfani && orfani.gruppi.length === 0 && (
+          <p style={{ fontSize: 12.5, color: T.success, fontWeight: 600, marginTop: 10 }}>
+            ✅ Nessun file orfano: tutto quello che c'è su Storage appartiene a un ricambio.
+          </p>
+        )}
+
+        {orfani && orfani.gruppi.length > 0 && (
+          <div style={{ marginTop: 12 }}>
+            <p style={{ fontSize: 13, fontWeight: 700, color: T.text, marginBottom: 6 }}>
+              {orfani.percorsi.length} file senza padrone, {mb(orfani.byte)} MB
+            </p>
+            <div style={{ maxHeight: 160, overflowY: "auto", border: `1px solid ${T.border}`, borderRadius: 10, padding: 8 }}>
+              {orfani.gruppi.map(g => (
+                <div key={g.nome} className="wrap-anywhere" style={{ fontFamily: "monospace", fontSize: 11, color: T.textMid, marginBottom: 3 }}>
+                  {g.nome} — {g.file} file{g.byte ? `, ${mb(g.byte)} MB` : ""}
+                </div>
+              ))}
+            </div>
+            <button onClick={() => setConferma(true)} disabled={eliminando} style={{
+              width: "100%", padding: 12, borderRadius: 12, marginTop: 10,
+              background: T.error, color: "white", fontSize: 14, fontWeight: 700,
+            }}>
+              {eliminando ? "Eliminazione…" : `🗑️ Elimina ${orfani.percorsi.length} file`}
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function SettingsScreen({ partsCount, userEmail }) {
   const [newPwd, setNewPwd] = useState("");
   const [confirmPwd, setConfirmPwd] = useState("");
@@ -6367,6 +6641,8 @@ function SettingsScreen({ partsCount, userEmail }) {
       </div>
 
       <FeedbackPanel />
+
+      <SpazioPanel />
 
       {/* Chiave AI — ora server-side */}
       <div style={{ background: T.card, borderRadius: 20, padding: 20, border: `1px solid ${T.border}`, boxShadow: T.shadow, marginBottom: 16 }}>
